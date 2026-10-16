@@ -1,0 +1,19 @@
+[package]
+name = "vivarium-sim"
+description = "Vivarium headless 模拟器：不依赖任何渲染库"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vivarium-sim"
+path = "src/main.rs"
+
+[dependencies]
+vivarium-core.workspace = true
+vivarium-render.workspace = true
+
+# 刻意**不依赖** wgpu / winit / egui。
+# 这个 bin 存在的全部理由，就是让"跑一万代"变廉价；
+# 一旦它拉进图形依赖，每次编译都要多等几分钟，长跑调参就废了。

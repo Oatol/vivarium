@@ -1,0 +1,13 @@
+[package]
+name = "vivarium-render"
+description = "Vivarium 渲染层：像素（wgpu）与 ASCII 双渲染器"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vivarium-core.workspace = true
+
+# wgpu / winit 将在 M0 第二步接入。
+# 现在不引入，是为了让 `cargo check` 保持秒级——ASCII 渲染器完全不需要 GPU。

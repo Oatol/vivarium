@@ -1,0 +1,20 @@
+[package]
+name = "vivarium-game"
+description = "Vivarium 图形前端"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "vivarium-game"
+path = "src/main.rs"
+
+[dependencies]
+vivarium-core.workspace = true
+vivarium-render.workspace = true
+vivarium-ui.workspace = true
+vivarium-app.workspace = true
+
+# M0 第二步会在这里加上 wgpu + winit。
+# 在那之前，图形前端刻意保持零图形依赖，以便整个 workspace 能秒级 check。

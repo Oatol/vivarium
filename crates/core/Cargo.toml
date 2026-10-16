@@ -1,0 +1,11 @@
+[package]
+name = "vivarium-core"
+description = "Vivarium 模拟内核：无渲染依赖，可 headless 运行"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+# 刻意保持零依赖。core 的编译速度直接决定调试循环的长度，
+# 也保证"同种子 ⇒ 同结果"不会被第三方库的版本变化破坏。

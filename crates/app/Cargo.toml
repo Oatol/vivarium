@@ -1,0 +1,12 @@
+[package]
+name = "vivarium-app"
+description = "Vivarium 应用层：主循环、输入、时间控制"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+vivarium-core.workspace = true
+vivarium-render.workspace = true
+vivarium-ui.workspace = true

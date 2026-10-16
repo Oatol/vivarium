@@ -1,0 +1,12 @@
+/target
+**/*.rs.bk
+*.pdb
+
+# 模拟存档与长跑统计输出
+/saves
+/stats
+
+# 编辑器
+.vscode/
+.idea/
+*.swp

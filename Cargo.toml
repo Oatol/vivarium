@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/render",
+    "crates/ui",
+    "crates/app",
+    "bins/game",
+    "bins/sim",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+license = "MIT OR Apache-2.0"
+
+[workspace.dependencies]
+vivarium-core = { path = "crates/core" }
+vivarium-render = { path = "crates/render" }
+vivarium-ui = { path = "crates/ui" }
+vivarium-app = { path = "crates/app" }
+
+# 发布构建：模拟内核要跑得快，但调试信息保留到 line-tables-only，
+# 这样 release 下依然能拿到可读的 panic 栈。
+[profile.release]
+lto = "thin"
+codegen-units = 1
+debug = "line-tables-only"
+
+# 开发构建：模拟内核在 debug 下会慢一个数量级，
+# 所以给依赖开 opt-level 3，自己的 crate 保持 O0 以便快速编译与调试。
+[profile.dev.package."*"]
+opt-level = 3
