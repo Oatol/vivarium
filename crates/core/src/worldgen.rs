@@ -37,6 +37,12 @@ const SEABED_PERCENT: usize = 66;
 /// 少了又会变成"海上孤零零一座山"。
 const ISLAND_COUNT: (usize, usize) = (3, 6);
 
+/// 每多少列放一团残骸。数值越大团块越稀疏。
+///
+/// 团块本身是透镜状（宽 7~17 格），所以这个密度已经能保证
+/// 基岩里到处都有零星的有机沉积，而不是一片纯净的石头。
+const REMAINS_CLUMPS_PER_COLUMNS: usize = 6;
+
 /// 放气泡所需的最小水柱高度（格）。
 ///
 /// 一个气泡是 2×2 的方块，覆盖两列、两行。要求水柱至少有这么高，
@@ -169,7 +175,9 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
         raise_bump(&mut rise, cx, half + half / 4, peak * 25 / 100);
     }
 
-    let surface: Vec<isize> = (0..w).map(|x| seabed as isize + drift[x] - rise[x]).collect();
+    let surface: Vec<isize> = (0..w)
+        .map(|x| seabed as isize + drift[x] - rise[x])
+        .collect();
 
     // --- 3. 铺材质 ---
     //
@@ -202,13 +210,7 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
         let rock = top + sand;
         rock_top[x] = rock;
         if rock < h {
-            world.fill_rect(
-                x as isize,
-                rock as isize,
-                1,
-                h - rock,
-                MaterialKind::Stone,
-            );
+            world.fill_rect(x as isize, rock as isize, 1, h - rock, MaterialKind::Stone);
         }
     }
 
@@ -232,19 +234,44 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     }
 
     // 沉积层里的残骸——细胞死亡后的产物，M2 起它会真的出现。
-    // 只落在基岩里：海床是起伏的，按固定 y 盲放会把残骸摆进水里。
-    for _ in 0..(w / 8) {
-        let x = rng.gen_range_usize(0, w);
-        let lo = rock_top[x] + 2;
+    //
+    // 做成**透镜状团块**，而不是逐列单点撒。单点撒出来是一串孤立的珠子，
+    // 既不像有机沉积，也让"团块整体沉降"这件事在 M1 里根本看不出来。
+    // 透镜是水平拉长的椭圆：宽 7~17 格、厚 3~7 格，埋在海床基岩里。
+    //
+    // 判定用整数而不是浮点：`(dx/hw)² + (dy/hh)² ≤ 1` 两边同乘 `hw²·hh²`
+    // 就只剩整数乘法。世界生成必须是逐位可复现的，能不用浮点就不用。
+    for _ in 0..(w / REMAINS_CLUMPS_PER_COLUMNS) {
+        let cx = rng.gen_range_usize(0, w);
+        // 团块中心从基岩顶往下 4 格起，保证整个团块埋在石头里。
+        let lo = rock_top[cx] + 4;
         if lo >= h {
             continue;
         }
-        let y = rng.gen_range_usize(lo, h);
-        world.set(x as isize, y as isize, MaterialKind::Remains);
+        let cy = rng.gen_range_usize(lo, h);
+        let hw = rng.gen_range_usize(3, 9) as isize; // 半宽 3~8
+        let hh = rng.gen_range_usize(1, 4) as isize; // 半高 1~3
+        let (hw2, hh2) = (hw * hw, hh * hh);
+        for dy in -hh..=hh {
+            for dx in -hw..=hw {
+                if dx * dx * hh2 + dy * dy * hw2 > hw2 * hh2 {
+                    continue;
+                }
+                let (px, py) = (cx as isize + dx, cy as isize + dy);
+                if !world.in_bounds(px, py) {
+                    continue;
+                }
+                // **只替换基岩**。海床是起伏的，团块边缘会伸到沙层或水里去，
+                // 在那里造残骸就等于凭空往水里塞东西。
+                if world.get(px, py) == MaterialKind::Stone {
+                    world.set(px, py, MaterialKind::Remains);
+                }
+            }
+        }
     }
 
-    // 一小撮火，落在最高的岛顶上。
-    // （M1 之前它不蔓延也不熄灭，只负责让调色板最后一个颜色出现在画面里。）
+    // 一小撮火，落在最高的岛顶上方的空中。
+    // M1 起它会自己蔓延、被水浇灭、十几 tick 后烧完——正好用来确认反应表接对了。
     let mut peak_x = 0usize;
     for x in 1..w {
         if surface[x] < surface[peak_x] {

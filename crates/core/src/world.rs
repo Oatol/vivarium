@@ -152,8 +152,11 @@ impl World {
     }
 
     /// 行主序索引。
+    ///
+    /// 公开出去是因为"本 tick 已移动"之类的辅助数组要和网格同序索引，
+    /// 让它们各自重算一遍 `y * width + x` 迟早会有一处写错。
     #[inline]
-    const fn index(&self, x: usize, y: usize) -> usize {
+    pub const fn index_of(&self, x: usize, y: usize) -> usize {
         y * self.width + x
     }
 
@@ -161,7 +164,7 @@ impl World {
     #[inline]
     pub fn get(&self, x: isize, y: isize) -> MaterialKind {
         if self.in_bounds(x, y) {
-            self.cells[self.index(x as usize, y as usize)].kind
+            self.cells[self.index_of(x as usize, y as usize)].kind
         } else {
             MaterialKind::Empty
         }
@@ -170,22 +173,80 @@ impl World {
     /// 读取格子（不越界检查，调用方保证坐标合法）。
     #[inline]
     pub fn get_unchecked(&self, x: usize, y: usize) -> MaterialKind {
-        self.cells[self.index(x, y)].kind
+        self.cells[self.index_of(x, y)].kind
+    }
+
+    /// 读取格子的标记位。越界返回 0。
+    #[inline]
+    pub fn flags(&self, x: isize, y: isize) -> u8 {
+        if self.in_bounds(x, y) {
+            self.cells[self.index_of(x as usize, y as usize)].flags
+        } else {
+            0
+        }
+    }
+
+    /// 写入格子的标记位。越界被忽略，值未变化时不标脏。
+    ///
+    /// 标记位不改变画面，但会改变模拟结果，所以**必须**标脏——
+    /// 否则一个"只剩寿命在倒计时"的火焰所在分块会被跳过，永远烧不完。
+    pub fn set_flags(&mut self, x: isize, y: isize, flags: u8) -> bool {
+        if !self.in_bounds(x, y) {
+            return false;
+        }
+        let idx = self.index_of(x as usize, y as usize);
+        if self.cells[idx].flags == flags {
+            return false;
+        }
+        self.cells[idx].flags = flags;
+        self.mark_dirty(x as usize, y as usize);
+        true
     }
 
     /// 写入格子。值未变化时不标脏，这是脏标记有效的前提。
+    ///
+    /// 换材质时**清空标记位**：标记位是材质自己的状态（火的剩余寿命、
+    /// 本 tick 是否已移动），换了材质它就失去意义，留着会污染新材质的行为。
     ///
     /// 越界写入被静默忽略——画笔拖到边缘时不该 panic。
     pub fn set(&mut self, x: isize, y: isize, kind: MaterialKind) -> bool {
         if !self.in_bounds(x, y) {
             return false;
         }
-        let idx = self.index(x as usize, y as usize);
+        let idx = self.index_of(x as usize, y as usize);
         if self.cells[idx].kind == kind {
             return false;
         }
         self.cells[idx].kind = kind;
+        self.cells[idx].flags = 0;
         self.mark_dirty(x as usize, y as usize);
+        true
+    }
+
+    /// 交换两格的全部内容（材质 + 标记位）。
+    ///
+    /// 材质层的移动**全部**通过它完成：粉末下坠、液体下沉、气体上浮都不是
+    /// "把 A 复制到 B 再清空 A"，而是交换。原因有两个：
+    ///
+    /// - 目标格往往不是空的（沙落进水里、水沉进气里），复制会**凭空吞掉**那格材质，
+    ///   世界里的物质总量就不再守恒，M1 的守恒断言立刻失效。
+    /// - 标记位随材质一起搬走，"这一格本 tick 已经动过"才不会丢。
+    ///
+    /// 任一端越界、或两格内容完全相同，返回 `false` 且不标脏。
+    pub fn swap(&mut self, x1: isize, y1: isize, x2: isize, y2: isize) -> bool {
+        if !self.in_bounds(x1, y1) || !self.in_bounds(x2, y2) {
+            return false;
+        }
+        let (x1u, y1u) = (x1 as usize, y1 as usize);
+        let (x2u, y2u) = (x2 as usize, y2 as usize);
+        let i = self.index_of(x1u, y1u);
+        let j = self.index_of(x2u, y2u);
+        if i == j || self.cells[i] == self.cells[j] {
+            return false;
+        }
+        self.cells.swap(i, j);
+        self.mark_dirty(x1u, y1u);
+        self.mark_dirty(x2u, y2u);
         true
     }
 
@@ -203,21 +264,43 @@ impl World {
     /// 把整个世界刷成同一种材质。
     pub fn fill_all(&mut self, kind: MaterialKind) {
         for cell in &mut self.cells {
-            cell.kind = kind;
+            *cell = MaterialCell::new(kind);
         }
         self.dirty.iter_mut().for_each(|d| *d = true);
         self.dirty_count = self.chunk_count();
     }
 
-    /// 标记某格所在的分块为脏。
+    /// 标记某格**及其一圈邻格**所在的分块为脏。
+    ///
+    /// ## 为什么必须带上邻格
+    ///
+    /// 脏块的作用是"下一 tick 跳过完全没动过的区域"。但一个格子能不能动，
+    /// 取决于它的邻居——(10, 10) 的水流走了，(10, 9) 的水才终于能往下走，
+    /// 而 (10, 9) 自己一个字节都没变过。
+    ///
+    /// 只标变化格所在的分块，就会出现"这一格已经该动了，但它所在的分块
+    /// 被判定为静止而跳过"，于是跳块扫描与全扫的结果**不一致**——
+    /// 而 M1 的验收断言正是"两者逐 tick 相同"。带上 1 格晕影，
+    /// 变化的影响范围就覆盖住了所有可能因此变得可动的格子。
+    ///
+    /// 代价是最多多标 4 个分块。对 512²（64 块）来说完全可忽略，
+    /// 而且渲染层多上传几个没变的分块是安全的。
     #[inline]
     pub fn mark_dirty(&mut self, x: usize, y: usize) {
-        let cx = x / CHUNK_SIZE;
-        let cy = y / CHUNK_SIZE;
-        let ci = cy * self.chunk_cols + cx;
-        if !self.dirty[ci] {
-            self.dirty[ci] = true;
-            self.dirty_count += 1;
+        // 以格为单位往外扩一圈，再折算成分块——比"直接给分块坐标 ±1"
+        // 精确得多，后者会在格子不贴边时白标一圈分块。
+        for dy in -1isize..=1 {
+            for dx in -1isize..=1 {
+                let (nx, ny) = (x as isize + dx, y as isize + dy);
+                if !self.in_bounds(nx, ny) {
+                    continue;
+                }
+                let ci = (ny as usize / CHUNK_SIZE) * self.chunk_cols + (nx as usize / CHUNK_SIZE);
+                if !self.dirty[ci] {
+                    self.dirty[ci] = true;
+                    self.dirty_count += 1;
+                }
+            }
         }
     }
 
@@ -233,19 +316,36 @@ impl World {
         self.dirty_count
     }
 
-    /// 清空所有脏标记。材质层应当在每个 tick 的**开头**调用，
-    /// 这样本 tick 产生的脏标记就留给下一个 tick 使用。
+    /// 清空所有脏标记。
+    ///
+    /// 材质层在每个 tick 的**开头**调用，于是本 tick 产生的脏标记
+    /// 正好留给下一个 tick 使用。这条协议是自洽的：
+    /// 第 N tick 结束时脏块集合 = "在第 N tick 里变化过的格子所在的分块"，
+    /// 而第 N+1 tick 需要重新检查的正是这些分块。
     pub fn clear_dirty(&mut self) {
         self.dirty.iter_mut().for_each(|d| *d = false);
         self.dirty_count = 0;
     }
 
-    /// 推进一个 tick。
+    /// 把所有分块标为脏，即"下一个 tick 强制全网格扫描"。
     ///
-    /// M0 阶段这里只做两件事：清脏标记、tick 计数。
-    /// 材质流动规则、生命层调度会在后续里程碑接入。
-    pub fn step(&mut self) {
-        self.clear_dirty();
+    /// 两个用途：
+    /// - 读档、时间倒带之后，脏块集合不可信，需要重新扫一遍；
+    /// - 作为**测试锚点**：让模拟器在"跳块"与"全扫"两种模式下跑同一份初始世界，
+    ///   逐 tick 比较哈希，就能直接证明跳块没有改变结果。
+    ///   没有这条断言，跳块优化就只能靠"看起来没问题"来验收。
+    pub fn mark_all_dirty(&mut self) {
+        self.dirty.iter_mut().for_each(|d| *d = true);
+        self.dirty_count = self.chunk_count();
+    }
+
+    /// 推进 tick 计数。
+    ///
+    /// 这里**不再**顺带清脏标记。M0 时 `step()` 把两件事捆在一起，
+    /// 但材质层必须先**读**上一 tick 留下的脏块集合，再清空它开始本 tick——
+    /// 捆在一起就没法在清空之前读到。推进与清空拆开，调用方按需要排序。
+    #[inline]
+    pub fn advance_tick(&mut self) {
         self.tick += 1;
     }
 
@@ -342,12 +442,13 @@ mod tests {
         let mut w = World::new(128, 128).unwrap();
         w.clear_dirty();
         // 同一块内写多次，只应标脏一次。
-        w.set(0, 0, MaterialKind::Stone);
-        w.set(1, 1, MaterialKind::Stone);
-        w.set(63, 63, MaterialKind::Stone);
+        // 坐标都离块边界足够远，晕影不会溢到邻块去——那是另一个测试的事。
+        w.set(10, 10, MaterialKind::Stone);
+        w.set(11, 11, MaterialKind::Stone);
+        w.set(40, 40, MaterialKind::Stone);
         assert_eq!(w.dirty_chunk_count(), 1);
         // 跨到相邻块，应变成两块。
-        w.set(64, 0, MaterialKind::Stone);
+        w.set(70, 10, MaterialKind::Stone);
         assert_eq!(w.dirty_chunk_count(), 2);
         assert!(w.is_chunk_dirty(1, 0));
     }
@@ -359,7 +460,7 @@ mod tests {
         for (w, off) in [(&mut a, 0isize), (&mut b, 0isize)] {
             w.fill_rect(10 + off, 10, 32, 32, MaterialKind::Sand);
             w.fill_rect(100, 50, 16, 16, MaterialKind::Water);
-            w.step();
+            w.advance_tick();
         }
         assert_eq!(a.hash(), b.hash());
     }
@@ -385,11 +486,16 @@ mod tests {
     }
 
     #[test]
-    fn step_clears_dirty_and_advances_tick() {
+    fn clear_dirty_and_advance_tick_are_separate() {
         let mut w = World::new(64, 64).unwrap();
         w.set(1, 1, MaterialKind::Stone);
         assert_eq!(w.dirty_chunk_count(), 1);
-        w.step();
+        // 只推进 tick：脏标记必须原样留着，材质层还要读它。
+        w.advance_tick();
+        assert_eq!(w.tick(), 1);
+        assert_eq!(w.dirty_chunk_count(), 1);
+        // 再清空。
+        w.clear_dirty();
         assert_eq!(w.dirty_chunk_count(), 0);
         assert_eq!(w.tick(), 1);
     }
@@ -397,5 +503,167 @@ mod tests {
     #[test]
     fn chunk_size_is_what_we_think_it_is() {
         assert_eq!(CHUNK_SIZE, 64);
+    }
+
+    // -----------------------------------------------------------------------
+    // 交换
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn swap_moves_both_cells() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(10, 10, MaterialKind::Sand);
+        assert!(w.swap(10, 10, 10, 11));
+        assert_eq!(w.get(10, 10), MaterialKind::Empty);
+        assert_eq!(w.get(10, 11), MaterialKind::Sand);
+    }
+
+    /// 交换是**守恒**的：世界里的材质总量不变。
+    ///
+    /// 这条直接支撑 M1 的守恒断言。用复制实现的移动会在这里红：
+    /// 沙落进水里会把那格水凭空吞掉。
+    #[test]
+    fn swap_conserves_every_material() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 0, 8, 8, MaterialKind::Sand);
+        w.fill_rect(0, 8, 8, 8, MaterialKind::Water);
+        let before = w.census();
+        // 把整个沙块和水块逐格对调一遍。
+        for y in 0..8 {
+            for x in 0..8 {
+                w.swap(x, y, x, y + 8);
+            }
+        }
+        assert_eq!(w.census(), before);
+    }
+
+    #[test]
+    fn swap_carries_flags_along() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(5, 5, MaterialKind::Fire);
+        w.set_flags(5, 5, 9);
+        w.swap(5, 5, 5, 6);
+        assert_eq!(w.get(5, 6), MaterialKind::Fire);
+        assert_eq!(w.flags(5, 6), 9, "flags must travel with the material");
+        assert_eq!(w.flags(5, 5), 0);
+    }
+
+    #[test]
+    fn swapping_identical_cells_is_a_noop() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 0, 4, 4, MaterialKind::Water);
+        w.clear_dirty();
+        assert!(
+            !w.swap(0, 0, 1, 0),
+            "two identical water cells need no swap"
+        );
+        assert_eq!(w.dirty_chunk_count(), 0);
+    }
+
+    #[test]
+    fn swap_with_itself_is_a_noop() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(3, 3, MaterialKind::Sand);
+        w.clear_dirty();
+        assert!(!w.swap(3, 3, 3, 3));
+        assert_eq!(w.get(3, 3), MaterialKind::Sand);
+        assert_eq!(w.dirty_chunk_count(), 0);
+    }
+
+    #[test]
+    fn swap_out_of_bounds_is_rejected() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(0, 0, MaterialKind::Sand);
+        assert!(!w.swap(0, 0, -1, 0));
+        assert!(!w.swap(0, 0, 64, 0));
+        assert_eq!(w.get(0, 0), MaterialKind::Sand);
+    }
+
+    #[test]
+    fn swap_across_chunks_dirties_both() {
+        let mut w = World::new(128, 64).unwrap();
+        w.clear_dirty();
+        w.set(63, 10, MaterialKind::Sand); // 会在两块上标脏（晕影）
+        w.clear_dirty();
+        w.swap(63, 10, 64, 10); // 跨块
+        assert!(w.is_chunk_dirty(0, 0));
+        assert!(w.is_chunk_dirty(1, 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // 标记位
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn flags_roundtrip() {
+        let mut w = World::new(64, 64).unwrap();
+        assert_eq!(w.flags(7, 7), 0);
+        assert!(w.set_flags(7, 7, 42));
+        assert_eq!(w.flags(7, 7), 42);
+        assert!(!w.set_flags(7, 7, 42), "redundant write must not dirty");
+        assert_eq!(w.flags(-1, 0), 0, "out of bounds reads give 0");
+        assert!(!w.set_flags(-1, 0, 1), "out of bounds writes are ignored");
+    }
+
+    #[test]
+    fn changing_material_clears_stale_flags() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(2, 2, MaterialKind::Fire);
+        w.set_flags(2, 2, 7);
+        w.set(2, 2, MaterialKind::Water);
+        assert_eq!(w.flags(2, 2), 0, "new material must not inherit old state");
+    }
+
+    /// 标记位参与哈希——否则"火焰只剩寿命在倒计时"这类状态
+    /// 在哈希里看不见，可复现性断言就形同虚设。
+    #[test]
+    fn flags_affect_hash() {
+        let mut a = World::new(64, 64).unwrap();
+        let mut b = World::new(64, 64).unwrap();
+        a.set(1, 1, MaterialKind::Fire);
+        b.set(1, 1, MaterialKind::Fire);
+        b.set_flags(1, 1, 5);
+        assert_ne!(a.hash(), b.hash());
+    }
+
+    // -----------------------------------------------------------------------
+    // 脏标记晕影
+    // -----------------------------------------------------------------------
+
+    /// 变化格**周围一圈**所在的分块也要标脏。
+    ///
+    /// 这条是"跳块扫描 == 全扫"的前提：邻居的流动会让本格变得可动，
+    /// 而本格自己没变过。
+    #[test]
+    fn dirty_marks_a_one_cell_halo() {
+        let mut w = World::new(256, 256).unwrap();
+        w.clear_dirty();
+        // 正好落在块 (0,0) 的右下角——晕影会溢出到右边和下边的块。
+        w.set(63, 63, MaterialKind::Stone);
+        assert!(w.is_chunk_dirty(0, 0), "the cell's own chunk");
+        assert!(w.is_chunk_dirty(1, 0), "right neighbour chunk");
+        assert!(w.is_chunk_dirty(0, 1), "below neighbour chunk");
+        assert!(w.is_chunk_dirty(1, 1), "diagonal neighbour chunk");
+        assert!(!w.is_chunk_dirty(2, 0), "two chunks away is not affected");
+        assert_eq!(w.dirty_chunk_count(), 4);
+    }
+
+    #[test]
+    fn halo_does_not_escape_the_world() {
+        let mut w = World::new(128, 128).unwrap();
+        w.clear_dirty();
+        w.set(0, 0, MaterialKind::Stone); // 左上角，晕影会越界
+        assert_eq!(w.dirty_chunk_count(), 1);
+        w.clear_dirty();
+        w.set(127, 127, MaterialKind::Stone); // 右下角
+        assert_eq!(w.dirty_chunk_count(), 1);
+    }
+
+    #[test]
+    fn halo_inside_one_chunk_stays_one_chunk() {
+        let mut w = World::new(128, 128).unwrap();
+        w.clear_dirty();
+        w.set(30, 30, MaterialKind::Stone); // 四邻都在块 (0,0) 内
+        assert_eq!(w.dirty_chunk_count(), 1);
     }
 }

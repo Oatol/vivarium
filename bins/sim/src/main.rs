@@ -7,15 +7,25 @@
 //! cargo run -p vivarium-sim -- --help
 //! cargo run -p vivarium-sim -- --ticks 10000 --seed 42
 //! cargo run -p vivarium-sim -- --width 128 --height 128 --ticks 200 --ascii
+//! cargo run -p vivarium-sim -- --ticks 3000 --ignite 40 --report-every 500
 //! ```
 //!
 //! 输出里的 `hash` 是网格的确定性指纹。同种子 + 同参数 ⇒ 同 hash，
 //! 这是 SPEC 里"可复现性"那条验收断言的命令行入口。
+//!
+//! ## 两个比 hash 更重要的数字
+//!
+//! - **活跃块数**：本 tick 真正被检查的分块数量。SPEC 第 2.4 节说得很清楚，
+//!   材质层的成本取决于活跃格子比例，不是网格尺寸。世界平静下来之后，
+//!   这个数字应当掉到 0——掉不下去就说明有东西在永远抖动，
+//!   跳块优化形同虚设。
+//! - **材质变化表**：跑了 N 个 tick 之后，每种材质多了多少少了多少。
+//!   守恒断言出错时，一眼就能看出是哪种材质凭空出现或消失了。
 
 use std::process::ExitCode;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use vivarium_core::{worldgen, MaterialKind, Rng, World};
+use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::Renderer;
 
@@ -34,6 +44,7 @@ struct Args {
     height: usize,
     ticks: u64,
     seed: u64,
+    ignite: usize,
     ascii: bool,
     quiet: bool,
     report_every: u64,
@@ -46,6 +57,7 @@ impl Default for Args {
             height: DEFAULT_HEIGHT,
             ticks: DEFAULT_TICKS,
             seed: DEFAULT_SEED,
+            ignite: 0,
             ascii: false,
             quiet: false,
             report_every: 0,
@@ -66,6 +78,7 @@ Vivarium headless 模拟器
     --height <N>         世界高度（必须是 64 的倍数）  [默认 {DEFAULT_HEIGHT}]
     --ticks <N>          推进的 tick 数                [默认 {DEFAULT_TICKS}]
     --seed <N>           随机种子                      [默认 {DEFAULT_SEED}]
+    --ignite <N>         在最高的岛顶点燃 N 格火（看它上浮、十几 tick 后烧完）  [默认 0 = 不点火]
     --report-every <N>   每 N 个 tick 打印一次进度     [默认 0 = 只在结束时打印]
     --ascii              结束时打印 ASCII 视图
     --quiet              只输出最终报告
@@ -91,6 +104,7 @@ fn parse_args() -> Result<Parsed, String> {
             "--height" => args.height = take_usize(&mut it, "--height")?,
             "--ticks" => args.ticks = take_u64(&mut it, "--ticks")?,
             "--seed" => args.seed = take_u64(&mut it, "--seed")?,
+            "--ignite" => args.ignite = take_usize(&mut it, "--ignite")?,
             "--report-every" => args.report_every = take_u64(&mut it, "--report-every")?,
             other => return Err(format!("未知参数: {other}\n\n{}", usage())),
         }
@@ -123,18 +137,83 @@ fn take_u64(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, St
 // 重力向下、海洋 + 岛屿）。这里只负责调用，不负责实现——
 // 早先 sim / game / 渲染预览各有一份副本，已经开始漂移了。
 
-fn print_report(world: &World, elapsed: Duration) {
+/// 材质的中文短名。仅用于控制台报告。
+fn material_label(kind: MaterialKind) -> &'static str {
+    match kind {
+        MaterialKind::Empty => "空",
+        MaterialKind::Stone => "石",
+        MaterialKind::Sand => "沙",
+        MaterialKind::Water => "水",
+        MaterialKind::Fire => "火",
+        MaterialKind::Gas => "气",
+        MaterialKind::Remains => "骸",
+    }
+}
+
+/// 在一行里紧凑地列出所有材质的格子数。
+fn census_line(census: &[usize; MaterialKind::COUNT]) -> String {
+    MaterialKind::ALL
+        .iter()
+        .map(|k| format!("{} {}", material_label(*k), census[k.as_u8() as usize]))
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+/// 在最高的岛顶撒 `count` 格火，用来观察燃烧与蔓延。
+///
+/// 点火位置贴着地表往上放一格——直接放在地表会立刻被地形埋掉。
+fn ignite_peak(world: &mut World, layout: &WorldLayout, count: usize) {
+    if count == 0 {
+        return;
+    }
+    let peak = layout.peak_x();
+    let half = count / 2;
+    for i in 0..count {
+        let x = (peak + i).saturating_sub(half).min(world.width() - 1);
+        let surface = layout.surface[x];
+        if surface <= 0 {
+            continue;
+        }
+        // 往上一格点火。若那里不是空的（比如正好是岩石），就跳过。
+        let y = surface - 1;
+        if world.get(x as isize, y) == MaterialKind::Empty {
+            world.set(x as isize, y, MaterialKind::Fire);
+        }
+    }
+}
+
+/// 跨 tick 累积的性能与工作量统计。
+#[derive(Default)]
+struct RunStats {
+    active_chunk_sum: u64,
+    visited_sum: u64,
+    moved_sum: u64,
+    reacted_sum: u64,
+    ticks: u64,
+}
+
+impl RunStats {
+    fn record(&mut self, sim: &MaterialSim) {
+        let s = sim.stats();
+        self.active_chunk_sum += s.active_chunks as u64;
+        self.visited_sum += s.visited as u64;
+        self.moved_sum += s.moved as u64;
+        self.reacted_sum += s.reacted as u64;
+        self.ticks += 1;
+    }
+}
+
+fn print_state(world: &World, label: &str) {
     let census = world.census();
     let total = (world.width() * world.height()) as f64;
 
     println!(
-        "tick {}  hash {:#018x}  dirty_chunks {}/{}",
+        "{label}  tick {}  hash {:#018x}  dirty_chunks {}/{}",
         world.tick(),
         world.hash(),
         world.dirty_chunk_count(),
         world.chunk_count()
     );
-
     for kind in MaterialKind::ALL {
         let n = census[kind.as_u8() as usize];
         if n == 0 {
@@ -143,9 +222,35 @@ fn print_report(world: &World, elapsed: Duration) {
         let pct = n as f64 / total * 100.0;
         println!("  {:<8} {:>9}  {:>5.2}%", kind.name(), n, pct);
     }
+}
 
-    if !elapsed.is_zero() {
-        println!("  用时      {:?}", elapsed);
+/// 打印"初始 → 最终"的材质变化表。
+///
+/// 守恒断言出错时，这张表比"哈希不一样"有用得多：它直接告诉你是哪种材质
+/// 凭空多出来或少掉了。
+fn print_delta(before: &[usize; MaterialKind::COUNT], after: &[usize; MaterialKind::COUNT]) {
+    let mut lines = Vec::new();
+    for kind in MaterialKind::ALL {
+        let i = kind.as_u8() as usize;
+        if before[i] == after[i] {
+            continue;
+        }
+        let d = after[i] as isize - before[i] as isize;
+        lines.push(format!(
+            "  {:<8} {:>9} → {:>9}   {:+}",
+            kind.name(),
+            before[i],
+            after[i],
+            d
+        ));
+    }
+    if lines.is_empty() {
+        println!("材质变化: 无（逐种守恒）");
+    } else {
+        println!("材质变化（初始 → 最终）:");
+        for line in lines {
+            println!("{line}");
+        }
     }
 }
 
@@ -172,6 +277,9 @@ fn main() -> ExitCode {
 
     let mut rng = Rng::new(args.seed);
     let layout = worldgen::sea_and_islands(&mut world, &mut rng);
+    ignite_peak(&mut world, &layout, args.ignite);
+
+    let census_before = world.census();
 
     if !args.quiet {
         println!(
@@ -184,27 +292,60 @@ fn main() -> ExitCode {
             layout.seabed,
             layout.land_columns()
         );
+        if args.ignite > 0 {
+            println!(
+                "点火：最高岛峰顶 x={} 附近 {} 格",
+                layout.peak_x(),
+                args.ignite
+            );
+        }
         println!("初始状态:");
-        print_report(&world, Duration::ZERO);
+        print_state(&world, "");
         println!();
     }
 
+    let mut sim = MaterialSim::new();
+    let mut stats = RunStats::default();
     let start = Instant::now();
     for i in 0..args.ticks {
-        world.step();
+        sim.step(&mut world);
+        stats.record(&sim);
+
         if args.report_every > 0 && (i + 1) % args.report_every == 0 {
+            let s = sim.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  |  {}",
                 i + 1,
                 args.ticks,
-                world.hash()
+                world.hash(),
+                s.active_chunks,
+                world.chunk_count(),
+                s.moved,
+                s.reacted,
+                census_line(&world.census()),
             );
         }
     }
     let elapsed = start.elapsed();
 
     println!("最终状态:");
-    print_report(&world, elapsed);
+    print_state(&world, "");
+    if !elapsed.is_zero() && args.ticks > 0 {
+        let ms_per_tick = elapsed.as_secs_f64() * 1000.0 / args.ticks as f64;
+        let avg_active = stats.active_chunk_sum as f64 / stats.ticks as f64;
+        let avg_visited = stats.visited_sum as f64 / stats.ticks as f64;
+        println!(
+            "  用时      {:?}  ·  {ms_per_tick:.4} ms/tick  ·  平均活跃块 {avg_active:.1}/{}  ·  平均访问 {avg_visited:.0} 格",
+            elapsed,
+            world.chunk_count()
+        );
+        println!(
+            "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次",
+            stats.visited_sum, stats.moved_sum, stats.reacted_sum
+        );
+    }
+    println!();
+    print_delta(&census_before, &world.census());
 
     if args.ascii {
         println!();

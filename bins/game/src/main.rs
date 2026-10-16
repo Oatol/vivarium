@@ -19,15 +19,22 @@
 //! |---|---|
 //! | 空格 | 暂停 / 继续 |
 //! | 1 / 2 / 3 / 4 | 速度 1× / 5× / 50× / 最大 |
+//! | F | 在最高的岛顶点一把火 |
 //! | R | 重新铺一遍地形（用来验证增量上传确实在工作） |
 //! | Esc | 退出 |
+//!
+//! ## 盯什么
+//!
+//! 标题栏里的**活跃块**是本项目最该盯的一个数字。SPEC 第 2.4 节说材质层的成本
+//! 取决于活跃格子比例，而不是网格尺寸——世界塌稳之后它应当掉到 0。
+//! 如果它长期停在满格，说明有东西在永远抖动，跳块优化等于没写。
 
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
-use vivarium_core::{worldgen, MaterialKind, Rng, World, WorldLayout};
+use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::pixel::PixelRenderer;
 use vivarium_render::Renderer;
@@ -108,7 +115,9 @@ fn parse_args() -> Result<Options, String> {
 }
 
 fn take_number(args: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, String> {
-    let raw = args.next().ok_or_else(|| format!("{flag} 后面缺一个数字"))?;
+    let raw = args
+        .next()
+        .ok_or_else(|| format!("{flag} 后面缺一个数字"))?;
     raw.parse::<u64>()
         .map_err(|_| format!("{flag} 的值 `{raw}` 不是数字"))
 }
@@ -234,6 +243,9 @@ struct Game {
     instance: wgpu::Instance,
     renderer: PixelRenderer,
     world: World,
+    /// 材质流动引擎。跨 tick 的状态（已移动掩码、活跃分块快照）都在它里面，
+    /// 世界的全部内容仍然在 `world` 里。
+    sim: MaterialSim,
     /// 初始地貌的两条基准线。横幅要用，将来相机取景也要用。
     layout: WorldLayout,
     rng: Rng,
@@ -267,8 +279,8 @@ impl Game {
             .map_err(|e| format!("创建绘制表面失败：{e}"))?;
 
         let size = window.inner_size();
-        let renderer =
-            PixelRenderer::new(&instance, surface, size.width, size.height).map_err(|e| e.to_string())?;
+        let renderer = PixelRenderer::new(&instance, surface, size.width, size.height)
+            .map_err(|e| e.to_string())?;
 
         let mut world = World::new(opts.width, opts.height).map_err(|e| e.to_string())?;
         let mut rng = Rng::new(opts.seed);
@@ -279,6 +291,7 @@ impl Game {
             instance,
             renderer,
             world,
+            sim: MaterialSim::new(),
             layout,
             rng,
             seed: opts.seed,
@@ -306,7 +319,7 @@ impl Game {
   地貌      : 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列
   世界纹理  : {} KiB（脏块增量上传）
 
-  空格 暂停/继续 · 1/2/3/4 速度 · R 重铺地形 · Esc 退出",
+  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · R 重铺地形 · Esc 退出",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -335,11 +348,38 @@ impl Game {
                 "2" => self.scale = TimeScale::X5,
                 "3" => self.scale = TimeScale::X50,
                 "4" => self.scale = TimeScale::Max,
+                "f" | "F" => self.ignite_peak(),
                 "r" | "R" => self.reseed(),
                 _ => {}
             },
             _ => {}
         }
+    }
+
+    /// 在最高的岛顶点一把火。
+    ///
+    /// 这不是装饰——它是**肉眼验证反应表与寿命**的最快路径：
+    /// 火应当沿可燃物蔓延、被水浇灭、十几 tick 后自己烧完。
+    /// 如果它永远不灭，或者一烧就烧穿整张图，问题一眼可见。
+    fn ignite_peak(&mut self) {
+        let peak = self.layout.peak_x();
+        let mut lit = 0usize;
+        for i in 0..8isize {
+            let x = peak as isize + i - 4;
+            if !self.world.in_bounds(x, 0) {
+                continue;
+            }
+            let surface = self.layout.surface[x as usize];
+            if surface <= 0 {
+                continue;
+            }
+            let y = surface - 1;
+            if self.world.get(x, y) == MaterialKind::Empty {
+                self.world.set(x, y, MaterialKind::Fire);
+                lit += 1;
+            }
+        }
+        println!("点火：岛峰 x={peak} 附近放了 {lit} 格火");
     }
 
     /// 换一个种子重铺地形。
@@ -352,13 +392,16 @@ impl Game {
         self.rng = Rng::new(self.seed);
         self.world.fill_all(MaterialKind::Empty);
         self.layout = worldgen::sea_and_islands(&mut self.world, &mut self.rng);
+        // 掩码里留着上一个世界的 tick 戳。虽然戳不匹配本身是安全的，
+        // 但重铺之后世界的"活跃区域"完全变了，重建一份更省心也更好推理。
+        self.sim = MaterialSim::new();
     }
 
     fn frame(&mut self) {
         let tick_start = Instant::now();
         let ticks = self.budget.plan_ticks(self.scale, self.last_tick_cost);
         for _ in 0..ticks {
-            self.world.step();
+            self.sim.step(&mut self.world);
         }
         if ticks > 0 {
             self.last_tick_cost = tick_start.elapsed() / ticks;
@@ -384,12 +427,15 @@ impl Game {
         self.fps_window_start = Instant::now();
 
         let stats = self.renderer.stats();
+        let sim = self.sim.stats();
         let total = self.world.chunk_count();
         self.window.set_title(&format!(
-            "Vivarium — tick {} · {:.0} fps · {} · 本帧上传 {}/{} 块 · 累计 {} 块",
+            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 本帧上传 {}/{} 块 · 累计 {} 块",
             self.world.tick(),
             self.fps,
             scale_label(self.scale),
+            sim.active_chunks,
+            total,
             stats.last_uploaded_chunks,
             total,
             stats.total_uploaded_chunks,
@@ -417,8 +463,9 @@ fn scale_label(scale: TimeScale) -> &'static str {
 // 三份已经开始漂移。世界地貌是**设计决定**（SPEC 第 2.0 节：横板侧视、
 // 重力向下、海洋 + 岛屿），不该有三份互相矛盾的实现。
 //
-// 顺带一提：生成出来的地形是静态的——沙不会塌、水不会流、火不会烧。
-// 那是 M1 的材质流动规则要接上的事。
+// M1 起，生成出来的地形不再是静态的：沙会塌、水会流、气会浮、火会烧，
+// 全部由 `vivarium_core::MaterialSim` 驱动。启动画面因此会自己演化——
+// 岛上的沙往海里滑、水找平、气泡从沉积层里浮上来。
 
 // ---------------------------------------------------------------------------
 // ASCII 降级路径
@@ -455,8 +502,9 @@ fn run_ascii(opts: &Options) -> ExitCode {
     let mut renderer = AsciiRenderer::new(camera);
 
     let hash_before = world.hash();
+    let mut sim = MaterialSim::new();
     for _ in 0..opts.ticks {
-        world.step();
+        sim.step(&mut world);
     }
     let hash_after = world.hash();
 

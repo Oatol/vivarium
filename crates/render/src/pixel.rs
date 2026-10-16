@@ -605,13 +605,7 @@ impl Blitter {
 ///
 /// 独立成自由函数是为了让它不借用 `Blitter`——`upload` 里 uploader 已经
 /// 可变借走了，再来一个 `&mut self` 就打架了。
-fn write_chunk(
-    queue: &wgpu::Queue,
-    texture: &wgpu::Texture,
-    cx: usize,
-    cy: usize,
-    pixels: &[u8],
-) {
+fn write_chunk(queue: &wgpu::Queue, texture: &wgpu::Texture, cx: usize, cy: usize, pixels: &[u8]) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -874,7 +868,7 @@ impl Renderer for PixelRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivarium_core::{worldgen, MaterialKind, Rng};
+    use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng};
 
     // --- letterbox ------------------------------------------------------
 
@@ -909,7 +903,13 @@ mod tests {
         // 这才是 letterbox 真正的不变量：**屏幕上的宽高比 == 世界的宽高比**。
         // 上面两条测的是具体数值，这条测的是性质——数值写反了它能抓住。
         for world in [(512, 512), (1024, 256), (256, 1024), (640, 640)] {
-            for target in [(800, 600), (600, 800), (1920, 1080), (1080, 1920), (1000, 1000)] {
+            for target in [
+                (800, 600),
+                (600, 800),
+                (1920, 1080),
+                (1080, 1920),
+                (1000, 1000),
+            ] {
                 let u = letterbox(world, target);
                 let on_screen_w = u.scale[0] * target.0 as f32;
                 let on_screen_h = u.scale[1] * target.1 as f32;
@@ -1115,14 +1115,13 @@ mod tests {
             apply_limit_buckets: false,
         }))
         .ok()?;
-        let (device, queue) =
-            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
-                label: Some("vivarium-test-device"),
-                required_features: wgpu::Features::empty(),
-                required_limits: adapter.limits(),
-                ..Default::default()
-            }))
-            .ok()?;
+        let (device, queue) = pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor {
+            label: Some("vivarium-test-device"),
+            required_features: wgpu::Features::empty(),
+            required_limits: adapter.limits(),
+            ..Default::default()
+        }))
+        .ok()?;
         Some((device, queue))
     }
 
@@ -1293,56 +1292,20 @@ mod tests {
         }
     }
 
-    /// 把离屏渲染结果写成 PNG，供人眼检查。
-    ///
-    /// 默认 `#[ignore]`：它会写文件，不该混在日常 `cargo test` 里。
-    /// 需要看的时候：
-    ///
-    /// ```text
-    /// cargo test -p vivarium-render --lib -- --ignored --nocapture render_preview_png
-    /// ```
-    ///
-    /// 为什么值得有这么一个测试：像素渲染的 bug（颜色偏了、上下颠倒、
-    /// 留边位置错了、行列错位）**全都是看一眼就知道、但很难写出好断言**的那一类。
-    /// 上面那些断言只能钉住少数几个采样点，这张图能一次性覆盖全部 307200 个像素。
-    #[test]
-    #[ignore = "会写文件；需要人眼看时手动跑"]
-    fn render_preview_png() {
-        let Some((device, queue)) = headless_device() else {
-            eprintln!("跳过：本机没有可用的 wgpu 适配器");
-            return;
-        };
-
-        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
-        let mut blitter = Blitter::new(device.clone(), queue.clone(), target_format);
-
-        let mut world = World::new(PREVIEW_WORLD, PREVIEW_WORLD).unwrap();
-        let mut rng = Rng::new(2026_1016);
-        let layout = seed_preview_world(&mut world, &mut rng);
-
-        let uploaded = blitter.upload(&world).expect("上传失败");
-        assert_eq!(uploaded, world.chunk_count(), "首帧应当整张上传");
-
-        let target = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("preview-target"),
-            size: wgpu::Extent3d {
-                width: PREVIEW_W,
-                height: PREVIEW_H,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: target_format,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("preview-encoder"),
-        });
-        blitter.draw(&mut encoder, &target_view, (PREVIEW_W, PREVIEW_H));
+    /// 把当前世界画进离屏纹理并读回像素。返回 `(像素, 本次上传的分块数)`。
+    fn blit_and_read(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        blitter: &mut Blitter,
+        target: &wgpu::Texture,
+        target_view: &wgpu::TextureView,
+        world: &World,
+    ) -> (Vec<u8>, usize) {
+        let uploaded = blitter.upload(world).expect("上传失败");
+        assert!(
+            uploaded <= world.chunk_count(),
+            "上传的分块数不可能超过总块数"
+        );
 
         // 640 × 4 = 2560，正好是 256 的整数倍，读回时不用补 padding。
         let bytes_per_row = PREVIEW_W * 4;
@@ -1352,9 +1315,14 @@ mod tests {
             usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
             mapped_at_creation: false,
         });
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("preview-encoder"),
+        });
+        blitter.draw(&mut encoder, target_view, (PREVIEW_W, PREVIEW_H));
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &target,
+                texture: target,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -1383,15 +1351,91 @@ mod tests {
         device.poll(wgpu::PollType::wait_indefinitely()).ok();
         assert!(rx.recv().expect("映射回调没回来").is_ok(), "缓冲映射失败");
 
-        let pixels: Vec<u8> = slice
-            .get_mapped_range()
-            .expect("取映射视图失败")
-            .to_vec();
+        let pixels: Vec<u8> = slice.get_mapped_range().expect("取映射视图失败").to_vec();
         readback.unmap();
+        (pixels, uploaded)
+    }
+
+    /// 把像素写成 PNG。返回落盘路径。
+    fn write_png(name: &str, pixels: &[u8]) -> std::path::PathBuf {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(name);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).expect("建 target 目录失败");
+        }
+        let file = std::fs::File::create(&out).expect("创建 PNG 失败");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), PREVIEW_W, PREVIEW_H);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("写 PNG 头失败");
+        writer.write_image_data(pixels).expect("写 PNG 数据失败");
+        drop(writer);
+        eprintln!("预览已写出：{}", out.display());
+        assert!(out.metadata().expect("读不到刚写的文件").len() > 1024);
+        out
+    }
+
+    /// 把离屏渲染结果写成 PNG，供人眼检查。
+    ///
+    /// 默认 `#[ignore]`：它会写文件，不该混在日常 `cargo test` 里。
+    /// 需要看的时候：
+    ///
+    /// ```text
+    /// cargo test -p vivarium-render --lib -- --ignored --nocapture render_preview_png
+    /// ```
+    ///
+    /// 为什么值得有这么一个测试：像素渲染的 bug（颜色偏了、上下颠倒、
+    /// 留边位置错了、行列错位）**全都是看一眼就知道、但很难写出好断言**的那一类。
+    /// 上面那些断言只能钉住少数几个采样点，这张图能一次性覆盖全部 307200 个像素。
+    ///
+    /// M1 起它写**两张**：`render-preview.png` 是刚生成的地貌，
+    /// `render-preview-settled.png` 是材质层跑完之后的同一张图。
+    /// 两张对比就能看出沙塌了、水找平了、气泡浮上去了——
+    /// 这是"材质规则真的在工作"最直观的证据。
+    #[test]
+    #[ignore = "会写文件；需要人眼看时手动跑"]
+    fn render_preview_png() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("跳过：本机没有可用的 wgpu 适配器");
+            return;
+        };
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut blitter = Blitter::new(device.clone(), queue.clone(), target_format);
+
+        let mut world = World::new(PREVIEW_WORLD, PREVIEW_WORLD).unwrap();
+        let mut rng = Rng::new(2026_1016);
+        let layout = seed_preview_world(&mut world, &mut rng);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview-target"),
+            size: wgpu::Extent3d {
+                width: PREVIEW_W,
+                height: PREVIEW_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // --- 第一张：刚生成的地貌 ---------------------------------------
+        let (pixels, first_upload) =
+            blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
+        assert_eq!(
+            first_upload,
+            world.chunk_count(),
+            "首帧没有任何参照，必须整张上传"
+        );
 
         // --- 先断言几个"看一眼才知道对不对"的点 -------------------------
 
-        let bpr = bytes_per_row as usize;
+        let bpr = (PREVIEW_W * 4) as usize;
         let bg = palette::BACKGROUND;
         let [sr, sg, sb] = palette::rgb(MaterialKind::Stone);
 
@@ -1421,7 +1465,7 @@ mod tests {
 
         // --- 再验一遍新地貌（海洋 + 岛屿）确实画出来了 ----------------
         //
-        // 世界 256² 映射到屏幕上 480×480 的方块，左上角在 (80, 0)。
+        // 世界映射到屏幕上 480×480 的方块，左上角在 (80, 0)。
         let scale = PREVIEW_H as f32 / PREVIEW_WORLD as f32;
         let sx = |wx: usize| 80 + (wx as f32 * scale) as usize;
         let sy = |wy: usize| (wy as f32 * scale) as usize;
@@ -1429,7 +1473,7 @@ mod tests {
         // 挑一列确定是海的：地表远在水面线之下。
         let ocean_x = (0..PREVIEW_WORLD)
             .find(|&x| layout.surface[x] > layout.waterline as isize + 24)
-            .expect("256² 的世界里应当至少有一列是海");
+            .expect("世界里的应当至少有一列是海");
 
         let sky = &pixels[sy(layout.waterline - 10) * bpr + sx(ocean_x) * 4..][..4];
         assert_color_close(sky, [bg[0], bg[1], bg[2], 255], "水面线之上的空天");
@@ -1442,27 +1486,48 @@ mod tests {
         let bed = &pixels[sy(layout.seabed + 8) * bpr + sx(ocean_x) * 4..][..4];
         assert_color_close(bed, [sr, sg, sb, 255], "海床线以下的基岩");
 
-        // --- 再写成 PNG ------------------------------------------------
+        write_png("render-preview.png", &pixels);
 
-        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../target/render-preview.png");
-        if let Some(parent) = out.parent() {
-            std::fs::create_dir_all(parent).expect("建 target 目录失败");
+        // --- 第二张：材质层跑完之后 -------------------------------------
+        //
+        // 先让模拟把世界塌稳。512² 大约两百多 tick 就完全静止，
+        // 这里多跑一截是为了拿到"稳态"而不是"正在塌"的中间态。
+        let mut sim = MaterialSim::new();
+        let mut settled_at = None;
+        for t in 0..2000 {
+            sim.step(&mut world);
+            if world.dirty_chunk_count() == 0 {
+                settled_at = Some(t);
+                break;
+            }
         }
+        let settled_at = settled_at.expect("预览用的世界应当能塌稳");
+        assert_eq!(world.dirty_chunk_count(), 0, "稳态世界的脏块数应当是 0");
 
-        let file = std::fs::File::create(&out).expect("创建 PNG 失败");
-        let mut encoder = png::Encoder::new(
-            std::io::BufWriter::new(file),
-            PREVIEW_W,
-            PREVIEW_H,
+        // 这一帧把模拟造成的变化追上 GPU。上传量应当大于 0——
+        // 否则说明要么世界压根没变，要么影子副本漏更新了。
+        let (settled, caught_up) =
+            blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
+        assert!(caught_up > 0, "世界明明变了，却一块都没上传");
+        assert_ne!(
+            settled, pixels,
+            "跑了 {settled_at} tick 之后画面居然一模一样"
         );
-        encoder.set_color(png::ColorType::Rgba);
-        encoder.set_depth(png::BitDepth::Eight);
-        let mut writer = encoder.write_header().expect("写 PNG 头失败");
-        writer.write_image_data(&pixels).expect("写 PNG 数据失败");
-        drop(writer);
 
-        eprintln!("预览已写出：{}", out.display());
-        assert!(out.metadata().expect("读不到刚写的文件").len() > 1024);
+        // 再画一帧：世界已经不动了，应当**一块都不传**，而且画面逐像素相同。
+        //
+        // 这条同时钉住两件事：增量上传确实按"内容有没有变"工作，
+        // 以及渲染是纯函数——同一份世界画两次必须给出同一张图。
+        let (again, idle) =
+            blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
+        assert_eq!(idle, 0, "静止世界不该再上传任何分块");
+        assert_eq!(again, settled, "同一份世界重画应当逐像素相同");
+
+        eprintln!(
+            "世界在第 {settled_at} tick 塌稳；本帧上传 {caught_up}/{} 块，下一帧 {idle} 块；材质计数 {:?}",
+            world.chunk_count(),
+            world.census()
+        );
+        write_png("render-preview-settled.png", &settled);
     }
 }

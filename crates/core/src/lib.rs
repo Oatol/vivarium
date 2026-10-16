@@ -24,10 +24,15 @@
 
 pub mod material;
 pub mod rng;
+pub mod sim;
 pub mod world;
 pub mod worldgen;
 
-pub use material::MaterialKind;
+pub use material::{
+    ignite_chance, react, MaterialKind, MoveRule, Reaction, FIRE_LIFETIME, IGNITE_BASE_PERCENT,
+    REACTIONS,
+};
 pub use rng::Rng;
+pub use sim::{MaterialSim, MovedMask};
 pub use world::{MaterialCell, World, WorldError, CHUNK_SIZE};
 pub use worldgen::{sea_and_islands, WorldLayout};

@@ -91,7 +91,10 @@ mod tests {
     #[test]
     fn paused_runs_nothing() {
         let b = FrameBudget::default();
-        assert_eq!(b.plan_ticks(TimeScale::Paused, Duration::from_micros(10)), 0);
+        assert_eq!(
+            b.plan_ticks(TimeScale::Paused, Duration::from_micros(10)),
+            0
+        );
     }
 
     #[test]

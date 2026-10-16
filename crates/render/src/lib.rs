@@ -53,10 +53,9 @@ impl std::fmt::Display for RenderError {
             ),
             Self::NotInitialized => write!(f, "renderer is not initialized"),
             Self::GpuInit(msg) => write!(f, "GPU 初始化失败：{msg}"),
-            Self::WorldTooLarge { width, height, max } => write!(
-                f,
-                "世界尺寸 {width}x{height} 超过显卡纹理上限 {max}"
-            ),
+            Self::WorldTooLarge { width, height, max } => {
+                write!(f, "世界尺寸 {width}x{height} 超过显卡纹理上限 {max}")
+            }
             Self::SurfaceValidation => write!(f, "交换链报出验证错误"),
         }
     }
