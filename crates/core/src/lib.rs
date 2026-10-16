@@ -14,11 +14,20 @@
 //!
 //! 所有随机都走 [`rng::Rng`]（固定种子），**禁用系统随机**。
 //! 契约：同种子 + 同操作序列 ⇒ 同结果，且网格哈希逐 tick 一致。
+//!
+//! ## 世界的形状
+//!
+//! 世界是一张**横板侧视剖面**，有唯一的重力轴（+Y 向下）：
+//! 沙往下掉、气往上浮、光自上而下衰减。默认地貌是「海洋 + 岛屿」，
+//! 由 [`worldgen::sea_and_islands`] 生成。这条决定见 SPEC 第 2.0 节——
+//! 它管着材质规则、并行扫描顺序和生物的运动方式。
 
 pub mod material;
 pub mod rng;
 pub mod world;
+pub mod worldgen;
 
 pub use material::MaterialKind;
 pub use rng::Rng;
 pub use world::{MaterialCell, World, WorldError, CHUNK_SIZE};
+pub use worldgen::{sea_and_islands, WorldLayout};

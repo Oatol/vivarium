@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
-use vivarium_core::{MaterialKind, Rng, World};
+use vivarium_core::{worldgen, MaterialKind, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::pixel::PixelRenderer;
 use vivarium_render::Renderer;
@@ -234,6 +234,8 @@ struct Game {
     instance: wgpu::Instance,
     renderer: PixelRenderer,
     world: World,
+    /// 初始地貌的两条基准线。横幅要用，将来相机取景也要用。
+    layout: WorldLayout,
     rng: Rng,
     seed: u64,
 
@@ -270,13 +272,14 @@ impl Game {
 
         let mut world = World::new(opts.width, opts.height).map_err(|e| e.to_string())?;
         let mut rng = Rng::new(opts.seed);
-        seed_world(&mut world, &mut rng);
+        let layout = worldgen::sea_and_islands(&mut world, &mut rng);
 
         Ok(Self {
             window,
             instance,
             renderer,
             world,
+            layout,
             rng,
             seed: opts.seed,
             scale: TimeScale::X1,
@@ -295,11 +298,12 @@ impl Game {
         // 问它只会得到 0，然后横幅上写着"世界纹理 0 KiB"。
         let texture_kib = (self.world.width() * self.world.height() * 4) / 1024;
         format!(
-            "Vivarium — 图形前端
+            "Vivarium — 图形前端（横板侧视 · 重力向下）
 
   适配器    : {}  ({:?})
   交换链    : {:?} @ {sw}×{sh}
   世界      : {}×{} 格，{} 个分块
+  地貌      : 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列
   世界纹理  : {} KiB（脏块增量上传）
 
   空格 暂停/继续 · 1/2/3/4 速度 · R 重铺地形 · Esc 退出",
@@ -309,6 +313,9 @@ impl Game {
             self.world.width(),
             self.world.height(),
             self.world.chunk_count(),
+            self.layout.waterline,
+            self.layout.seabed,
+            self.layout.land_columns(),
             texture_kib,
         )
     }
@@ -344,7 +351,7 @@ impl Game {
         self.seed = self.seed.wrapping_add(1);
         self.rng = Rng::new(self.seed);
         self.world.fill_all(MaterialKind::Empty);
-        seed_world(&mut self.world, &mut self.rng);
+        self.layout = worldgen::sea_and_islands(&mut self.world, &mut self.rng);
     }
 
     fn frame(&mut self) {
@@ -403,90 +410,15 @@ fn scale_label(scale: TimeScale) -> &'static str {
 // ---------------------------------------------------------------------------
 // 地形
 // ---------------------------------------------------------------------------
-
-/// 地表高度占世界高度的比例。
-///
-/// 放下三分之一：上面三分之二是天空，留给将来的飞行生物、气候层和上帝画笔。
-/// 早先版本用的是下六分之一，结果 512² 的世界里地面只占屏幕上薄薄一条，
-/// 整个画面看起来像"没画完"。
-const GROUND_FRACTION: usize = 3;
-
-/// 铺一小片地形，让首帧就有东西可看。
-///
-/// ⚠️ 这是**给渲染演示用的静态地形**，不是 M1 的材质规则：
-/// 沙不会塌，水不会流，火不会烧。它存在的意义只有一个——
-/// 让整条管线（世界 → 调色板 → 纹理 → 四边形）在第一帧就跑通，
-/// 而且六种非空材质都能出现，调色板有没有配错一眼就能看出来。
-///
-/// 注：`crates/render/src/pixel.rs` 的预览测试里有一份等价的副本，
-/// 改这里的时候记得一起改。
-fn seed_world(world: &mut World, rng: &mut Rng) {
-    let w = world.width();
-    let h = world.height();
-    let floor_top = h - h / GROUND_FRACTION;
-
-    // 基岩
-    world.fill_rect(0, floor_top as isize, w, h - floor_top, MaterialKind::Stone);
-
-    // 起伏的沙层。**带均值回归**的随机游走。
-    //
-    // 纯随机游走会一路漂走：早先版本里沙层爬到画面右侧半空，
-    // 因为"抬升"的累积没有任何东西把它拉回基线。
-    // 这里让偏离基线越远，回拉的概率越大。
-    let mut surface = floor_top as isize;
-    for x in 0..w as isize {
-        let roll = rng.gen_range_u32(0, 100);
-        let drift = floor_top as isize - surface; // 正数 = 当前比基线高
-        let up_chance = if drift > 4 {
-            15
-        } else if drift < -4 {
-            45
-        } else {
-            25
-        };
-        let down_chance = 50 - up_chance;
-        if roll < up_chance {
-            surface = (surface - 1).max(1);
-        } else if roll < up_chance + down_chance {
-            surface = (surface + 1).min(floor_top as isize + 10);
-        }
-        let thickness = rng.gen_range_usize(2, 6);
-        world.fill_rect(x, surface, 1, thickness, MaterialKind::Sand);
-    }
-
-    // 两处石台。给画面一点纵向层次——纯平的地面看起来像块背景板。
-    for _ in 0..2 {
-        let x = rng.gen_range_usize(0, w.saturating_sub(w / 5).max(1)) as isize;
-        let height = rng.gen_range_usize(6, 16);
-        let width = rng.gen_range_usize((w / 12).max(1), (w / 6).max(2));
-        let top = floor_top.saturating_sub(height);
-        world.fill_rect(x, top as isize, width, height, MaterialKind::Stone);
-    }
-
-    // 一处水洼
-    let pool_x = (w / 4) as isize;
-    world.fill_rect(
-        pool_x,
-        (floor_top as isize - 14).max(1),
-        w / 5,
-        14,
-        MaterialKind::Water,
-    );
-
-    // 空气中的气泡
-    for _ in 0..(w / 6) {
-        let x = rng.gen_range_usize(0, w) as isize;
-        let y = rng.gen_range_usize(0, (floor_top as isize - 20).max(1) as usize) as isize;
-        world.fill_rect(x, y, 2, 2, MaterialKind::Gas);
-    }
-
-    // 地层里的残骸——细胞死亡后的产物，M2 起它会真的出现
-    for _ in 0..(w / 8) {
-        let x = rng.gen_range_usize(0, w) as isize;
-        let y = rng.gen_range_usize(floor_top, h) as isize;
-        world.set(x, y, MaterialKind::Remains);
-    }
-}
+//
+// 地貌生成已经搬进 `vivarium_core::worldgen`。
+//
+// 原先这里有一份，`bins/sim` 和 `crates/render` 的预览测试里各有一份，
+// 三份已经开始漂移。世界地貌是**设计决定**（SPEC 第 2.0 节：横板侧视、
+// 重力向下、海洋 + 岛屿），不该有三份互相矛盾的实现。
+//
+// 顺带一提：生成出来的地形是静态的——沙不会塌、水不会流、火不会烧。
+// 那是 M1 的材质流动规则要接上的事。
 
 // ---------------------------------------------------------------------------
 // ASCII 降级路径
@@ -502,17 +434,21 @@ fn run_ascii(opts: &Options) -> ExitCode {
     };
 
     let mut rng = Rng::new(opts.seed);
-    seed_world(&mut world, &mut rng);
+    let layout = worldgen::sea_and_islands(&mut world, &mut rng);
 
     let view_width = 100.min(world.width());
     let view_height = 30.min(world.height());
     let mut camera = Camera::fit_bottom_left(&world, view_width, view_height);
-    // 往上挪一点，让地表落在视野下三分之一处。
-    // 直接贴左下角的话，512² 世界里那 85 格厚的岩层会把整个视野填满，
+    // 直接贴左下角的话，512² 世界里那近百格厚的岩层会把整个视野填满，
     // 屏幕上只剩一片 '#'——那等于什么都没看到。
-    let floor_top = world.height() - world.height() / GROUND_FRACTION;
-    let target_y = floor_top.saturating_sub(view_height * 2 / 3);
-    camera.pan(&world, 0, target_y as isize - camera.y as isize);
+    // 由地貌自己告诉我们该往哪儿看（见 `WorldLayout::focus_left/focus_top`）。
+    let target_x = layout.focus_left(view_width);
+    let target_y = layout.focus_top(view_height);
+    camera.pan(
+        &world,
+        target_x as isize - camera.x as isize,
+        target_y as isize - camera.y as isize,
+    );
 
     let mut renderer = AsciiRenderer::new(camera);
 
@@ -529,11 +465,14 @@ fn run_ascii(opts: &Options) -> ExitCode {
 
     println!("Vivarium — ASCII 降级视图（渲染器 = {}）", renderer.name());
     println!(
-        "{}×{} 世界，跑了 {} tick",
+        "{}×{} 世界 · 横板侧视 · 水面线 y={} · 海床线 y={} · 陆地 {} 列",
         world.width(),
         world.height(),
-        opts.ticks
+        layout.waterline,
+        layout.seabed,
+        layout.land_columns()
     );
+    println!("跑了 {} tick", opts.ticks);
     println!("hash {hash_before:#018x} → {hash_after:#018x}");
     println!();
     println!("{}", renderer.frame());

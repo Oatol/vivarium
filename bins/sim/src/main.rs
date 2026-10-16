@@ -15,7 +15,7 @@
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
-use vivarium_core::{MaterialKind, Rng, World};
+use vivarium_core::{worldgen, MaterialKind, Rng, World};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::Renderer;
 
@@ -115,49 +115,13 @@ fn take_u64(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, St
         .map_err(|_| format!("{flag} 需要一个非负整数，收到: {raw}"))
 }
 
-/// 铺一片确定性的初始地形。
-///
-/// 刻意写得简单——M0 的职责只是"世界能被看见、能被复现"，
-/// 真正的材质流动规则属于 M3。这里的唯一硬要求是：**同种子必须给出同一个世界**。
-/// 返回值是基岩顶面的 Y 坐标，供相机对准地表使用。
-fn seed_world(world: &mut World, rng: &mut Rng) -> isize {
-    let w = world.width();
-    let h = world.height();
-
-    // 石头基岩：底部八分之一
-    let floor_top = h - h / 8;
-    world.fill_rect(0, floor_top as isize, w, h - floor_top, MaterialKind::Stone);
-
-    // 起伏的沙层：一条随机游走的表面线
-    let mut surface = floor_top as isize;
-    let lowest = (floor_top as isize - 16).max(1);
-    for x in 0..w as isize {
-        match rng.gen_range_u32(0, 4) {
-            0 => surface = (surface + 1).min(floor_top as isize + 4),
-            1 => surface = (surface - 1).max(lowest),
-            _ => {}
-        }
-        let thickness = rng.gen_range_usize(1, 5);
-        world.fill_rect(x, surface, 1, thickness, MaterialKind::Sand);
-    }
-
-    // 一个水洼，制造材质边界
-    let pool_w = (w / 8).max(8);
-    let pool_x = (w / 3) as isize;
-    let pool_top = (floor_top as isize - 12).max(1);
-    world.fill_rect(pool_x, pool_top, pool_w, 12, MaterialKind::Water);
-
-    // 若干团可燃气体，给火留点戏（M3 之后才会真的烧起来）
-    let blob_count = w / 4;
-    let sky = (floor_top as isize - 24).max(1) as usize;
-    for _ in 0..blob_count {
-        let x = rng.gen_range_usize(0, w) as isize;
-        let y = rng.gen_range_usize(0, sky) as isize;
-        world.fill_rect(x, y, 2, 2, MaterialKind::Gas);
-    }
-
-    floor_top as isize
-}
+// ---------------------------------------------------------------------------
+// 地形
+// ---------------------------------------------------------------------------
+//
+// 地貌生成在 `vivarium_core::worldgen`（SPEC 第 2.0 节：横板侧视、
+// 重力向下、海洋 + 岛屿）。这里只负责调用，不负责实现——
+// 早先 sim / game / 渲染预览各有一份副本，已经开始漂移了。
 
 fn print_report(world: &World, elapsed: Duration) {
     let census = world.census();
@@ -207,12 +171,18 @@ fn main() -> ExitCode {
     };
 
     let mut rng = Rng::new(args.seed);
-    let surface = seed_world(&mut world, &mut rng);
+    let layout = worldgen::sea_and_islands(&mut world, &mut rng);
 
     if !args.quiet {
         println!(
             "Vivarium sim — {}x{}  seed {}  ticks {}",
             args.width, args.height, args.seed, args.ticks
+        );
+        println!(
+            "地貌：横板侧视 · 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列",
+            layout.waterline,
+            layout.seabed,
+            layout.land_columns()
         );
         println!("初始状态:");
         print_report(&world, Duration::ZERO);
@@ -238,24 +208,29 @@ fn main() -> ExitCode {
 
     if args.ascii {
         println!();
-        // 相机对准地表：让视野的四分之三落在地表之上，
-        // 这样一眼能看到天空、材质边界和基岩，而不是一大片石头或一大片空天。
-        let view_y = surface.saturating_sub((ASCII_VIEW_HEIGHT * 3 / 4) as isize) as usize;
-        let mut renderer = AsciiRenderer::new(Camera::new(
-            0,
-            view_y,
-            ASCII_VIEW_WIDTH,
-            ASCII_VIEW_HEIGHT,
-        ));
+        // 相机由地貌自己定位：对准最高的那座岛，让天空、岛屿轮廓和水体边界
+        // 同时入画。早先是硬编码"贴地表往上挪四分之三"，那只在"地面在下三分之一"
+        // 这一种地形下成立；换成海洋 + 岛屿之后，那个公式会把视野停在空水里。
+        let view_height = ASCII_VIEW_HEIGHT.min(world.height());
+        let view_width = ASCII_VIEW_WIDTH.min(world.width());
+        let mut camera = Camera::fit_bottom_left(&world, view_width, view_height);
+        let target_x = layout.focus_left(view_width);
+        let target_y = layout.focus_top(view_height);
+        camera.pan(
+            &world,
+            target_x as isize - camera.x as isize,
+            target_y as isize - camera.y as isize,
+        );
+
+        let mut renderer = AsciiRenderer::new(camera);
         if let Err(e) = renderer.render(&world) {
             eprintln!("ASCII 渲染失败: {e}");
             return ExitCode::FAILURE;
         }
         println!(
-            "ASCII 视图（{}x{}，对准地表 y={}，渲染器 = {}）:",
-            ASCII_VIEW_WIDTH,
-            ASCII_VIEW_HEIGHT,
-            view_y,
+            "ASCII 视图（{view_width}x{view_height}，对准最高的岛 x={}，水面线 y={}，渲染器 = {}）:",
+            layout.peak_x(),
+            layout.waterline,
             renderer.name()
         );
         println!("{}", renderer.frame());

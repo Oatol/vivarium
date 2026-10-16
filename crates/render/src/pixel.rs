@@ -874,7 +874,7 @@ impl Renderer for PixelRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivarium_core::{MaterialKind, Rng};
+    use vivarium_core::{worldgen, MaterialKind, Rng};
 
     // --- letterbox ------------------------------------------------------
 
@@ -1266,82 +1266,22 @@ mod tests {
 
     // --- 人眼预览 ---------------------------------------------------------
 
-    /// 预览图尺寸。16:12 的宽屏比例，用来顺带把 letterbox 的留边也画出来。
+    /// 预览图尺寸。4:3，用来顺带把 letterbox 的留边也画出来。
     const PREVIEW_W: u32 = 640;
     const PREVIEW_H: u32 = 480;
-    const PREVIEW_WORLD: usize = 256;
-
-    /// 和 `bins/game` 里那份地形保持一致——预览要能代表真实启动画面。
+    /// 用 SPEC 里的默认世界尺寸——预览图要能代表真实启动画面。
     ///
-    /// 这份副本是刻意的：让 `vivarium-render` 去依赖 `vivarium-app` 只为拿一个
-    /// 演示地形，会把依赖图弄脏，得不偿失。改那边的时候记得一起改。
-    fn seed_preview_world(world: &mut World, rng: &mut Rng) {
-        let w = world.width();
-        let h = world.height();
-        let floor_top = h - h / 3;
+    /// 早先用的是 256²，结果一座岛就占满整个画面，
+    /// 看不出"海洋 + 岛屿"是什么样子。
+    const PREVIEW_WORLD: usize = 512;
 
-        world.fill_rect(0, floor_top as isize, w, h - floor_top, MaterialKind::Stone);
-
-        // 带均值回归的随机游走。见 bins/game 里同名函数的说明。
-        let mut surface = floor_top as isize;
-        for x in 0..w as isize {
-            let roll = rng.gen_range_u32(0, 100);
-            let drift = floor_top as isize - surface;
-            let up_chance = if drift > 4 {
-                15
-            } else if drift < -4 {
-                45
-            } else {
-                25
-            };
-            let down_chance = 50 - up_chance;
-            if roll < up_chance {
-                surface = (surface - 1).max(1);
-            } else if roll < up_chance + down_chance {
-                surface = (surface + 1).min(floor_top as isize + 10);
-            }
-            let thickness = rng.gen_range_usize(2, 6);
-            world.fill_rect(x, surface, 1, thickness, MaterialKind::Sand);
-        }
-
-        for _ in 0..2 {
-            let x = rng.gen_range_usize(0, w.saturating_sub(w / 5).max(1)) as isize;
-            let height = rng.gen_range_usize(6, 16);
-            let width = rng.gen_range_usize((w / 12).max(1), (w / 6).max(2));
-            let top = floor_top.saturating_sub(height);
-            world.fill_rect(x, top as isize, width, height, MaterialKind::Stone);
-        }
-
-        let pool_x = (w / 4) as isize;
-        world.fill_rect(
-            pool_x,
-            (floor_top as isize - 14).max(1),
-            w / 5,
-            14,
-            MaterialKind::Water,
-        );
-
-        for _ in 0..(w / 6) {
-            let x = rng.gen_range_usize(0, w) as isize;
-            let y = rng.gen_range_usize(0, (floor_top as isize - 20).max(1) as usize) as isize;
-            world.fill_rect(x, y, 2, 2, MaterialKind::Gas);
-        }
-
-        for _ in 0..(w / 8) {
-            let x = rng.gen_range_usize(0, w) as isize;
-            let y = rng.gen_range_usize(floor_top, h) as isize;
-            world.set(x, y, MaterialKind::Remains);
-        }
-
-        // 一小撮火，把调色板最后一个颜色也用上。
-        // （M1 之前它不会蔓延，也不会熄灭，就静静待在那儿。）
-        world.fill_rect(
-            (w / 2) as isize,
-            (floor_top as isize - 34).max(1),
-            5,
-            5,
-            MaterialKind::Fire,
-        );
+    /// 预览用的世界地貌。
+    ///
+    /// 直接调用 `vivarium_core::worldgen`——**不要再往这里抄一份地形生成**。
+    /// M0 期间这段逻辑在 sim / game / 这里各有一份，三份已经开始漂移；
+    /// 预览图只有在和真实启动画面用同一套地貌时才有意义。
+    fn seed_preview_world(world: &mut World, rng: &mut Rng) -> worldgen::WorldLayout {
+        worldgen::sea_and_islands(world, rng)
     }
 
     fn assert_color_close(actual: &[u8], expected: [u8; 4], what: &str) {
@@ -1378,7 +1318,7 @@ mod tests {
 
         let mut world = World::new(PREVIEW_WORLD, PREVIEW_WORLD).unwrap();
         let mut rng = Rng::new(2026_1016);
-        seed_preview_world(&mut world, &mut rng);
+        let layout = seed_preview_world(&mut world, &mut rng);
 
         let uploaded = blitter.upload(&world).expect("上传失败");
         assert_eq!(uploaded, world.chunk_count(), "首帧应当整张上传");
@@ -1478,6 +1418,29 @@ mod tests {
         // 右边界同样要落在 640 - 80 = 560。
         let right_bar = &pixels[row * bpr + (PREVIEW_W as usize - bar + 1) * 4..][..4];
         assert_color_close(right_bar, [bg[0], bg[1], bg[2], 255], "右侧留边");
+
+        // --- 再验一遍新地貌（海洋 + 岛屿）确实画出来了 ----------------
+        //
+        // 世界 256² 映射到屏幕上 480×480 的方块，左上角在 (80, 0)。
+        let scale = PREVIEW_H as f32 / PREVIEW_WORLD as f32;
+        let sx = |wx: usize| 80 + (wx as f32 * scale) as usize;
+        let sy = |wy: usize| (wy as f32 * scale) as usize;
+
+        // 挑一列确定是海的：地表远在水面线之下。
+        let ocean_x = (0..PREVIEW_WORLD)
+            .find(|&x| layout.surface[x] > layout.waterline as isize + 24)
+            .expect("256² 的世界里应当至少有一列是海");
+
+        let sky = &pixels[sy(layout.waterline - 10) * bpr + sx(ocean_x) * 4..][..4];
+        assert_color_close(sky, [bg[0], bg[1], bg[2], 255], "水面线之上的空天");
+
+        let [wr, wg, wb] = palette::rgb(MaterialKind::Water);
+        let sea = &pixels[sy(layout.waterline + 10) * bpr + sx(ocean_x) * 4..][..4];
+        assert_color_close(sea, [wr, wg, wb, 255], "水面线之下的海水");
+
+        // 海床线以下是基岩，不可能有水。
+        let bed = &pixels[sy(layout.seabed + 8) * bpr + sx(ocean_x) * 4..][..4];
+        assert_color_close(bed, [sr, sg, sb, 255], "海床线以下的基岩");
 
         // --- 再写成 PNG ------------------------------------------------
 
