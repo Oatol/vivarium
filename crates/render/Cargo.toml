@@ -9,5 +9,17 @@ license.workspace = true
 [dependencies]
 vivarium-core.workspace = true
 
-# wgpu / winit 将在 M0 第二步接入。
-# 现在不引入，是为了让 `cargo check` 保持秒级——ASCII 渲染器完全不需要 GPU。
+# GPU 侧。注意这里**没有 winit**：
+# 窗口与事件循环属于应用层，render 只接受一个已经建好的 `wgpu::Surface`。
+# 这样 `bins/sim` 之外的东西想跑 headless 渲染时，不需要拖进一整套窗口系统。
+wgpu.workspace = true
+bytemuck.workspace = true
+# wgpu 的 adapter / device 请求是 async 的；pollster 是零依赖的最小阻塞执行器。
+pollster.workspace = true
+
+[dev-dependencies]
+# 只服务于"把离屏渲染结果导成 PNG"这一个预览测试。
+# 目的是让"画得对不对"可以被人眼直接看一眼，而不是只能靠断言数字去猜——
+# 像素渲染的问题（颜色偏了、上下颠倒、错位）全都是看一眼就知道、
+# 但很难写出好断言的那一类。
+png = "0.18"

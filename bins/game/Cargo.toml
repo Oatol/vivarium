@@ -16,5 +16,9 @@ vivarium-render.workspace = true
 vivarium-ui.workspace = true
 vivarium-app.workspace = true
 
-# M0 第二步会在这里加上 wgpu + winit。
-# 在那之前，图形前端刻意保持零图形依赖，以便整个 workspace 能秒级 check。
+# 窗口与事件循环只属于应用层。
+# vivarium-render 不依赖 winit——它只接受一个已经建好的 wgpu::Surface，
+# 这样"能不能开窗口"和"怎么把世界画成像素"是两件可以分别替换的事。
+winit.workspace = true
+wgpu.workspace = true
+pollster.workspace = true

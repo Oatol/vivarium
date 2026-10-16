@@ -9,12 +9,12 @@
 //! 1. [`Renderer`] 的方法只接收 `&World`——接口签名层面就杜绝了渲染器写回网格的可能；
 //! 2. 两个渲染器共用同一份 [`palette`] 语义映射，视觉可以不同，语义必须一致。
 //!
-//! ## M0 状态
+//! ## 状态
 //!
 //! | 渲染器 | 状态 |
 //! |---|---|
-//! | [`ascii::AsciiRenderer`] | ✅ 已完成。零 GPU 依赖，终端里能看，headless 调试主力 |
-//! | [`pixel::PixelRenderer`] | ⏳ wgpu 实现，M0 第二步接入 |
+//! | [`ascii::AsciiRenderer`] | ✅ 零 GPU 依赖，终端里能看，headless 调试主力 |
+//! | [`pixel::PixelRenderer`] | ✅ wgpu。世界纹理 + 脏块增量上传 + 全屏四边形 |
 
 pub mod ascii;
 pub mod palette;
@@ -23,6 +23,10 @@ pub mod pixel;
 use vivarium_core::World;
 
 /// 渲染错误。
+///
+/// 注意这里**没有**"交换链暂时拿不到帧"这一类。那不是错误——窗口被遮挡、
+/// 垂直同步超时都是正常现象，下一帧就好了。它们被记在
+/// [`pixel::PixelStats::skipped_frames`] 里，调用方想看再去看。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RenderError {
     /// 渲染目标尺寸与世界不匹配。
@@ -32,6 +36,12 @@ pub enum RenderError {
     },
     /// 渲染后端尚未初始化。
     NotInitialized,
+    /// GPU 初始化失败：没有适配器、设备创建被拒、交换链没有可用格式等。
+    GpuInit(String),
+    /// 世界尺寸超出显卡的纹理上限。
+    WorldTooLarge { width: u32, height: u32, max: u32 },
+    /// 交换链在获取帧时报了验证错误。这属于真的出问题了。
+    SurfaceValidation,
 }
 
 impl std::fmt::Display for RenderError {
@@ -42,6 +52,12 @@ impl std::fmt::Display for RenderError {
                 "render target size mismatch: expected {expected:?}, got {actual:?}"
             ),
             Self::NotInitialized => write!(f, "renderer is not initialized"),
+            Self::GpuInit(msg) => write!(f, "GPU 初始化失败：{msg}"),
+            Self::WorldTooLarge { width, height, max } => write!(
+                f,
+                "世界尺寸 {width}x{height} 超过显卡纹理上限 {max}"
+            ),
+            Self::SurfaceValidation => write!(f, "交换链报出验证错误"),
         }
     }
 }
