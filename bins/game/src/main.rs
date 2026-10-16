@@ -436,8 +436,10 @@ fn run_ascii(opts: &Options) -> ExitCode {
     let mut rng = Rng::new(opts.seed);
     let layout = worldgen::sea_and_islands(&mut world, &mut rng);
 
-    let view_width = 100.min(world.width());
-    let view_height = 30.min(world.height());
+    // 40 行而不是 30：512² 的剖面里，"天空 + 岛屿 + 水面线"这一段就有
+    // 几十格高，30 行只够装下岛的实体部分，屏幕上会只剩一片 '#'。
+    let view_width = 120.min(world.width());
+    let view_height = 40.min(world.height());
     let mut camera = Camera::fit_bottom_left(&world, view_width, view_height);
     // 直接贴左下角的话，512² 世界里那近百格厚的岩层会把整个视野填满，
     // 屏幕上只剩一片 '#'——那等于什么都没看到。
