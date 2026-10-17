@@ -428,14 +428,16 @@ impl Game {
 
         let stats = self.renderer.stats();
         let sim = self.sim.stats();
+        let workers = self.sim.workers();
         let total = self.world.chunk_count();
         self.window.set_title(&format!(
-            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 本帧上传 {}/{} 块 · 累计 {} 块",
+            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 工人 {} · 本帧上传 {}/{} 块 · 累计 {} 块",
             self.world.tick(),
             self.fps,
             scale_label(self.scale),
             sim.active_chunks,
             total,
+            workers,
             stats.last_uploaded_chunks,
             total,
             stats.total_uploaded_chunks,

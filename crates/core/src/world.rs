@@ -250,6 +250,59 @@ impl World {
         true
     }
 
+    /// 直接写入整格（材质 + 标记位），内容变化时标脏。
+    ///
+    /// 与 [`World::set`] 的区别：`set` 换材质时会把标记位清成 0，
+    /// 而这里写入的是一格**已经算好的完整状态**。材质层在分块私有副本上
+    /// 已经把标记位算好了（火的剩余寿命、本 tick 是否动过），写回时必须
+    /// 原样落地——否则火会被反复当成"刚生成"、寿命永远烧不完。
+    pub fn put_cell(&mut self, x: usize, y: usize, cell: MaterialCell) -> bool {
+        let idx = self.index_of(x, y);
+        if self.cells[idx] == cell {
+            return false;
+        }
+        self.cells[idx] = cell;
+        self.mark_dirty(x, y);
+        true
+    }
+
+    /// 写入一格，**不**标脏。
+    ///
+    /// 只给材质层的批量写回用：那边一次要写回整整一个分块，
+    /// 每格都去跑一遍 [`World::mark_dirty`] 的 3×3 循环是纯浪费——
+    /// 满负载时每 tick 十几万次写入 × 9 次邻格检查，实测能吃掉三成 tick 时间。
+    /// 调用方必须自己用 [`World::mark_chunk_dirty`] 把该标的块补上。
+    #[inline]
+    pub fn put_cell_quiet(&mut self, x: usize, y: usize, cell: MaterialCell) -> bool {
+        let idx = self.index_of(x, y);
+        if self.cells[idx] == cell {
+            return false;
+        }
+        self.cells[idx] = cell;
+        true
+    }
+
+    /// 把一个分块标脏（按分块坐标，越界忽略）。
+    ///
+    /// 与 [`World::mark_dirty`] 的分工：`mark_dirty` 接收的是**格**坐标、
+    /// 自动带 1 格晕影，适合零散写入；这个接收的是**块**坐标、不带晕影，
+    /// 适合"我已经自己算好哪些块该标"的批量写回。
+    #[inline]
+    pub fn mark_chunk_dirty(&mut self, cx: isize, cy: isize) {
+        if cx < 0 || cy < 0 {
+            return;
+        }
+        let (cx, cy) = (cx as usize, cy as usize);
+        if cx >= self.chunk_cols || cy >= self.chunk_rows {
+            return;
+        }
+        let ci = cy * self.chunk_cols + cx;
+        if !self.dirty[ci] {
+            self.dirty[ci] = true;
+            self.dirty_count += 1;
+        }
+    }
+
     /// 把矩形区域刷成同一种材质。画笔工具的底层操作。
     ///
     /// 区域会被裁剪到世界边界内。

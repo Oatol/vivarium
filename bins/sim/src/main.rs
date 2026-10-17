@@ -45,6 +45,7 @@ struct Args {
     ticks: u64,
     seed: u64,
     ignite: usize,
+    threads: usize,
     ascii: bool,
     quiet: bool,
     report_every: u64,
@@ -58,6 +59,7 @@ impl Default for Args {
             ticks: DEFAULT_TICKS,
             seed: DEFAULT_SEED,
             ignite: 0,
+            threads: 0,
             ascii: false,
             quiet: false,
             report_every: 0,
@@ -79,6 +81,7 @@ Vivarium headless 模拟器
     --ticks <N>          推进的 tick 数                [默认 {DEFAULT_TICKS}]
     --seed <N>           随机种子                      [默认 {DEFAULT_SEED}]
     --ignite <N>         在最高的岛顶点燃 N 格火（看它上浮、十几 tick 后烧完）  [默认 0 = 不点火]
+    --threads <N>        材质层的并行工人数  [默认 0 = 自动：按本机核数与当 tick 活量收敛]
     --report-every <N>   每 N 个 tick 打印一次进度     [默认 0 = 只在结束时打印]
     --ascii              结束时打印 ASCII 视图
     --quiet              只输出最终报告
@@ -105,6 +108,7 @@ fn parse_args() -> Result<Parsed, String> {
             "--ticks" => args.ticks = take_u64(&mut it, "--ticks")?,
             "--seed" => args.seed = take_u64(&mut it, "--seed")?,
             "--ignite" => args.ignite = take_usize(&mut it, "--ignite")?,
+            "--threads" => args.threads = take_usize(&mut it, "--threads")?,
             "--report-every" => args.report_every = take_u64(&mut it, "--report-every")?,
             other => return Err(format!("未知参数: {other}\n\n{}", usage())),
         }
@@ -189,6 +193,7 @@ struct RunStats {
     visited_sum: u64,
     moved_sum: u64,
     reacted_sum: u64,
+    workers_max: usize,
     ticks: u64,
 }
 
@@ -199,6 +204,9 @@ impl RunStats {
         self.visited_sum += s.visited as u64;
         self.moved_sum += s.moved as u64;
         self.reacted_sum += s.reacted as u64;
+        // 峰值而不是末值：跑到最后世界已经快静了，只剩一两块在动，
+        // 那时的工人数反映不了这次运行实际用到的并行度。
+        self.workers_max = self.workers_max.max(sim.workers());
         self.ticks += 1;
     }
 }
@@ -304,7 +312,11 @@ fn main() -> ExitCode {
         println!();
     }
 
-    let mut sim = MaterialSim::new();
+    let mut sim = if args.threads == 0 {
+        MaterialSim::new()
+    } else {
+        MaterialSim::with_threads(args.threads)
+    };
     let mut stats = RunStats::default();
     let start = Instant::now();
     for i in 0..args.ticks {
@@ -335,9 +347,10 @@ fn main() -> ExitCode {
         let avg_active = stats.active_chunk_sum as f64 / stats.ticks as f64;
         let avg_visited = stats.visited_sum as f64 / stats.ticks as f64;
         println!(
-            "  用时      {:?}  ·  {ms_per_tick:.4} ms/tick  ·  平均活跃块 {avg_active:.1}/{}  ·  平均访问 {avg_visited:.0} 格",
+            "  用时      {:?}  ·  {ms_per_tick:.4} ms/tick  ·  平均活跃块 {avg_active:.1}/{}  ·  平均访问 {avg_visited:.0} 格  ·  工人 {}（峰值）",
             elapsed,
-            world.chunk_count()
+            world.chunk_count(),
+            stats.workers_max
         );
         println!(
             "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次",
