@@ -40,6 +40,43 @@ impl MaterialCell {
     }
 }
 
+/// 一格的占用者：属于哪个有机体的第几个细胞。
+///
+/// `organism == 0` 表示这一格没有主人。用 0 当哨兵而不是 `Option<(u32, u16)>`，
+/// 是因为 `Option` 的 niche 优化在这个形状上不生效（`u32` 没有空位），
+/// 而"没有主人"本来就是这张表的一种取值，不是缺失。
+///
+/// 这张表与材质层**互斥**（SPEC §2.1）：一格要么是材质，要么属于某个细胞。
+/// 细胞的材质字段是 `Empty`，但生物体内部不是空位——所有"能不能进这一格"的
+/// 判定都必须问 [`World::yields_to`]，而不是只看材质。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub struct CellOwner {
+    /// 有机体编号，0 表示无主。
+    pub organism: u32,
+    /// 该格是这个有机体的第几个细胞。
+    pub cell: u16,
+}
+
+impl CellOwner {
+    /// 无主。
+    pub const NONE: Self = Self {
+        organism: 0,
+        cell: 0,
+    };
+
+    /// 由有机体编号与细胞下标构造。
+    #[inline]
+    pub const fn new(organism: u32, cell: u16) -> Self {
+        Self { organism, cell }
+    }
+
+    /// 这一格是否被占用。
+    #[inline]
+    pub const fn is_some(self) -> bool {
+        self.organism != 0
+    }
+}
+
 /// 世界构造失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorldError {
@@ -77,6 +114,8 @@ pub struct World {
     chunk_cols: usize,
     chunk_rows: usize,
     cells: Vec<MaterialCell>,
+    /// 每格的占用者，与 `cells` 同序。生命层独占这张表，材质层只读。
+    owner: Vec<CellOwner>,
     dirty: Vec<bool>,
     dirty_count: usize,
     tick: u64,
@@ -102,6 +141,7 @@ impl World {
             chunk_cols,
             chunk_rows,
             cells: vec![MaterialCell::default(); width * height],
+            owner: vec![CellOwner::NONE; width * height],
             // 新建的世界整块都是脏的，第一个 tick 需要完整扫描一次。
             dirty: vec![true; chunk_count],
             dirty_count: chunk_count,
@@ -176,8 +216,77 @@ impl World {
         self.cells[self.index_of(x, y)].kind
     }
 
-    /// 读取格子的标记位。越界返回 0。
+    // -- 占格层（生命层） ---------------------------------------------------
+    //
+    // 材质层**不写**这张表，只通过 [`World::yields_to`] 读它。
+    // 于是"一格非材质即细胞"这条互斥规则只有一个执行点。
+
+    /// 读取某格的占用者。越界返回 [`CellOwner::NONE`]。
     #[inline]
+    pub fn owner(&self, x: isize, y: isize) -> CellOwner {
+        if self.in_bounds(x, y) {
+            self.owner[self.index_of(x as usize, y as usize)]
+        } else {
+            CellOwner::NONE
+        }
+    }
+
+    /// 这一格是否被有机体占用。
+    #[inline]
+    pub fn is_occupied(&self, x: isize, y: isize) -> bool {
+        self.owner(x, y).is_some()
+    }
+
+    /// 设置某格的占用者。越界被忽略，值未变化时返回 `false`。
+    ///
+    /// 会标脏：占用状态的改变会让邻居"能不能流进来"跟着变
+    /// （一格从空位变成生物体的一部分，旁边的水就再也进不来了）。
+    pub fn set_owner(&mut self, x: isize, y: isize, owner: CellOwner) -> bool {
+        if !self.in_bounds(x, y) {
+            return false;
+        }
+        let idx = self.index_of(x as usize, y as usize);
+        if self.owner[idx] == owner {
+            return false;
+        }
+        self.owner[idx] = owner;
+        self.mark_dirty(x as usize, y as usize);
+        true
+    }
+
+    /// 清空某格的占用者。
+    #[inline]
+    pub fn vacate(&mut self, x: isize, y: isize) -> bool {
+        self.set_owner(x, y, CellOwner::NONE)
+    }
+
+    /// 整张占用表，与 [`World::cells`] 同序。渲染器用它判断"这一格是材质还是细胞"。
+    #[inline]
+    pub fn owners(&self) -> &[CellOwner] {
+        &self.owner
+    }
+
+    /// 材质层视角下，这一格能不能被 `mover` 挤开。
+    ///
+    /// 比 [`MaterialKind::displaceable_by`] 多一条：**被有机体占用的格子永远不让路**。
+    /// 细胞的材质字段是 `Empty`，如果只问材质，水会理所当然地灌进生物体内——
+    /// 而"一格非材质即细胞"是这套架构的地基（SPEC §2.1）。
+    ///
+    /// 材质层的所有让路判定都必须走这里，而不是自己拿 `get` 再比一遍。
+    #[inline]
+    pub fn yields_to(&self, x: isize, y: isize, mover: MaterialKind) -> bool {
+        if self.is_occupied(x, y) {
+            return false;
+        }
+        self.get(x, y).displaceable_by(mover)
+    }
+
+    /// 世界里被占用的格子总数。
+    pub fn occupied_count(&self) -> usize {
+        self.owner.iter().filter(|o| o.is_some()).count()
+    }
+
+    /// 读取格子的标记位。越界返回 0。    #[inline]
     pub fn flags(&self, x: isize, y: isize) -> u8 {
         if self.in_bounds(x, y) {
             self.cells[self.index_of(x as usize, y as usize)].flags
@@ -422,11 +531,20 @@ impl World {
     /// 不要换成 `DefaultHasher`，它的输出在不同 Rust 版本间不保证一致。
     pub fn hash(&self) -> u64 {
         let mut h = FNV_OFFSET_BASIS;
-        for cell in &self.cells {
+        for (cell, owner) in self.cells.iter().zip(&self.owner) {
             h ^= cell.kind.as_u8() as u64;
             h = h.wrapping_mul(FNV_PRIME);
             h ^= cell.flags as u64;
             h = h.wrapping_mul(FNV_PRIME);
+            // 空占用不携带任何信息，跳过它。
+            // 这一条同时保证了"M1 的世界"（没有任何有机体）哈希与加占格层之前
+            // 逐位相同——黄金测试因此不必改，也说明这层是真的"只增不改"。
+            if owner.is_some() {
+                h ^= owner.organism as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+                h ^= owner.cell as u64;
+                h = h.wrapping_mul(FNV_PRIME);
+            }
         }
         h
     }
@@ -440,7 +558,7 @@ impl World {
 
 #[cfg(test)]
 mod tests {
-    use super::{World, WorldError, CHUNK_SIZE};
+    use super::{CellOwner, World, WorldError, CHUNK_SIZE};
     use crate::material::MaterialKind;
 
     #[test]
@@ -718,5 +836,98 @@ mod tests {
         w.clear_dirty();
         w.set(30, 30, MaterialKind::Stone); // 四邻都在块 (0,0) 内
         assert_eq!(w.dirty_chunk_count(), 1);
+    }
+
+    // -- 占格层 -------------------------------------------------------------
+
+    #[test]
+    fn occupancy_roundtrip() {
+        let mut w = World::new(128, 128).unwrap();
+        assert!(!w.is_occupied(10, 10));
+        assert_eq!(w.owner(10, 10), CellOwner::NONE);
+
+        assert!(w.set_owner(10, 10, CellOwner::new(7, 3)));
+        assert!(w.is_occupied(10, 10));
+        assert_eq!(w.owner(10, 10), CellOwner::new(7, 3));
+        assert_eq!(w.occupied_count(), 1);
+
+        // 同一个值再写一次不该有任何变化。
+        assert!(!w.set_owner(10, 10, CellOwner::new(7, 3)));
+
+        assert!(w.vacate(10, 10));
+        assert!(!w.is_occupied(10, 10));
+        assert_eq!(w.occupied_count(), 0);
+    }
+
+    #[test]
+    fn occupancy_out_of_bounds_is_none_and_ignored() {
+        let mut w = World::new(128, 128).unwrap();
+        assert_eq!(w.owner(-1, 0), CellOwner::NONE);
+        assert_eq!(w.owner(0, 128), CellOwner::NONE);
+        assert!(!w.is_occupied(128, 0));
+        assert!(!w.set_owner(-1, -1, CellOwner::new(1, 0)));
+        assert_eq!(w.occupied_count(), 0);
+    }
+
+    /// 有机体占住的格子，任何材质都进不去——哪怕它的材质字段是 `Empty`。
+    ///
+    /// 这是"一格非材质即细胞"在材质层的唯一执行点。少了它，水会灌进鱼肚子里。
+    #[test]
+    fn yields_to_blocks_occupied_cells() {
+        let mut w = World::new(128, 128).unwrap();
+        w.set(20, 20, MaterialKind::Empty);
+        // 空位对沙是"可以让开"的。
+        assert!(w.yields_to(20, 20, MaterialKind::Sand));
+
+        w.set_owner(20, 20, CellOwner::new(1, 0));
+        assert!(!w.yields_to(20, 20, MaterialKind::Sand));
+        assert!(!w.yields_to(20, 20, MaterialKind::Water));
+
+        // 石本来就挡一切，占用与否都一样。
+        w.set(21, 20, MaterialKind::Stone);
+        assert!(!w.yields_to(21, 20, MaterialKind::Sand));
+    }
+
+    #[test]
+    fn occupying_marks_dirty() {
+        let mut w = World::new(128, 128).unwrap();
+        w.clear_dirty();
+        w.set_owner(30, 30, CellOwner::new(1, 0));
+        assert_eq!(w.dirty_chunk_count(), 1, "占格会改变邻居能不能流进来");
+    }
+
+    /// 没有有机体的世界，哈希必须与加占格层**之前**逐位相同。
+    ///
+    /// 这条钉住的是"只增不改"：占格层不该悄悄改变 M1 世界的指纹，
+    /// 否则所有历史黄金哈希都失效，而那种失效看起来会很像"物理变了"。
+    #[test]
+    fn empty_occupancy_keeps_the_hash_unchanged() {
+        let mut w = World::new(128, 128).unwrap();
+        for x in 0..128isize {
+            w.set(x, 100, MaterialKind::Stone);
+        }
+        let materials_only = {
+            let mut h = super::FNV_OFFSET_BASIS;
+            for cell in w.cells() {
+                h ^= cell.kind.as_u8() as u64;
+                h = h.wrapping_mul(super::FNV_PRIME);
+                h ^= cell.flags as u64;
+                h = h.wrapping_mul(super::FNV_PRIME);
+            }
+            h
+        };
+        assert_eq!(w.hash(), materials_only);
+    }
+
+    #[test]
+    fn occupancy_changes_the_hash() {
+        let mut w = World::new(128, 128).unwrap();
+        let before = w.hash();
+        w.set_owner(5, 5, CellOwner::new(1, 0));
+        assert_ne!(w.hash(), before);
+        // 同一个世界、同一格换个细胞下标，哈希也该变。
+        let with_first = w.hash();
+        w.set_owner(5, 5, CellOwner::new(1, 1));
+        assert_ne!(w.hash(), with_first);
     }
 }

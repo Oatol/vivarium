@@ -29,7 +29,7 @@
 //! 正好等于 wgpu 的 `COPY_BYTES_PER_ROW_ALIGNMENT`。
 //! 块上传天然满足行对齐，不需要手动补 padding。下面有一条编译期断言盯着这件事。
 
-use vivarium_core::{MaterialCell, World, CHUNK_SIZE};
+use vivarium_core::{CellOwner, MaterialCell, World, CHUNK_SIZE};
 
 use crate::{palette, RenderError, Renderer};
 
@@ -133,17 +133,39 @@ impl std::fmt::Display for FrameSkip {
 ///
 /// **不持有任何 GPU 资源。** 这是刻意的：这个结构里全是索引算术，
 /// 最容易写错，也最需要测试，而测试不该要求一台有显卡的机器。
+/// 一个格子在画面上"长什么样"的紧凑编码。
+///
+/// - 无主：材质 id（0..7）
+/// - 有主：`0x1_0000 | organism`
+///
+/// 两者不可能撞号，所以"有没有生物"这件事不需要额外的标志位，
+/// 直接比这个 u32 就够了。用 u32 而不是 u8 是因为 organism 编号会超过 255，
+/// 截断之后"第 300 条鱼和第 44 条鱼"会被当成同一个视觉状态，移动时就不重画。
+#[inline]
+fn visual_key(cells: &[MaterialCell], owners: &[CellOwner], i: usize) -> u32 {
+    let owner = owners[i];
+    if owner.is_some() {
+        0x1_0000 | owner.organism
+    } else {
+        cells[i].kind.as_u8() as u32
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct PixelUploader {
     width: usize,
     height: usize,
     chunk_cols: usize,
     chunk_rows: usize,
-    /// 上一次上传时每个格子的材质 id。
+    /// 上一次上传时每个格子的**视觉键**。
     ///
-    /// 初值填 `u8::MAX`——它不是任何合法材质，于是"首帧整张都是脏的"
+    /// 视觉键 = 材质 id，或者"这一格被某个有机体占了"。
+    /// 之所以不能只看材质：细胞格的材质字段永远是 `Empty`，
+    /// 只比材质的话，一条鱼游过水面时渲染器会认为什么都没变，鱼根本不会出现。
+    ///
+    /// 初值填 `u32::MAX`——它不是任何合法视觉键，于是"首帧整张都是脏的"
     /// 这件事不需要额外的标志位来记，比较结果自然就全为真。
-    shadow: Vec<u8>,
+    shadow: Vec<u32>,
     /// 本帧需要重新上传的块掩码。
     dirty: Vec<bool>,
     dirty_count: usize,
@@ -175,7 +197,7 @@ impl PixelUploader {
             height,
             chunk_cols,
             chunk_rows,
-            shadow: vec![u8::MAX; width * height],
+            shadow: vec![u32::MAX; width * height],
             dirty: vec![false; chunk_cols * chunk_rows],
             dirty_count: 0,
             chunk_pixels: vec![0u8; Self::chunk_byte_len()],
@@ -219,11 +241,10 @@ impl PixelUploader {
             "世界尺寸变了，uploader 必须重建"
         );
 
-        let cells = world.cells();
         let mut dirty_count = 0usize;
         for cy in 0..self.chunk_rows {
             for cx in 0..self.chunk_cols {
-                let changed = self.chunk_changed(cells, cx, cy);
+                let changed = self.chunk_changed(world, cx, cy);
                 self.dirty[cy * self.chunk_cols + cx] = changed;
                 if changed {
                     dirty_count += 1;
@@ -235,11 +256,14 @@ impl PixelUploader {
     }
 
     /// 本块是否有格子与上次上传时不同。
-    fn chunk_changed(&self, cells: &[MaterialCell], cx: usize, cy: usize) -> bool {
+    fn chunk_changed(&self, world: &World, cx: usize, cy: usize) -> bool {
+        let cells = world.cells();
+        let owners = world.owners();
         for row in 0..CHUNK_SIZE {
             let base = (cy * CHUNK_SIZE + row) * self.width + cx * CHUNK_SIZE;
             for col in 0..CHUNK_SIZE {
-                if self.shadow[base + col] != cells[base + col].kind.as_u8() {
+                let i = base + col;
+                if self.shadow[i] != visual_key(cells, owners, i) {
                     return true;
                 }
             }
@@ -262,19 +286,25 @@ impl PixelUploader {
     /// 反复调用——第二次会算出一模一样的内容，纯属浪费。
     pub fn build_chunk(&mut self, world: &World, cx: usize, cy: usize) -> &[u8] {
         let cells = world.cells();
+        let owners = world.owners();
         let mut out = 0usize;
         for row in 0..CHUNK_SIZE {
             let base = (cy * CHUNK_SIZE + row) * self.width + cx * CHUNK_SIZE;
             for col in 0..CHUNK_SIZE {
                 let i = base + col;
-                let kind = cells[i].kind;
-                let [r, g, b] = palette::rgb(kind);
+                let owner = owners[i];
+                let [r, g, b] = if owner.is_some() {
+                    // 生物永远压过材质：它站在水里时那一格画的是它，不是水。
+                    palette::organism_rgb(owner.organism)
+                } else {
+                    palette::rgb(cells[i].kind)
+                };
                 self.chunk_pixels[out] = r;
                 self.chunk_pixels[out + 1] = g;
                 self.chunk_pixels[out + 2] = b;
                 self.chunk_pixels[out + 3] = 255;
                 out += 4;
-                self.shadow[i] = kind.as_u8();
+                self.shadow[i] = visual_key(cells, owners, i);
             }
         }
         &self.chunk_pixels
@@ -868,6 +898,7 @@ impl Renderer for PixelRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vivarium_core::life_sim::{stock_surface, LifeSim};
     use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng};
 
     // --- letterbox ------------------------------------------------------
@@ -956,6 +987,69 @@ mod tests {
             w.set(x, y, k);
         }
         w
+    }
+
+    // --- 细胞 -----------------------------------------------------------
+
+    /// 走完一帧：标脏 → 把每个脏块都生成一遍（顺带刷新影子副本）。
+    ///
+    /// `prepare` 本身不更新影子副本——影子副本是 `build_chunk` 写的。
+    /// 所以"再 prepare 一次应该 0 脏块"的前提是先真的上传过一帧。
+    fn settle(up: &mut PixelUploader, w: &World) -> usize {
+        let n = up.prepare(w);
+        for cy in 0..w.chunk_rows() {
+            for cx in 0..w.chunk_cols() {
+                if up.is_dirty_chunk(cx, cy) {
+                    up.build_chunk(w, cx, cy);
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn an_organism_shows_up_even_though_its_cell_is_empty_material() {
+        let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
+        let mut up = PixelUploader::new(&w);
+        settle(&mut up, &w);
+        assert_eq!(up.prepare(&w), 0, "静止世界不该有脏块");
+
+        // 细胞格的材质字段永远是 Empty——只比材质的话这里会漏掉。
+        w.set_owner(10, 10, CellOwner::new(1, 0));
+        assert_eq!(up.prepare(&w), 1, "生物出现必须让所在分块变脏");
+    }
+
+    #[test]
+    fn an_organism_swimming_across_chunks_dirties_both() {
+        let mut w = World::new(128, 128).unwrap();
+        let mut up = PixelUploader::new(&w);
+        settle(&mut up, &w);
+        assert_eq!(up.prepare(&w), 0);
+
+        // 从 (63, 10) 挪到 (64, 10)：跨越 x 方向的块边界。
+        w.set_owner(63, 10, CellOwner::new(1, 0));
+        settle(&mut up, &w);
+        w.vacate(63, 10);
+        w.set_owner(64, 10, CellOwner::new(1, 0));
+        assert_eq!(up.prepare(&w), 2, "旧块和新块都得重画");
+    }
+
+    #[test]
+    fn organism_pixels_override_the_material_underneath() {
+        let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
+        w.set_owner(10, 10, CellOwner::new(1, 0));
+        let mut up = PixelUploader::new(&w);
+        settle(&mut up, &w);
+        let px = up.build_chunk(&w, 0, 0).to_vec();
+
+        let off = (10 * CHUNK_SIZE + 10) * 4;
+        let drawn = [px[off], px[off + 1], px[off + 2]];
+        assert_ne!(
+            drawn,
+            palette::rgb(MaterialKind::Water),
+            "鱼站在水里时画的是鱼"
+        );
+        assert_eq!(drawn, palette::organism_rgb(1));
     }
 
     #[test]
@@ -1529,5 +1623,45 @@ mod tests {
             world.census()
         );
         write_png("render-preview-settled.png", &settled);
+
+        // --- 第三张：把鱼放进去 -----------------------------------------
+        //
+        // 这张图存在的意义不是"好看"，而是**证明生物真的出现在画面上**。
+        // 细胞格的材质字段永远是 `Empty`，如果脏块检测只看材质，
+        // 这条鱼在水里游的时候渲染器会认为什么都没变，画面上一条鱼也没有。
+        let mut life = LifeSim::new(&mut world);
+        let ids = stock_surface(&mut world, &mut life, 80, 300);
+        assert!(!ids.is_empty(), "水面附近应当放得下鱼");
+
+        for _ in 0..300 {
+            life.step(&mut world);
+            sim.step(&mut world);
+        }
+        assert!(!life.organisms().is_empty(), "三百 tick 之后鱼不该全死光");
+
+        let (with_fish, _) =
+            blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
+        assert_ne!(with_fish, settled, "放鱼之后画面必须变了");
+
+        // 挑一条鱼的第一格，它画出来必须是那个有机体的颜色。
+        let sample = life
+            .organisms()
+            .first()
+            .map(|o| o.anchor)
+            .expect("至少有一条鱼");
+        let (fx, fy) = (sample.0 as usize, sample.1 as usize);
+        let fish_px = &with_fish[sy(fy) * bpr + sx(fx) * 4..][..4];
+        let owner = world.owner(fx as isize, fy as isize);
+        assert!(owner.is_some(), "锚点格必须被占用");
+        let [fr, fg, fb] = palette::organism_rgb(owner.organism);
+        assert_color_close(fish_px, [fr, fg, fb, 255], "鱼在画面上的颜色");
+
+        eprintln!(
+            "放鱼 {} 条，跑 300 tick 后剩 {} 条，能量账 {:?}",
+            ids.len(),
+            life.organisms().len(),
+            life.audit(&world)
+        );
+        write_png("render-preview-life.png", &with_fish);
     }
 }

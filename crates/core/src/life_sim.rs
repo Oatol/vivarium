@@ -1,0 +1,1504 @@
+//! 生命层调度：代谢、死亡、能量账。
+//!
+//! ## 为什么这一层不进材质线程池
+//!
+//! SPEC §2.4 明确要求：有机体跨分块移动，**不能**放进材质层的并行调度。
+//! 材质层的并行前提是"每块只碰自己的格子"，而一个生物的身体横跨两三块是常态。
+//! 硬塞进去就得给占格表加锁，而占格表恰恰是所有生物都要写的东西——
+//! 那把锁会比材质计算本身还贵。
+//!
+//! 所以这里是**单线程顺序执行**。代价可以接受：M2 的有机体数量是个位数到几十，
+//! 每个只做十几次邻域查询，总开销远小于材质层。等生物上千了再谈并行，
+//! 而那时候的形状大概率是"按生物并行"（每个生物互不重叠），
+//! 和材质层的分块并行是两套不同的东西。
+//!
+//! ## 能量账怎么才能真的对上
+//!
+//! 只有一个办法：**所有能量进出都必须走同一个记账点**。
+//!
+//! - 太阳能：`inject` 时记账，只记真正加到生物身上的那一份（取整丢掉的零头不计入）
+//! - 维持成本：`dissipated` 累加，能量离开生物可用池但仍在账上
+//! - 死亡：剩余能量按细胞数摊进残骸的 `flags`，摊不尽的零头计入 `dissipated`
+//! - 进食：从残骸的 `flags` 取出，一进一出，总数不变
+//!
+//! 于是 [`LifeSim::audit`] 的断言永远是
+//! `Σ organism.energy + Σ remains.flags + dissipated == injected`。
+//!
+//! **已知的不守恒出口**：火烧掉残骸。材质层不知道残骸里存着能量，
+//! 一把火把残骸烧成空，那部分能量就凭空消失了。M2 不处理（测试场景里没有火），
+//! 但这条必须写在这里，免得以后有人拿"守恒测试没过"当谜题查一整天。
+
+use crate::life::{
+    remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
+    IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
+    IN_FACING_Y, IN_FOOD_AHEAD, IN_KIN_AHEAD, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT,
+    OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
+};
+use crate::material::MaterialKind;
+use crate::rng::Rng;
+use crate::world::World;
+
+/// 生产者细胞在满光下每 tick 产出的能量。
+///
+/// 这个数字不是拍的，是从"想看到什么生态"反推的：
+/// 一条三格鱼（移动 + 嘴 + 生产者）维持成本 11、移动再花 3，合计 14。
+/// 要让它在浅水（光 ≈ 0.8）净赚、在深水（光 ≈ 0.15）净亏，
+/// 产出就得落在 `14 / 0.8 ≈ 17.5` 到 `14 / 0.15 ≈ 93` 之间。
+/// 取 24 意味着浅水每 tick 净赚 5、深水每 tick 亏 11——
+/// 攒够一次繁殖（200 点）大约 40 tick，而沉到深处 20 tick 就开始挨饿。
+pub const PRODUCER_YIELD: u32 = 24;
+
+/// 有机体能量上限。防止一个生产者无限攒能量然后把世界撑爆。
+pub const MAX_ENERGY: u32 = 1_000;
+
+/// 繁殖需要的能量。达到后分裂，子代拿走 [`BIRTH_ENERGY`]。
+pub const REPRODUCTION_ENERGY: u32 = 400;
+
+/// 子代出生时携带的能量。
+pub const BIRTH_ENERGY: u32 = 200;
+
+/// 自然寿命上限（tick）。到点就死，不商量。
+pub const MAX_AGE: u32 = 20_000;
+
+/// 突变率：每个权重被扰动的概率。
+pub const MUTATION_RATE: f32 = 0.05;
+
+/// 突变强度（高斯标准差）。
+pub const MUTATION_SIGMA: f32 = 0.15;
+
+/// 能顶开水体的最大身体格数（SPEC §2.2）。
+///
+/// 超过这个规模就被水挡住。理由 SPEC 写得很直白：如果任何生物都能无代价
+/// 顶开液体，一个 1000 格的生物移动会推走 1000 格水，行为和性能都会崩。
+pub const SMALL_BODY_MAX: usize = 8;
+
+/// 移动的基础能量成本（再按质量加成）。
+pub const MOVE_COST: u32 = 1;
+
+/// 方向输出的阈值。低于它就不动。
+///
+/// 没有这个阈值，一个输出恒为 0.02 的基因组会让生物每 tick 都试图移动，
+/// 白白烧掉能量——看起来像"生物莫名消瘦"，实际是网络在噪声上做决策。
+pub const MOVE_THRESHOLD: f32 = 0.15;
+
+/// 生命层自己的随机源。繁殖突变与将来的发育都用它。
+///
+/// 与材质层分开：材质层的随机全部是位置派生的（[`crate::rng::Rng::at`]），
+/// 不需要状态；生命层的突变是**事件**（"这一次繁殖"），没有位置可言，
+/// 所以用顺序 RNG，种子固定即可保证确定性。
+const LIFE_SEED: u64 = 0x5EED_1F3E;
+
+/// 光照被上方生物遮挡的检查深度（格）。
+///
+/// 这一条是种群的**负反馈**：鱼都挤在水面附近时，上面那层会挡住下面那层的光，
+/// 产出下降，繁殖自然放缓。没有它，浅水里的能量收入是恒定的，
+/// 种群就会指数爆炸——实测 256² 里 400 tick 从 4 条涨到 480 条。
+pub const SUN_SHADE_DEPTH: i32 = 12;
+
+/// 遮挡的横向半径。
+///
+/// **不能只查正上方**：手工鱼是水平游的，它们会排成一排而不是叠罗汉。
+/// 只查正上方的遮挡对这种队形完全无效（实测种群卡在 9 条，能量却条条顶格）。
+/// 查一个小方柱之后，"这一片水域有多少生物"才真的影响光照。
+pub const SUN_SHADE_RADIUS: i32 = 3;
+
+/// 多少格生物才算把光挡掉一半。
+///
+/// 12 太狠了：一条鱼繁殖后子代就贴在旁边（3 格），遮挡率立刻 25%，
+/// 亲代剩下的 200 点能量撑不过十几 tick，于是"生完就死"。
+/// 24 让一个中等鱼群只损失三四成光，亲代有机会缓过来。
+const SHADE_SATURATION: f32 = 24.0;
+
+/// 最多被遮挡掉多少光。留一点保底，免得一层鱼把下面彻底闷死。
+const MAX_SHADE: f32 = 0.85;
+
+/// 繁殖时的领地半径（切比雪夫距离）。
+pub const CROWD_RADIUS: i32 = 4;
+
+/// 半径内有多少个同类时不再繁殖。
+pub const CROWD_LIMIT: usize = 6;
+
+/// 生成失败的原因。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SpawnError {
+    /// 身体有一部分落在世界之外。
+    OutOfBounds,
+    /// 目标格已经被别的细胞占了。
+    CellOccupied,
+    /// 目标格是固体（石 / 沙 / 残骸），身体放不进去。
+    Blocked,
+    /// 身体是空的。
+    EmptyBody,
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::OutOfBounds => write!(f, "organism body leaves the world"),
+            Self::CellOccupied => write!(f, "target cell is already occupied"),
+            Self::Blocked => write!(f, "target cell is solid"),
+            Self::EmptyBody => write!(f, "organism has no cells"),
+        }
+    }
+}
+
+impl std::error::Error for SpawnError {}
+
+/// 能量账。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct EnergyLedger {
+    /// 累计注入：初始残骸能量 + 初始生物能量 + 太阳能。
+    pub injected: u64,
+    /// 累计耗散：维持成本 + 死亡时的零头。
+    pub dissipated: u64,
+}
+
+/// 一次能量审计的结果。
+///
+/// `accounted() == injected` 就是守恒。不相等时 `leak()` 直接告诉你差多少，
+/// 正数是凭空多出来的，负数是漏掉的。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnergyAudit {
+    /// 所有活着的有机体身上的能量。
+    pub organisms: u64,
+    /// 环境里所有残骸蕴含的能量（残骸格的 `flags` 之和）。
+    pub remains: u64,
+    /// 累计耗散。
+    pub dissipated: u64,
+    /// 累计注入。
+    pub injected: u64,
+}
+
+impl EnergyAudit {
+    /// 账面上应有的总量。
+    pub fn accounted(&self) -> u64 {
+        self.organisms + self.remains + self.dissipated
+    }
+
+    /// 账实差额。0 表示守恒。
+    pub fn leak(&self) -> i64 {
+        self.accounted() as i64 - self.injected as i64
+    }
+
+    /// 是否严格守恒。
+    pub fn is_balanced(&self) -> bool {
+        self.leak() == 0
+    }
+}
+
+/// 一 tick 的生命层统计。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LifeStats {
+    /// 活着的有机体数。
+    pub organisms: usize,
+    /// 活着的细胞总数。
+    pub cells: usize,
+    /// 所有有机体的能量之和。
+    pub energy: u64,
+    /// 本 tick 出生数。
+    pub born: u32,
+    /// 本 tick 死亡数。
+    pub died: u32,
+    /// 本 tick 饿死的数量（死亡的一个子集）。
+    pub starved: u32,
+    /// 本 tick 吃掉的残骸格数。
+    pub eaten: u32,
+    /// 累计被出生动作"挤没"的流体格数。
+    ///
+    /// 正常应当是 0。它一旦不为 0，就说明 [`displace_fluid`] 走到了兜底二，
+    /// 世界会随出生次数慢慢变干——这是那种"跑一万 tick 之后海平面下降了三格"的 bug，
+    /// 只靠肉眼看画面永远发现不了。
+    pub fluid_lost: u64,
+}
+
+/// 生命层调度器。
+#[derive(Debug)]
+pub struct LifeSim {
+    organisms: Vec<Organism>,
+    next_id: OrganismId,
+    ledger: EnergyLedger,
+    rng: Rng,
+    stats: LifeStats,
+}
+
+impl Default for LifeSim {
+    /// 空世界的调度器。能量账从 0 开始，没有任何有机体。
+    ///
+    /// 注意它**不等于** [`LifeSim::new`]：`new` 会把世界里已有的残骸计入注入，
+    /// 而这里没有世界可看。所以正常流程一律走 `new`。
+    fn default() -> Self {
+        Self {
+            organisms: Vec::new(),
+            next_id: 1,
+            ledger: EnergyLedger::default(),
+            rng: Rng::new(LIFE_SEED),
+            stats: LifeStats::default(),
+        }
+    }
+}
+
+impl LifeSim {
+    /// 新建调度器，并把世界里**已有**的残骸当作初始能量注入。
+    ///
+    /// 地貌生成器撒下的碎屑不是生物尸体，但它们确实是可吃的能量，
+    /// 所以从第一天起就得进账——否则第一次有东西啃了一口天然残骸，
+    /// 守恒断言就会莫名其妙地多出 25 点能量。
+    pub fn new(world: &mut World) -> Self {
+        let mut ledger = EnergyLedger::default();
+        for idx in 0..world.cells().len() {
+            let cell = world.cells()[idx];
+            if cell.kind != MaterialKind::Remains {
+                continue;
+            }
+            let (x, y) = (idx % world.width(), idx / world.width());
+            // 记的是这一格**实际**带多少能量，不是固定值。
+            // 已经带值的残骸（读档、上一轮初始化过）必须按原值入账，
+            // 否则账面上会凭空多出"标称值 − 实际值"。
+            let energy = if cell.flags == 0 {
+                world.set_flags(x as isize, y as isize, REMAINS_ENERGY as u8);
+                REMAINS_ENERGY as u64
+            } else {
+                cell.flags as u64
+            };
+            ledger.injected += energy;
+        }
+        Self {
+            organisms: Vec::new(),
+            next_id: 1,
+            ledger,
+            rng: Rng::new(LIFE_SEED),
+            stats: LifeStats::default(),
+        }
+    }
+
+    /// 当前的统计。
+    #[inline]
+    pub fn stats(&self) -> LifeStats {
+        self.stats
+    }
+
+    /// 当前的账本。
+    #[inline]
+    pub fn ledger(&self) -> EnergyLedger {
+        self.ledger
+    }
+
+    /// 所有有机体。
+    #[inline]
+    pub fn organisms(&self) -> &[Organism] {
+        &self.organisms
+    }
+
+    /// 所有有机体（可变）。
+    #[inline]
+    pub fn organisms_mut(&mut self) -> &mut [Organism] {
+        &mut self.organisms
+    }
+
+    /// 按编号找有机体。
+    pub fn organism(&self, id: OrganismId) -> Option<&Organism> {
+        self.organisms.iter().find(|o| o.id == id)
+    }
+
+    /// 往世界里放一个有机体，**不**记注入账。
+    ///
+    /// 用于"能量从别处来"的场景：繁殖（子代的能量是亲代给的）、读档。
+    /// 凭空造一个生物请用 [`LifeSim::spawn_injected`]。
+    ///
+    /// 先把身体每一格都验一遍（在界内、无主），全部通过才落子。
+    /// 半途失败会留下一个缺了几块的身体，那比放不进去更难查。
+    pub fn spawn(
+        &mut self,
+        world: &mut World,
+        mut org: Organism,
+    ) -> Result<OrganismId, SpawnError> {
+        if org.cells.is_empty() {
+            return Err(SpawnError::EmptyBody);
+        }
+        // 第一遍只验证，不动世界——半途失败会留下一个缺了几块的身体，
+        // 那种残缺比"放不进去"难查得多。
+        for cell in &org.cells {
+            let (x, y) = org.cell_at(cell);
+            if !Self::can_place(world, x, y) {
+                return Err(if !world.in_bounds(x as isize, y as isize) {
+                    SpawnError::OutOfBounds
+                } else if world.is_occupied(x as isize, y as isize) {
+                    SpawnError::CellOccupied
+                } else {
+                    SpawnError::Blocked
+                });
+            }
+        }
+        // 第二遍落地：先把身体格腾空并记住里面的流体，再占格，最后把流体推出去。
+        //
+        // 顺序不能乱。先占格再推水，`is_occupied` 才会把身体格排除在候选之外；
+        // 反过来会把水又换回刚腾空的身体格里（见 [`push_fluid_out`] 的注释）。
+        let mut fluids: Vec<(i32, i32, MaterialKind)> = Vec::new();
+        for cell in &org.cells {
+            let (x, y) = org.cell_at(cell);
+            let kind = world.get(x as isize, y as isize);
+            if kind.is_fluid() {
+                fluids.push((x, y, kind));
+                world.set(x as isize, y as isize, MaterialKind::Empty);
+            }
+        }
+
+        org.id = self.next_id;
+        self.next_id += 1;
+        org.claim(world);
+
+        for (x, y, kind) in fluids {
+            if !push_fluid_out(world, kind, x, y) {
+                self.stats.fluid_lost += 1;
+            }
+        }
+
+        let id = org.id;
+        self.organisms.push(org);
+        Ok(id)
+    }
+
+    /// 往世界里放一个有机体，并把它身上的能量记为"注入"。
+    ///
+    /// 初始投放与玩家投放走这条路。用错了会怎样：忘了记账 ⇒ 守恒断言报
+    /// "少了 N 点"；多记一次 ⇒ 报"多了 N 点"。两种都会在测试里立刻显形。
+    pub fn spawn_injected(
+        &mut self,
+        world: &mut World,
+        org: Organism,
+    ) -> Result<OrganismId, SpawnError> {
+        let energy = org.energy as u64;
+        let id = self.spawn(world, org)?;
+        self.ledger.injected += energy;
+        Ok(id)
+    }
+
+    /// 把一个有机体从世界里抹掉（用于测试与"玩家删除"）。
+    ///
+    /// 身上的能量记入耗散，不留残骸。
+    pub fn despawn(&mut self, world: &mut World, id: OrganismId) {
+        if let Some(i) = self.organisms.iter().position(|o| o.id == id) {
+            let org = self.organisms.remove(i);
+            org.release(world);
+            self.ledger.dissipated += org.energy as u64;
+        }
+    }
+
+    /// 审计能量账。**不是**每 tick 都该调用——它要扫一遍整张网格。
+    pub fn audit(&self, world: &World) -> EnergyAudit {
+        let mut remains = 0u64;
+        for cell in world.cells() {
+            if cell.kind == MaterialKind::Remains {
+                remains += cell.flags as u64;
+            }
+        }
+        EnergyAudit {
+            organisms: self.organisms.iter().map(|o| o.energy as u64).sum(),
+            remains,
+            dissipated: self.ledger.dissipated,
+            injected: self.ledger.injected,
+        }
+    }
+
+    /// 推进一个 tick 的生命层。
+    ///
+    /// 顺序：太阳能 → 行为（移动 / 进食 / 繁殖）→ 代谢（可能饿死）→ 清理尸体 → 统计。
+    ///
+    /// 行为放在代谢之前，是因为"这一 tick 能动"应该由"这一 tick 开始时还剩多少能量"
+    /// 决定。反过来的话，一个刚好付得起维持成本的生物会先被扣光、再判定能不能动，
+    /// 于是永远动不了——那是一个很难从现象反推的死结。
+    pub fn step(&mut self, world: &mut World) {
+        // `fluid_lost` 是累计量，不该跟着每 tick 的统计一起清零。
+        let fluid_lost = self.stats.fluid_lost;
+        self.stats = LifeStats::default();
+        self.stats.fluid_lost = fluid_lost;
+
+        // 1) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
+        self.inject_sunlight(world);
+
+        // 2) 行为。
+        self.act(world);
+
+        // 3) 代谢。付不起维持成本就饿死。
+        let mut starved: Vec<usize> = Vec::new();
+        let mut dissipated = 0u64;
+        for (i, org) in self.organisms.iter_mut().enumerate() {
+            org.age += 1;
+            for cell in &mut org.cells {
+                cell.age += 1;
+            }
+            let upkeep = org.upkeep();
+            if org.age >= MAX_AGE || org.energy < upkeep {
+                // 老死与饿死走同一条埋葬路径。这里**不**动 energy：
+                // 剩下的那点（哪怕不够付一次维持成本）会随尸体进入残骸，
+                // 由 `bury` 统一记账。在这里先扣一遍会让它被算两次。
+                starved.push(i);
+            } else {
+                org.energy -= upkeep;
+                dissipated += upkeep as u64;
+            }
+        }
+        self.ledger.dissipated += dissipated;
+        self.stats.starved = starved.len() as u32;
+
+        // 4) 清理。逆序删，下标才不会错位。
+        for &i in starved.iter().rev() {
+            let org = self.organisms.remove(i);
+            self.bury(world, &org);
+            self.stats.died += 1;
+        }
+
+        // 5) 统计。
+        self.stats.organisms = self.organisms.len();
+        self.stats.cells = self.organisms.iter().map(|o| o.cell_count()).sum();
+        self.stats.energy = self.organisms.iter().map(|o| o.energy as u64).sum();
+    }
+
+    /// 让一个有机体变成残骸。
+    ///
+    /// **尸体携带的是它死时还剩的能量，没有额外的基础值。**
+    /// 这一点是刻意的：如果尸体固定带 25 点，那么"饿死 → 变残骸 → 被吃"
+    /// 就成了一条凭空造能量的永动机，守恒断言立刻失效。
+    /// 代价是饿死的尸体是空的——物理上也说得通，它已经被自己烧光了。
+    ///
+    /// 每格分到 `energy / 细胞数`，摊不尽的零头、以及超过 `u8` 上限的部分
+    /// 都记进耗散。用 `flags` 存能量而不是另开一张表：材质层交换格子时
+    /// 会连 `flags` 一起搬，于是残骸沉降、被水冲走，能量都跟着走——
+    /// 这一点是免费的。
+    fn bury(&mut self, world: &mut World, org: &Organism) {
+        let n = org.cells.len().max(1) as u32;
+        let per_cell = (org.energy / n).min(u8::MAX as u32);
+        for cell in &org.cells {
+            let (x, y) = org.cell_at(cell);
+            let (x, y) = (x as isize, y as isize);
+            world.vacate(x, y);
+            world.set(x, y, remains_of(cell.kind));
+            // `set` 会把 flags 清 0，所以能量必须写在它之后。
+            world.set_flags(x, y, per_cell as u8);
+        }
+        self.ledger.dissipated += (org.energy - per_cell * n) as u64;
+    }
+
+    /// 生产者按光照产能量。
+    ///
+    /// 光从世界顶端射入，随深度线性衰减到 0。这条梯度是"生产者必须待在浅水、
+    /// 而浅水正是掠食者猎场"的物理来源（SPEC §2.0）——
+    /// 如果光照处处相同，生物就没有理由浮上来，也就没有垂直方向的生态位。
+    ///
+    /// 还要再乘一个**遮挡系数**：上方每一格被别的生物占住，就挡掉一部分光。
+    /// 这一条是种群的负反馈，没有它浅水的能量收入恒定，种群指数爆炸
+    /// （实测 256² 里 400 tick 从 4 条涨到 480 条，还在涨）。
+    fn inject_sunlight(&mut self, world: &mut World) {
+        let height = world.height().max(1) as f32;
+        let mut injected = 0u64;
+        for org in &mut self.organisms {
+            let producers = org.count(CellType::Producer);
+            if producers == 0 {
+                continue;
+            }
+            let (ax, ay) = org.anchor;
+            let depth = (ay.max(0) as f32 / height).clamp(0.0, 1.0);
+
+            // 这一小片水域里有多少格被**别人**占着。自己的格子不算——
+            // 否则一条鱼只要生产者长在自己头顶就永远在自我遮挡。
+            let mut blocked = 0i32;
+            for dy in 1..=SUN_SHADE_DEPTH {
+                for dx in -SUN_SHADE_RADIUS..=SUN_SHADE_RADIUS {
+                    let owner = world.owner((ax + dx) as isize, (ay - dy) as isize);
+                    if owner.is_some() && owner.organism != org.id {
+                        blocked += 1;
+                    }
+                }
+            }
+            let shade = (blocked as f32 / SHADE_SATURATION).min(MAX_SHADE);
+
+            let light = (1.0 - depth) * (1.0 - shade);
+            let gain = (PRODUCER_YIELD as f32 * light) as u32 * producers as u32;
+            if gain == 0 {
+                continue;
+            }
+            let room = MAX_ENERGY.saturating_sub(org.energy);
+            let gain = gain.min(room);
+            org.energy += gain;
+            // 只记真正加进去的那份。被上限截掉的、以及浮点转整数丢掉的零头
+            // 从未进入生物可用池，不该出现在"注入"里。
+            injected += gain as u64;
+        }
+        self.ledger.injected += injected;
+    }
+
+    // -----------------------------------------------------------------------
+    // 行为
+    // -----------------------------------------------------------------------
+
+    /// 让每个有机体感知、决策、行动。
+    ///
+    /// 顺序按编号（= 加入顺序），不按位置。位置顺序会让"谁先动"取决于地图，
+    /// 而地图每 tick 都在变，于是同一个种子跑两遍结果不同。编号顺序是稳定的，
+    /// 而且它天然表达"老个体先动"。
+    fn act(&mut self, world: &mut World) {
+        for org in &mut self.organisms {
+            org.acted = false;
+        }
+        let mut eaten = 0u32;
+        // 长度取快照：本 tick 新生的个体 `acted == true`，不该在这一轮里行动。
+        let n = self.organisms.len();
+        for i in 0..n {
+            eaten += self.act_one(world, i);
+        }
+        self.stats.eaten += eaten;
+    }
+
+    /// 一个有机体的"感知 → 决策 → 执行"。
+    fn act_one(&mut self, world: &mut World, i: usize) -> u32 {
+        if self.organisms[i].acted {
+            return 0;
+        }
+        let inputs = self.sense(world, i);
+        let out = self.organisms[i].genome.think(&inputs);
+        self.organisms[i].acted = true;
+
+        // 进食与移动的先后：先吃再走。反过来的话，一个"看到食物就扑过去"的
+        // 生物会永远差一步——它走到食物格上时，食物已经不在邻格了。
+        let mut eaten = 0;
+        if out[OUT_EAT] > 0.0 {
+            if let Some((x, y)) = self.food_target(world, i) {
+                let id = self.organisms[i].id;
+                if self.eat_remains(world, id, x, y) {
+                    eaten = 1;
+                }
+            }
+        }
+
+        if let Some((dx, dy)) = pick_direction(&out) {
+            self.try_move(world, i, dx, dy);
+        }
+
+        if out[OUT_REPRODUCE] > 0.0 {
+            let id = self.organisms[i].id;
+            // 生不出来就算了，不重试——否则一个挤在角落里的生物会把
+            // 全部 tick 预算花在"再试一次找位置"上。
+            self.reproduce(world, id);
+        }
+
+        eaten
+    }
+
+    /// 把周围世界编码成网络输入。
+    fn sense(&self, world: &World, i: usize) -> [f32; INPUTS] {
+        let org = &self.organisms[i];
+        let body = org.cells.len();
+        let mut inp = [0.0f32; INPUTS];
+
+        let (fx, fy) = org.front();
+        inp[IN_FOOD_AHEAD] =
+            (world.get(fx as isize, fy as isize) == MaterialKind::Remains) as u8 as f32;
+        inp[IN_BLOCKED_AHEAD] = (!Self::passable(world, body, fx, fy)) as u8 as f32;
+
+        let owner = world.owner(fx as isize, fy as isize);
+        inp[IN_KIN_AHEAD] = (owner.is_some() && owner.organism != org.id) as u8 as f32;
+        // M2 没有物种概念，"异种"暂时恒为 0。留着这个通道是为了让网络形状
+        // 从第一天起就固定，M3 加上物种之后它才有值。
+        inp[IN_ALIEN_AHEAD] = 0.0;
+
+        let (ax, ay) = org.anchor;
+        inp[IN_BLOCKED_LEFT] = (!Self::passable(world, body, ax - 1, ay)) as u8 as f32;
+        inp[IN_BLOCKED_RIGHT] = (!Self::passable(world, body, ax + 1, ay)) as u8 as f32;
+        inp[IN_BLOCKED_UP] = (!Self::passable(world, body, ax, ay - 1)) as u8 as f32;
+        inp[IN_SUPPORTED_BELOW] = (!Self::passable(world, body, ax, ay + 1)) as u8 as f32;
+
+        inp[IN_ENERGY] = org.energy as f32 / MAX_ENERGY as f32;
+        inp[IN_AGE] = org.age as f32 / MAX_AGE as f32;
+        inp[IN_FACING_X] = org.facing.x as f32;
+        inp[IN_FACING_Y] = org.facing.y as f32;
+        inp
+    }
+
+    /// 这个身长的生物能不能进这一格（SPEC §2.2）。
+    ///
+    /// 石 / 沙 / 残骸一律挡；水和气按体型放行；火在 M2 里也挡
+    /// （伤害规则推迟到有装甲细胞的时候一起做，免得先做一套没法验证的伤害）。
+    fn passable(world: &World, body: usize, x: i32, y: i32) -> bool {
+        if !world.in_bounds(x as isize, y as isize) {
+            return false;
+        }
+        if world.is_occupied(x as isize, y as isize) {
+            return false;
+        }
+        match world.get(x as isize, y as isize) {
+            MaterialKind::Empty | MaterialKind::Gas => true,
+            MaterialKind::Water => body <= SMALL_BODY_MAX,
+            _ => false,
+        }
+    }
+
+    /// 找一个能吃的残骸格：任何嘴细胞的四邻。
+    fn food_target(&self, world: &World, i: usize) -> Option<(isize, isize)> {
+        let org = &self.organisms[i];
+        for cell in &org.cells {
+            if cell.kind != CellType::Mouth {
+                continue;
+            }
+            let (x, y) = org.cell_at(cell);
+            for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
+                let (nx, ny) = (x + dx, y + dy);
+                if world.get(nx as isize, ny as isize) == MaterialKind::Remains {
+                    return Some((nx as isize, ny as isize));
+                }
+            }
+        }
+        None
+    }
+
+    /// 整体平移一格。
+    ///
+    /// 分两步：**先把所有目标格验完，再动手**。半步移动会留下一个撕裂的身体，
+    /// 而占格表里那些格子从此再也没人认领——那是一种"世界慢慢漏掉细胞"的 bug，
+    /// 从现象上完全看不出是移动写错了。
+    fn try_move(&mut self, world: &mut World, i: usize, dx: i32, dy: i32) -> bool {
+        let org = &self.organisms[i];
+        let body = org.cells.len();
+        let cost = MOVE_COST * org.mass().max(1);
+        if org.energy < cost {
+            return false;
+        }
+
+        let new_anchor = (org.anchor.0 + dx, org.anchor.1 + dy);
+        let old: Vec<(i32, i32)> = org.footprint().collect();
+        let mut targets = Vec::with_capacity(body);
+        for cell in &org.cells {
+            targets.push((
+                new_anchor.0 + cell.offset.0 as i32,
+                new_anchor.1 + cell.offset.1 as i32,
+            ));
+        }
+
+        for &(x, y) in &targets {
+            if !world.in_bounds(x as isize, y as isize) {
+                return false;
+            }
+            if world.is_occupied(x as isize, y as isize) {
+                // 目标格被占：只有"那本来就是自己身体的一部分"才允许。
+                if !old.iter().any(|&(ox, oy)| ox == x && oy == y) {
+                    return false;
+                }
+            } else if !Self::passable(world, body, x, y) {
+                return false;
+            }
+        }
+
+        // 执行：放手 → 顶开流体 → 占位。
+        // 中间这一小段"身体不在世界上"是安全的：生命层是单线程的，
+        // 而材质层要等整个生命层跑完才轮到，没有人会看到这个中间态。
+        org.release(world);
+
+        // 身体腾出来的格子——只有这些位置才接得住被挤开的流体。
+        //
+        // 这里有一个很容易写错的陷阱：不能拿 `old[k]` 当第 k 个细胞的落点。
+        // 身体内部会重叠——右移一格时，0 号细胞的新位置正是 1 号细胞的旧位置。
+        // 照着下标配对的写法会把水换进**新身体内部**（那格随即被 claim 成细胞），
+        // 于是鱼肚子里藏了一格水；等它死掉、那格被写成残骸，水就凭空没了。
+        // 实测 512² 跑 8000 tick 少了 371 格水，根因就在这里。
+        let vacated: Vec<(i32, i32)> = old
+            .iter()
+            .copied()
+            .filter(|p| !targets.contains(p))
+            .collect();
+        let mut next_vacated = 0usize;
+        for &(x, y) in &targets {
+            if old.contains(&(x, y)) {
+                // 身体内部的格子：它本来就是 Empty，没什么可挤的。
+                continue;
+            }
+            if !world.get(x as isize, y as isize).is_fluid() {
+                continue;
+            }
+            if next_vacated >= vacated.len() {
+                break;
+            }
+            let (ox, oy) = vacated[next_vacated];
+            next_vacated += 1;
+            // 小生物顶开水：水被挤到身体刚让出来的那一格。
+            // 用 `swap` 而不是"复制 + 清空"，水才不会凭空消失。
+            world.swap(ox as isize, oy as isize, x as isize, y as isize);
+        }
+
+        {
+            let org = &mut self.organisms[i];
+            org.anchor = new_anchor;
+            org.energy -= cost;
+            if dx != 0 {
+                org.facing.x = dx as i8;
+                org.facing.y = 0;
+            } else if dy != 0 {
+                org.facing.y = dy as i8;
+            }
+            org.claim(world);
+        }
+        // 移动消耗的能量变成热离开生物可用池，必须记账。
+        self.ledger.dissipated += cost as u64;
+        true
+    }
+
+    /// 繁殖：把一个有机体拆成亲代 + 子代。
+    ///
+    /// M2 只在**附近**生：子代的身体形状与亲代相同，能量拿走 [`BIRTH_ENERGY`]。
+    /// 真正的"找个空位生下来"要等身体能压缩/扩展之后再说——
+    /// 现在强行找位置只会让出生失败率取决于地图，掩盖掉代谢本身的问题。
+    ///
+    /// 返回子代编号；能量不够或没地方放则返回 `None`。
+    pub fn reproduce(&mut self, world: &mut World, id: OrganismId) -> Option<OrganismId> {
+        let idx = self.organisms.iter().position(|o| o.id == id)?;
+        let parent = &self.organisms[idx];
+        if parent.energy < REPRODUCTION_ENERGY {
+            return None;
+        }
+
+        // 拥挤：附近同类太多就不生。
+        //
+        // 这是第二道负反馈（第一道是光照遮挡）。光遮挡让"密处更穷"，
+        // 但一条鱼仍可以在别人都饿着的时候自己攒够能量——所以还需要
+        // 一条"地盘"规则，否则种群会在能量总量受限的同时把个体数堆到很高。
+        let (ax, ay) = parent.anchor;
+        let nearby = self
+            .organisms
+            .iter()
+            .filter(|o| o.id != id)
+            .filter(|o| {
+                (o.anchor.0 - ax).abs() <= CROWD_RADIUS && (o.anchor.1 - ay).abs() <= CROWD_RADIUS
+            })
+            .count();
+        if nearby >= CROWD_LIMIT {
+            return None;
+        }
+
+        // 先把亲代身上要用的东西拷出来，再动账——否则 `&mut self` 的借用
+        // 会一路顶到循环里，`self.fits` 就没法调了。
+        let anchor = parent.anchor;
+        let cells = parent.cells.clone();
+        let facing = parent.facing;
+        let mut genome = parent.genome.clone();
+        genome.mutate(&mut self.rng, MUTATION_RATE, MUTATION_SIGMA);
+
+        let child = Organism {
+            id: 0, // spawn 会分配
+            anchor,
+            cells,
+            energy: BIRTH_ENERGY,
+            age: 0,
+            facing,
+            genome,
+            acted: true, // 出生这一 tick 不再行动
+        };
+
+        // 子代与亲代不能占同一批格子。候选位置在切比雪夫距离 6 以内，
+        // **随机挑一个**而不是"从最近的开始试"。
+        //
+        // 这一条是被实测逼出来的：按距离排序时，子代永远生在亲代右上角，
+        // 于是十几代之后整个种群挤成一团（ASCII 视图里就是一块 6×3 的 @）。
+        // 挤成一团之后拥挤规则生效，种群卡在 10 条不再增长——
+        // 表面看是"生态平衡"，实际是"所有鱼叠在一起"。
+        let mut offsets: Vec<(i32, i32)> = Vec::with_capacity(168);
+        for dy in -6i32..=6 {
+            for dx in -6i32..=6 {
+                if dx != 0 || dy != 0 {
+                    offsets.push((dx, dy));
+                }
+            }
+        }
+        for i in (1..offsets.len()).rev() {
+            let j = self.rng.gen_range_usize(0, i + 1);
+            offsets.swap(i, j);
+        }
+
+        for (dx, dy) in offsets {
+            let mut candidate = child.clone();
+            candidate.anchor = (anchor.0 + dx, anchor.1 + dy);
+            if !self.fits(world, &candidate) {
+                continue;
+            }
+            if let Ok(cid) = self.spawn(world, candidate) {
+                // 能量从亲代转给子代，一进一出，总量不变，所以**不记注入**。
+                self.organisms[idx].energy -= BIRTH_ENERGY;
+                self.stats.born += 1;
+                return Some(cid);
+            }
+        }
+        None
+    }
+
+    /// 这个有机体的身体能不能完整落在这个位置。
+    ///
+    /// 比 [`Self::can_place`] 多一条：**水格上方必须有空气**。
+    /// 繁殖出来的子代必须遵守它，因为子代出生时那一格的水要被推走
+    /// （见 [`displace_fluid`]），而水下没有空位。
+    ///
+    /// 玩家手动投放不受这条限制——想往海沟里扔鱼是玩家的自由，
+    /// 那条鱼会因为没有光而饿死，那本身就是要展示的东西。
+    fn fits(&self, world: &World, org: &Organism) -> bool {
+        org.cells.iter().all(|c| {
+            let (x, y) = org.cell_at(c);
+            Self::can_place(world, x, y) && Self::water_has_air_above(world, x, y)
+        })
+    }
+
+    /// 如果这一格是水，它的上方整列里得有空位——否则这格水无处可去。
+    ///
+    /// 范围必须和 [`displace_fluid`] 的兜底搜索一致，否则会出现
+    /// "验证说上方有空气、真要搬的时候那格已经被占了"的情形，
+    /// 然后水就被清掉。实测 512² 跑 8000 tick 少了 405 格水，根因就是这两处范围不一致。
+    fn water_has_air_above(world: &World, x: i32, y: i32) -> bool {
+        let (xs, ys) = (x as isize, y as isize);
+        if world.get(xs, ys) != MaterialKind::Water {
+            return true;
+        }
+        (0..ys)
+            .rev()
+            .any(|ny| !world.is_occupied(xs, ny) && world.get(xs, ny) == MaterialKind::Empty)
+    }
+
+    /// 单格能不能放细胞：在界内、无主、不是固体。
+    fn can_place(world: &World, x: i32, y: i32) -> bool {
+        let (xs, ys) = (x as isize, y as isize);
+        if !world.in_bounds(xs, ys) || world.is_occupied(xs, ys) {
+            return false;
+        }
+        matches!(
+            world.get(xs, ys),
+            MaterialKind::Empty | MaterialKind::Gas | MaterialKind::Water
+        )
+    }
+
+    /// 吃掉某一格残骸，能量转给指定有机体。返回是否真的吃到了。
+    ///
+    /// 吃不下的时候**只吃一部分**，剩下的留在残骸里。
+    /// 早先的写法是 `energy = (energy + gain).min(MAX_ENERGY)`，
+    /// 超过上限的那部分凭空蒸发——账面上看不出来，直到某条鱼在满能量时
+    /// 咬了一口尸体，守恒断言就差了 20 点。
+    pub fn eat_remains(&mut self, world: &mut World, id: OrganismId, x: isize, y: isize) -> bool {
+        if world.get(x, y) != MaterialKind::Remains {
+            return false;
+        }
+        let Some(idx) = self.organisms.iter().position(|o| o.id == id) else {
+            return false;
+        };
+        let gain = world.flags(x, y) as u32;
+        let room = MAX_ENERGY.saturating_sub(self.organisms[idx].energy);
+        let taken = gain.min(room);
+        if taken == 0 {
+            return false;
+        }
+        if taken == gain {
+            world.set(x, y, MaterialKind::Empty);
+        } else {
+            // 留一部分在尸体上，下一顿再来。
+            world.set_flags(x, y, (gain - taken) as u8);
+        }
+        let org = &mut self.organisms[idx];
+        org.energy += taken;
+        self.stats.eaten += 1;
+        true
+    }
+
+    /// 手工加一个细胞（调试与手工生物用）。
+    pub fn push_cell(org: &mut Organism, kind: CellType, offset: (i16, i16)) {
+        org.cells.push(Cell::new(kind, offset));
+    }
+
+    /// 造一条最小的"鱼"：一个移动细胞 + 一个嘴 + 一个生产者。
+    ///
+    /// 形状是竖着的三格，因为它要在水里上下移动；横着三格会更容易卡在
+    /// 岛坡上。这不是最优形状，是**第一个能证明整条链路通的**形状。
+    pub fn simple_fish(anchor: (i32, i32), genome: Genome, energy: u32) -> Organism {
+        let cells = vec![
+            Cell::new(CellType::Mover, (0, 0)),
+            Cell::new(CellType::Mouth, (1, 0)),
+            Cell::new(CellType::Producer, (0, -1)),
+        ];
+        let mut org = Organism::new(0, anchor, cells, genome);
+        org.energy = energy;
+        org
+    }
+}
+
+/// 把一格流体从 `(x, y)` 推到附近的空位。返回 `false` 表示没地方放、只能丢弃。
+///
+/// **必须在 `claim` 之后调用**：身体格一旦有了主人，`is_occupied` 就会替我们
+/// 把它们排除在候选之外。反过来（先推水再占格）会出大问题——
+/// 刚腾空的身体格本身是 `Empty`，会被当成"附近的好位置"，
+/// 于是水又被换回身体里。实测身体格 `(10, 40)` 里藏了一格水，就是这么来的。
+fn push_fluid_out(world: &mut World, kind: MaterialKind, x: i32, y: i32) -> bool {
+    for r in 1..=6i32 {
+        for dy in -r..=r {
+            for dx in -r..=r {
+                if dx.abs() != r && dy.abs() != r {
+                    continue;
+                }
+                let (nx, ny) = (x + dx, y + dy);
+                if !world.in_bounds(nx as isize, ny as isize) {
+                    continue;
+                }
+                if world.is_occupied(nx as isize, ny as isize) {
+                    continue;
+                }
+                if world.get(nx as isize, ny as isize) != MaterialKind::Empty {
+                    continue;
+                }
+                world.set(nx as isize, ny as isize, kind);
+                return true;
+            }
+        }
+    }
+    // 兜底：顶到这一列的水面以上。水里出生时几乎总是走这条路——
+    // 水体中间根本没有空位。水被顶到水面上方，水面上升一格，
+    // 材质层下一 tick 会自己把它流平（阿基米德）。
+    for ny in (0..y).rev() {
+        if world.is_occupied(x as isize, ny as isize) {
+            continue;
+        }
+        if world.get(x as isize, ny as isize) != MaterialKind::Empty {
+            continue;
+        }
+        world.set(x as isize, ny as isize, kind);
+        return true;
+    }
+    false
+}
+
+/// 从网络输出里挑一个移动方向。
+///
+/// 取**激活最强**的那一路，而不是"四个都大于阈值就都试一遍"：
+/// 同时往右和往上走没有定义，而"最强的那一路胜出"至少是稳定的。
+/// 全部低于 [`MOVE_THRESHOLD`] 就不动——这一步很重要，见那个常量的注释。
+fn pick_direction(out: &[f32; OUTPUTS]) -> Option<(i32, i32)> {
+    let candidates = [
+        (OUT_LEFT, -1, 0),
+        (OUT_RIGHT, 1, 0),
+        (OUT_UP, 0, -1),
+        (OUT_DOWN, 0, 1),
+    ];
+    let mut best: Option<(f32, i32, i32)> = None;
+    for (idx, dx, dy) in candidates {
+        let v = out[idx];
+        if v <= MOVE_THRESHOLD {
+            continue;
+        }
+        if best.map_or(true, |(bv, _, _)| v > bv) {
+            best = Some((v, dx, dy));
+        }
+    }
+    best.map(|(_, dx, dy)| (dx, dy))
+}
+
+/// 一条手工设计的"食腐鱼"的大脑。
+///
+/// 三件事：往前游、撞墙就掉头、看到什么就吃、攒够能量就生。
+/// 它不会躲、不会追、不会转向猎物——**这就是 M2 想要的水平**：
+/// 先证明"感知 → 决策 → 移动 → 进食 → 繁殖 → 死亡 → 残骸"这条链是通的，
+/// 再谈网络能学到什么。一个会追猎物的基因组在没有猎物时和这个没有区别。
+///
+/// "撞墙掉头"不是装饰：只给"往右"的偏置时，所有鱼都会游到右边界堆成一团，
+/// 于是互相拥挤、停止繁殖，整个种群卡在 9 条（实测）。一条能被墙推回来的鱼
+/// 才会把水域用满——这是 M2 里第一次看到"行为影响生态"的地方。
+pub fn handcrafted_fish_genome() -> Genome {
+    let mut g = Genome::blank();
+    g.weights[Genome::b_o(OUT_RIGHT)] = 1.0;
+    g.weights[Genome::b_o(OUT_EAT)] = 2.0;
+    g.weights[Genome::b_o(OUT_REPRODUCE)] = 1.5;
+    // 撞到哪一侧的墙，就往另一侧走。**不能**写成"前方被挡就往左"——
+    // 那样鱼会在墙边左右抖：被挡住→往左走一格→前方空出来→又想往右。
+    // 分左右两路之后，它才会真的走完整个水池再折返。
+    g.connect(IN_BLOCKED_RIGHT, OUT_LEFT, 10.0);
+    g.connect(IN_BLOCKED_LEFT, OUT_RIGHT, 10.0);
+    g
+}
+
+/// 在水面附近投放若干条鱼。
+///
+/// "水面附近"= 该列第一个水格再往下两格。位置不是随便挑的：
+/// 生产者靠光吃饭，而光随深度线性衰减，所以鱼必须待在水面附近才活得下去
+/// （见 [`PRODUCER_YIELD`] 的推导）。把它们扔到海床上，几秒就全饿死。
+///
+/// 返回实际投放成功的编号。放不下的（水太浅、格子被占）会被跳过，
+/// 而不是让整批失败——玩家按一下"放鱼"不该因为某一列地形不行就全都不出现。
+pub fn stock_surface(
+    world: &mut World,
+    sim: &mut LifeSim,
+    count: usize,
+    energy: u32,
+) -> Vec<OrganismId> {
+    let mut ids = Vec::new();
+    if count == 0 || world.width() == 0 {
+        return ids;
+    }
+    let width = world.width();
+    let step = (width / count).max(1);
+    let genome = handcrafted_fish_genome();
+
+    for k in 0..count {
+        let x = ((k * step + step / 2).min(width - 1)) as i32;
+        let mut surface = None;
+        for y in 0..world.height() as i32 {
+            if world.get(x as isize, y as isize) == MaterialKind::Water {
+                surface = Some(y);
+                break;
+            }
+        }
+        let Some(y) = surface else { continue };
+        // 往下两格：锚点在水面之下，生产者那一格（锚点上方）正好贴着水面。
+        let org = LifeSim::simple_fish((x, y + 2), genome.clone(), energy);
+        if let Ok(id) = sim.spawn_injected(world, org) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pool() -> World {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 30, 64, 30, MaterialKind::Water);
+        w
+    }
+
+    #[test]
+    fn spawn_claims_every_cell() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let org = LifeSim::simple_fish((20, 25), Genome::blank(), 100);
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+        assert_eq!(w.occupied_count(), 3);
+        assert_eq!(w.owner(20, 25).organism, id);
+        assert_eq!(w.owner(21, 25).organism, id);
+        assert_eq!(w.owner(20, 24).organism, id);
+    }
+
+    #[test]
+    fn spawn_rejects_occupied_and_out_of_bounds() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 10))
+            .unwrap();
+        let again = sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 10));
+        assert_eq!(again.unwrap_err(), SpawnError::CellOccupied);
+
+        let edge = sim.spawn_injected(&mut w, LifeSim::simple_fish((0, 0), Genome::blank(), 10));
+        assert_eq!(edge.unwrap_err(), SpawnError::OutOfBounds);
+    }
+
+    #[test]
+    fn starvation_turns_the_body_into_remains() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        // 生产者放进深水（光很弱）+ 没有嘴 = 必然饿死。
+        let org = LifeSim::simple_fish((20, 50), Genome::blank(), 6);
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+        let spots: Vec<_> = sim.organism(id).unwrap().footprint().collect();
+
+        for _ in 0..200 {
+            sim.step(&mut w);
+            if sim.organisms().is_empty() {
+                break;
+            }
+        }
+
+        assert!(sim.organisms().is_empty(), "必须饿死");
+        assert_eq!(w.occupied_count(), 0, "尸体不能继续占格");
+        for (x, y) in spots {
+            assert_eq!(
+                w.get(x as isize, y as isize),
+                MaterialKind::Remains,
+                "({x}, {y}) 应该是残骸"
+            );
+        }
+    }
+
+    #[test]
+    fn energy_is_conserved_through_life_and_death() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 45), Genome::blank(), 120))
+            .unwrap();
+
+        for _ in 0..500 {
+            sim.step(&mut w);
+            let audit = sim.audit(&w);
+            assert!(
+                audit.is_balanced(),
+                "第 {} tick 能量账不平：{:?}，差额 {}",
+                w.tick(),
+                audit,
+                audit.leak()
+            );
+            if sim.organisms().is_empty() {
+                break;
+            }
+        }
+        assert!(sim.organisms().is_empty(), "这条鱼应该已经饿死");
+        assert_eq!(
+            w.count_of(MaterialKind::Remains),
+            3,
+            "尸体必须以残骸形式回到环境"
+        );
+        // 饿死的尸体是被自己烧光的，能量可能已经接近 0——
+        // 这里只要求账平，不要求残骸里还有能量（见 `bury` 的注释）。
+        assert!(sim.audit(&w).is_balanced());
+    }
+
+    /// 老死的尸体**带着能量**。这是"吃尸体"能成立的前提：
+    /// 如果所有尸体都是空的，残骸就只是地形，不是食物。
+    #[test]
+    fn an_old_organism_leaves_energy_in_its_remains() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 300))
+            .unwrap();
+        sim.organisms_mut()[0].age = MAX_AGE - 1;
+
+        sim.step(&mut w);
+
+        assert!(sim.organism(id).is_none(), "到寿数必须死");
+        let audit = sim.audit(&w);
+        assert!(audit.remains > 0, "尸体应该带着能量：{audit:?}");
+        assert!(audit.is_balanced(), "差额 {}", audit.leak());
+        assert_eq!(w.count_of(MaterialKind::Remains), 3);
+    }
+
+    #[test]
+    fn natural_remains_are_counted_as_initial_energy() {
+        let mut w = pool();
+        w.set(10, 20, MaterialKind::Remains);
+        w.set(11, 20, MaterialKind::Remains);
+        let sim = LifeSim::new(&mut w);
+        assert_eq!(sim.ledger().injected, 2 * REMAINS_ENERGY as u64);
+        assert_eq!(w.flags(10, 20), REMAINS_ENERGY as u8);
+        assert!(sim.audit(&w).is_balanced());
+    }
+
+    #[test]
+    fn eating_moves_energy_from_remains_into_the_body() {
+        let mut w = pool();
+        // 残骸放在嘴够得着、但身体压不到的地方。
+        w.set(22, 25, MaterialKind::Remains);
+        w.set_flags(22, 25, REMAINS_ENERGY as u8);
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 50))
+            .unwrap();
+
+        let before = sim.audit(&w);
+        assert!(sim.eat_remains(&mut w, id, 22, 25));
+        assert_eq!(w.get(22, 25), MaterialKind::Empty);
+        assert_eq!(sim.organism(id).unwrap().energy, 50 + REMAINS_ENERGY);
+        let after = sim.audit(&w);
+        assert_eq!(after.accounted(), before.accounted(), "进食只是搬运");
+    }
+
+    #[test]
+    fn sunlight_feeds_producers_only_in_shallow_water() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let shallow = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((10, 2), Genome::blank(), 100))
+            .unwrap();
+        let deep = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((40, 58), Genome::blank(), 100))
+            .unwrap();
+
+        sim.step(&mut w);
+
+        let s = sim.organism(shallow).unwrap().energy;
+        let d = sim.organism(deep).unwrap().energy;
+        assert!(s > d, "浅水的生产者应该拿到更多光：{s} vs {d}");
+        assert!(sim.audit(&w).is_balanced());
+    }
+
+    #[test]
+    fn reproduction_needs_energy_and_a_free_spot() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let poor = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+            .unwrap();
+        assert!(sim.reproduce(&mut w, poor).is_none());
+
+        // 测试直接给这条鱼加能量。加多少就得补记多少注入，
+        // 否则账面上会凭空多出 300 点——这正是"所有能量进出都要走记账点"的意思。
+        let deficit = REPRODUCTION_ENERGY - sim.organisms()[0].energy;
+        sim.organisms_mut()[0].energy = REPRODUCTION_ENERGY;
+        sim.ledger.injected += deficit as u64;
+
+        let child = sim.reproduce(&mut w, poor);
+        assert!(child.is_some(), "能量够了就该生得出来");
+        assert_eq!(sim.organisms().len(), 2);
+        assert!(sim.audit(&w).is_balanced(), "繁殖不能造能量");
+    }
+
+    // -----------------------------------------------------------------------
+    // 行为
+    // -----------------------------------------------------------------------
+
+    /// 偏置让"往右"与"想吃"恒为 0.96，所以这条鱼不看任何东西也会一直往右游、
+    /// 遇到尸体就吃。这不是"聪明"，是**可控**——测试需要一个不会随机改主意的对象。
+    fn forward_genome() -> Genome {
+        let mut g = Genome::blank();
+        g.weights[Genome::b_o(OUT_RIGHT)] = 2.0;
+        g.weights[Genome::b_o(OUT_EAT)] = 2.0;
+        g
+    }
+
+    /// 两格身体：移动 + 嘴。没有生产者，所以能量只减不增。
+    fn swimmer(anchor: (i32, i32), energy: u32) -> Organism {
+        let mut org = Organism::new(
+            0,
+            anchor,
+            vec![
+                Cell::new(CellType::Mover, (0, 0)),
+                Cell::new(CellType::Mouth, (1, 0)),
+            ],
+            forward_genome(),
+        );
+        org.energy = energy;
+        org
+    }
+
+    /// 在 [`forward_genome`] 基础上再打开繁殖输出。
+    ///
+    /// 单独拆出来而不是直接加进 `forward_genome`，是因为**大多数测试不希望
+    /// 被测对象半路生孩子**——数量一变，断言里的坐标、占格数、能量账全都对不上。
+    fn breeder_genome() -> Genome {
+        let mut g = forward_genome();
+        g.weights[Genome::b_o(OUT_REPRODUCE)] = 2.0;
+        g
+    }
+
+    #[test]
+    fn direction_picking_respects_the_threshold() {
+        let mut out = [0.0f32; OUTPUTS];
+        assert!(pick_direction(&out).is_none(), "全零不该动");
+        out[OUT_UP] = MOVE_THRESHOLD + 0.01;
+        assert_eq!(pick_direction(&out), Some((0, -1)));
+        out[OUT_RIGHT] = 0.9;
+        assert_eq!(pick_direction(&out), Some((1, 0)), "更强的方向胜出");
+    }
+
+    #[test]
+    fn a_fish_swims_forward_on_its_own() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((10, 40), 200)).unwrap();
+
+        for _ in 0..10 {
+            sim.step(&mut w);
+        }
+
+        let anchor = sim.organism(id).unwrap().anchor;
+        assert_eq!(anchor, (20, 40), "十 tick 应该正好游十格");
+    }
+
+    #[test]
+    fn movement_costs_energy_and_the_upkeep() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((10, 40), 100)).unwrap();
+
+        sim.step(&mut w);
+
+        // 移动 1 × 质量(2+1) = 3；维持 4(移动) + 2(嘴) = 6。合计 9。
+        assert_eq!(sim.organism(id).unwrap().energy, 91);
+        assert!(sim.audit(&w).is_balanced());
+    }
+
+    #[test]
+    fn a_fish_stops_at_stone() {
+        let mut w = pool();
+        w.set(16, 40, MaterialKind::Stone);
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((10, 40), 200)).unwrap();
+
+        for _ in 0..20 {
+            sim.step(&mut w);
+        }
+
+        // 身体是 [移动, 嘴]，所以锚点停在 14 时嘴正好顶在 15，
+        // 再往前一步就要把嘴塞进 16 的石头里。
+        assert_eq!(sim.organism(id).unwrap().anchor.0, 14);
+    }
+
+    #[test]
+    fn a_swimming_fish_never_tears_its_body() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, swimmer((10, 40), 500)).unwrap();
+
+        for _ in 0..50 {
+            sim.step(&mut w);
+            assert_eq!(w.occupied_count(), 2, "身体必须始终是完整的两格");
+        }
+    }
+
+    #[test]
+    fn swimming_pushes_water_aside_instead_of_destroying_it() {
+        let mut w = pool();
+        let before = w.count_of(MaterialKind::Water);
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((10, 40), 5000)).unwrap();
+
+        // 出生时水被推到旁边，一格都不该消失。
+        let after_spawn = w.count_of(MaterialKind::Water);
+        assert_eq!(after_spawn, before, "出生只能把水挤开，不能把水变没");
+
+        // 后半段是回归测试：早先按"第 k 个细胞的旧位置 → 第 k 个细胞的新位置"
+        // 搬运流体，身体内部重叠时会把水换进**新身体内部**。那格随即被占成细胞，
+        // 于是鱼肚子里藏了一格水；鱼死后那格被写成残骸，水就凭空没了。
+        // 只看水总量要跑很久才看得出，所以这里同时断言身体格是空的。
+        for _ in 0..200 {
+            sim.step(&mut w);
+            if let Some(org) = sim.organism(id) {
+                for (x, y) in org.footprint() {
+                    assert_eq!(
+                        w.get(x as isize, y as isize),
+                        MaterialKind::Empty,
+                        "身体格 ({x}, {y}) 里不该有材质"
+                    );
+                }
+            }
+            assert_eq!(
+                w.count_of(MaterialKind::Water),
+                after_spawn,
+                "游动只能搬运水，一格都不能少"
+            );
+        }
+    }
+
+    #[test]
+    fn a_fish_eats_what_its_mouth_touches() {
+        let mut w = pool();
+        w.set(16, 40, MaterialKind::Remains);
+        w.set_flags(16, 40, 20);
+        // 再往前一格是石头，于是鱼吃完就停在那儿，不会游过头。
+        w.set(17, 40, MaterialKind::Stone);
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, swimmer((10, 40), 400)).unwrap();
+
+        for _ in 0..20 {
+            sim.step(&mut w);
+        }
+
+        assert_eq!(w.count_of(MaterialKind::Remains), 0, "残骸应该被吃掉");
+        assert!(sim.audit(&w).is_balanced());
+    }
+
+    #[test]
+    fn a_body_too_big_cannot_push_through_water() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+
+        // 造一条比 `SMALL_BODY_MAX` 更长的鱼，塞在水的正中间。
+        let cells: Vec<Cell> = (0..(SMALL_BODY_MAX as i16 + 2))
+            .map(|i| Cell::new(CellType::Mover, (i, 0)))
+            .collect();
+        let mut big = Organism::new(0, (10, 40), cells, forward_genome());
+        big.energy = 500;
+
+        // 出生时水被挤开，所以它现在悬在一个空腔里；
+        // 空腔之外全是水，它一格也走不动。
+        let id = sim.spawn_injected(&mut w, big).unwrap();
+        let start = sim.organism(id).unwrap().anchor;
+
+        for _ in 0..10 {
+            sim.step(&mut w);
+        }
+        assert_eq!(sim.organism(id).unwrap().anchor, start, "大生物被水挡住");
+    }
+
+    // -----------------------------------------------------------------------
+    // 生态
+    // -----------------------------------------------------------------------
+
+    /// 浅池：水面在 y=8，池底是石头。水面附近光足够强。
+    fn shallow_pool() -> World {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 8, 64, 52, MaterialKind::Water);
+        w
+    }
+
+    /// **M2 的验收锚点之一**：一条手工设计的鱼，放进浅水能自己活下去并繁殖。
+    ///
+    /// 这条测试真正在验证的是三件事同时成立：
+    /// 1. 生产者的能量产出够付维持成本（平衡没有调歪）
+    /// 2. 繁殖链路通（能量 → 子代 → 占格）
+    /// 3. 能量账在几百次繁殖之后仍然一分不差
+    ///
+    /// 它挂了通常不是"某个函数写错"，而是某个常数把生态调到了活不下去的一侧。
+    #[test]
+    fn a_handcrafted_fish_lives_and_reproduces_in_shallow_water() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(
+            &mut w,
+            LifeSim::simple_fish((10, 12), breeder_genome(), 200),
+        )
+        .unwrap();
+
+        for i in 0..800 {
+            sim.step(&mut w);
+            // 每 tick 都扫一遍整张网格太贵（audit 是 O(格子数)），
+            // 每 100 tick 抽查一次足够抓住任何一处漏账。
+            if i % 100 == 0 {
+                assert!(
+                    sim.audit(&w).is_balanced(),
+                    "第 {} tick 能量账不平：{:?}",
+                    w.tick(),
+                    sim.audit(&w)
+                );
+            }
+        }
+        assert!(sim.audit(&w).is_balanced(), "收尾时能量账必须还是平的");
+
+        // 不断言"那一条鱼还活着"：这条鱼是 r 策略，生完一轮之后被自己
+        // 的子代挡住光、耗尽能量而死是**正常结局**。要断言的是种群没有灭绝、
+        // 而且确实繁殖过。
+        assert!(!sim.organisms().is_empty(), "种群不该灭绝");
+        assert!(
+            sim.organisms().len() > 1,
+            "八百 tick 足够繁殖一轮，实际只有 {} 条",
+            sim.organisms().len()
+        );
+    }
+
+    /// 反面：同一条鱼扔进深水，光不够，必然饿死。
+    ///
+    /// 两条测试合起来才说明"生产者必须待在浅水"是一条**真约束**，
+    /// 而不是一句写在文档里的愿望。
+    #[test]
+    fn the_same_fish_starves_in_deep_water() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 8, 64, 52, MaterialKind::Water);
+
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 56), breeder_genome(), 200),
+            )
+            .unwrap();
+
+        for _ in 0..800 {
+            sim.step(&mut w);
+            if sim.organism(id).is_none() {
+                break;
+            }
+        }
+
+        assert!(sim.organism(id).is_none(), "深水里应该饿死");
+        assert!(sim.audit(&w).is_balanced());
+    }
+}

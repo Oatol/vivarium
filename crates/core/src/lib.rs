@@ -22,6 +22,8 @@
 //! 由 [`worldgen::sea_and_islands`] 生成。这条决定见 SPEC 第 2.0 节——
 //! 它管着材质规则、并行扫描顺序和生物的运动方式。
 
+pub mod life;
+pub mod life_sim;
 pub mod material;
 pub mod rng;
 pub mod sim;
@@ -34,5 +36,5 @@ pub use material::{
 };
 pub use rng::Rng;
 pub use sim::{MaterialSim, MovedMask};
-pub use world::{MaterialCell, World, WorldError, CHUNK_SIZE};
+pub use world::{CellOwner, MaterialCell, World, WorldError, CHUNK_SIZE};
 pub use worldgen::{sea_and_islands, WorldLayout};

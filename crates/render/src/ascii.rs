@@ -139,7 +139,13 @@ impl Renderer for AsciiRenderer {
             let y = (self.camera.y + row) as isize;
             for col in 0..cols {
                 let x = (self.camera.x + col) as isize;
-                self.buffer.push(palette::glyph(world.get(x, y)));
+                // 一格非材质即细胞（SPEC §2.1）：先问有没有主人，再问材质。
+                // 顺序不能反——细胞格的材质字段是 `Empty`，反着问就永远看不见生物。
+                if world.is_occupied(x, y) {
+                    self.buffer.push(palette::CELL_GLYPH);
+                } else {
+                    self.buffer.push(palette::glyph(world.get(x, y)));
+                }
             }
             self.buffer.push('\n');
         }
@@ -155,12 +161,27 @@ impl Renderer for AsciiRenderer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivarium_core::MaterialKind;
+    use vivarium_core::{CellOwner, MaterialKind};
 
     fn world_with_stone(x: isize, y: isize) -> World {
         let mut w = World::new(64, 64).unwrap();
         w.set(x, y, MaterialKind::Stone);
         w
+    }
+
+    #[test]
+    fn organisms_render_as_at_signs() {
+        let mut w = World::new(64, 64).unwrap();
+        w.set(20, 5, MaterialKind::Water);
+        w.set_owner(20, 5, CellOwner::new(1, 0));
+        let mut r = AsciiRenderer::new(Camera::new(20, 5, 4, 2));
+        r.render(&w).unwrap();
+        let first = r.frame().lines().next().unwrap();
+        assert_eq!(
+            first.chars().next().unwrap(),
+            palette::CELL_GLYPH,
+            "细胞格的材质是水，但画出来必须是生物"
+        );
     }
 
     #[test]

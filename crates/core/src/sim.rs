@@ -379,6 +379,18 @@ impl Ctx<'_> {
         self.ws.cells[self.off(x, y)].kind
     }
 
+    /// 这一格能不能被 `mover` 挤开。
+    ///
+    /// 占格表不进分块副本（材质层从不写它），所以直接问真世界——
+    /// 生命层跑完之后才轮到材质层，一个 tick 之内它不会变。
+    #[inline]
+    fn yields_to(&self, x: isize, y: isize, mover: MaterialKind) -> bool {
+        if self.world.is_occupied(x, y) {
+            return false;
+        }
+        self.get(x, y).displaceable_by(mover)
+    }
+
     /// 读整格（材质 + 标记位）。
     #[inline]
     fn cell_at(&self, x: isize, y: isize) -> MaterialCell {
@@ -999,11 +1011,11 @@ impl Ctx<'_> {
                 return false;
             }
             // 路径上撞到不能让路的材质，这一侧就到头了。
-            if !self.get(nx, m.y).displaceable_by(m.kind) {
+            if !self.yields_to(nx, m.y, m.kind) {
                 return false;
             }
             // 脚下能让开 ⇒ 挪过去之后下一 tick 会自己掉下去。
-            if self.get(nx, m.y + dir).displaceable_by(m.kind) {
+            if self.yields_to(nx, m.y + dir, m.kind) {
                 return self.try_step_to(m, nx, m.y);
             }
         }
@@ -1015,7 +1027,7 @@ impl Ctx<'_> {
         if !self.world.in_bounds(to_x, to_y) {
             return false;
         }
-        if !self.get(to_x, to_y).displaceable_by(m.kind) {
+        if !self.yields_to(to_x, to_y, m.kind) {
             return false;
         }
         if !self.swap(m.x, m.y, to_x, to_y) {
@@ -1181,6 +1193,7 @@ struct Mover {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::world::CellOwner;
     use crate::worldgen::sea_and_islands;
 
     /// 每列里某种材质的格子数。
@@ -1394,6 +1407,47 @@ mod tests {
             "gas should rise exactly one cell"
         );
         assert_eq!(w.get(32, 63), MaterialKind::Empty);
+    }
+
+    /// 被有机体占住的格子对材质是**实心**的，哪怕它的材质字段是 `Empty`。
+    ///
+    /// 这是 M2 的地基：如果水能灌进生物体内，"一格非材质即细胞"就不成立了，
+    /// 之后所有关于"细胞在哪儿、吃什么、被什么挡住"的判定都会错。
+    #[test]
+    fn materials_cannot_flow_into_occupied_cells() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 40, 64, 24, MaterialKind::Stone);
+        w.fill_rect(0, 10, 64, 30, MaterialKind::Water);
+
+        // 在水体正中占一个 3×3 的空腔，像一条泡在水里的鱼。
+        let mut occupied = Vec::new();
+        for y in 24..27isize {
+            for x in 30..33isize {
+                w.set(x, y, MaterialKind::Empty);
+                w.set_owner(x, y, CellOwner::new(1, occupied.len() as u16));
+                occupied.push((x, y));
+            }
+        }
+
+        let mut sim = MaterialSim::new();
+        for _ in 0..300 {
+            sim.step(&mut w);
+            for &(x, y) in &occupied {
+                assert_eq!(
+                    w.get(x, y),
+                    MaterialKind::Empty,
+                    "water leaked into the organism at ({x}, {y})"
+                );
+                assert!(w.is_occupied(x, y));
+            }
+        }
+
+        // 水被这个洞挡住，但世界仍然必须能静下来。
+        assert_eq!(
+            w.dirty_chunk_count(),
+            0,
+            "an occupied cell must not keep the world awake"
+        );
     }
 
     #[test]

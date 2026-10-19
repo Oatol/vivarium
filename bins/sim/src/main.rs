@@ -25,6 +25,7 @@
 use std::process::ExitCode;
 use std::time::Instant;
 
+use vivarium_core::life_sim::{stock_surface, LifeSim};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::Renderer;
@@ -45,6 +46,7 @@ struct Args {
     ticks: u64,
     seed: u64,
     ignite: usize,
+    fish: usize,
     threads: usize,
     ascii: bool,
     quiet: bool,
@@ -59,6 +61,7 @@ impl Default for Args {
             ticks: DEFAULT_TICKS,
             seed: DEFAULT_SEED,
             ignite: 0,
+            fish: 0,
             threads: 0,
             ascii: false,
             quiet: false,
@@ -81,6 +84,7 @@ Vivarium headless 模拟器
     --ticks <N>          推进的 tick 数                [默认 {DEFAULT_TICKS}]
     --seed <N>           随机种子                      [默认 {DEFAULT_SEED}]
     --ignite <N>         在最高的岛顶点燃 N 格火（看它上浮、十几 tick 后烧完）  [默认 0 = 不点火]
+    --fish <N>           在水面附近投放 N 条手工设计的鱼  [默认 0 = 没有生物]
     --threads <N>        材质层的并行工人数  [默认 0 = 自动：按本机核数与当 tick 活量收敛]
     --report-every <N>   每 N 个 tick 打印一次进度     [默认 0 = 只在结束时打印]
     --ascii              结束时打印 ASCII 视图
@@ -108,6 +112,7 @@ fn parse_args() -> Result<Parsed, String> {
             "--ticks" => args.ticks = take_u64(&mut it, "--ticks")?,
             "--seed" => args.seed = take_u64(&mut it, "--seed")?,
             "--ignite" => args.ignite = take_usize(&mut it, "--ignite")?,
+            "--fish" => args.fish = take_usize(&mut it, "--fish")?,
             "--threads" => args.threads = take_usize(&mut it, "--threads")?,
             "--report-every" => args.report_every = take_u64(&mut it, "--report-every")?,
             other => return Err(format!("未知参数: {other}\n\n{}", usage())),
@@ -317,16 +322,30 @@ fn main() -> ExitCode {
     } else {
         MaterialSim::with_threads(args.threads)
     };
+    // 生命层必须在材质层**之前**跑：生物挤开的水要在同一个 tick 里流走。
+    // 反过来（先材质后生物）会让"鱼游过去"和"水合拢"差一拍，
+    // 视觉上像是鱼在水里拖了一条尾迹。
+    let mut life = LifeSim::new(&mut world);
+    if args.fish > 0 {
+        let ids = stock_surface(&mut world, &mut life, args.fish, 300);
+        if !args.quiet {
+            println!("投放 {} 条鱼（水面附近）", ids.len());
+            println!();
+        }
+    }
+
     let mut stats = RunStats::default();
     let start = Instant::now();
     for i in 0..args.ticks {
+        life.step(&mut world);
         sim.step(&mut world);
         stats.record(&sim);
 
         if args.report_every > 0 && (i + 1) % args.report_every == 0 {
             let s = sim.stats();
+            let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  能量 {:>6}  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -334,6 +353,8 @@ fn main() -> ExitCode {
                 world.chunk_count(),
                 s.moved,
                 s.reacted,
+                l.organisms,
+                l.energy,
                 census_line(&world.census()),
             );
         }
@@ -359,6 +380,27 @@ fn main() -> ExitCode {
     }
     println!();
     print_delta(&census_before, &world.census());
+
+    let l = life.stats();
+    println!();
+    println!(
+        "生命层  生物 {} · 细胞 {} · 能量 {} · 出生时挤没的流体 {} 格",
+        l.organisms, l.cells, l.energy, l.fluid_lost
+    );
+    let audit = life.audit(&world);
+    println!(
+        "能量账  注入 {} · 消耗 {} · 残骸 {} · 生物 {} · 差额 {}{}",
+        audit.injected,
+        audit.dissipated,
+        audit.remains,
+        audit.organisms,
+        audit.leak(),
+        if audit.is_balanced() {
+            "（守恒）"
+        } else {
+            "  ← 不守恒！"
+        }
+    );
 
     if args.ascii {
         println!();

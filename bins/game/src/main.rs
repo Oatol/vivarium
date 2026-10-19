@@ -34,6 +34,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
+use vivarium_core::life_sim::{stock_surface, LifeSim};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::pixel::PixelRenderer;
@@ -61,6 +62,8 @@ struct Options {
     seed: u64,
     /// ASCII 模式下跑多少 tick 再打印。
     ticks: u64,
+    /// 启动时在水面附近投放多少条鱼。0 表示不放。
+    fish: usize,
 }
 
 impl Default for Options {
@@ -71,6 +74,7 @@ impl Default for Options {
             height: DEFAULT_SIZE,
             seed: DEFAULT_SEED,
             ticks: 60,
+            fish: 0,
         }
     }
 }
@@ -88,6 +92,7 @@ fn print_help() {
   --height <N>       世界高度，必须是 64 的倍数（默认 {DEFAULT_SIZE}）
   --seed <N>         随机种子（默认 {DEFAULT_SEED}）
   --ticks <N>        仅 --ascii：先跑多少 tick 再打印（默认 60）
+  --fish <N>         启动时在水面附近投放 N 条鱼（默认 0，按 L 也可以随时放）
   -h, --help         显示这份帮助"
     );
 }
@@ -103,6 +108,7 @@ fn parse_args() -> Result<Options, String> {
             "--height" => opts.height = take_number(&mut args, "--height")? as usize,
             "--seed" => opts.seed = take_number(&mut args, "--seed")?,
             "--ticks" => opts.ticks = take_number(&mut args, "--ticks")?,
+            "--fish" => opts.fish = take_number(&mut args, "--fish")? as usize,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -246,6 +252,9 @@ struct Game {
     /// 材质流动引擎。跨 tick 的状态（已移动掩码、活跃分块快照）都在它里面，
     /// 世界的全部内容仍然在 `world` 里。
     sim: MaterialSim,
+    /// 生命层。**独立于材质层**，单线程顺序执行（SPEC §2.4）：
+    /// 生物的身体横跨好几个分块，塞进材质线程池就得给占格表加锁。
+    life: LifeSim,
     /// 初始地貌的两条基准线。横幅要用，将来相机取景也要用。
     layout: WorldLayout,
     rng: Rng,
@@ -285,6 +294,12 @@ impl Game {
         let mut world = World::new(opts.width, opts.height).map_err(|e| e.to_string())?;
         let mut rng = Rng::new(opts.seed);
         let layout = worldgen::sea_and_islands(&mut world, &mut rng);
+        // 建生命层时会扫一遍地形，把天然碎屑折成"初始能量"记进账。
+        let mut life = LifeSim::new(&mut world);
+        if opts.fish > 0 {
+            let ids = stock_surface(&mut world, &mut life, opts.fish, 300);
+            println!("启动时投放 {} 条鱼", ids.len());
+        }
 
         Ok(Self {
             window,
@@ -292,6 +307,7 @@ impl Game {
             renderer,
             world,
             sim: MaterialSim::new(),
+            life,
             layout,
             rng,
             seed: opts.seed,
@@ -318,8 +334,9 @@ impl Game {
   世界      : {}×{} 格，{} 个分块
   地貌      : 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列
   世界纹理  : {} KiB（脏块增量上传）
+  生物      : {} 条 · {} 个细胞 · 能量 {}
 
-  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · R 重铺地形 · Esc 退出",
+  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · L 放鱼 · R 重铺地形 · Esc 退出",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -330,6 +347,13 @@ impl Game {
             self.layout.seabed,
             self.layout.land_columns(),
             texture_kib,
+            self.life.organisms().len(),
+            self.life
+                .organisms()
+                .iter()
+                .map(|o| o.cell_count())
+                .sum::<usize>(),
+            self.life.stats().energy,
         )
     }
 
@@ -349,6 +373,7 @@ impl Game {
                 "3" => self.scale = TimeScale::X50,
                 "4" => self.scale = TimeScale::Max,
                 "f" | "F" => self.ignite_peak(),
+                "l" | "L" => self.release_fish(),
                 "r" | "R" => self.reseed(),
                 _ => {}
             },
@@ -382,6 +407,16 @@ impl Game {
         println!("点火：岛峰 x={peak} 附近放了 {lit} 格火");
     }
 
+    /// 在水面附近放一批鱼。
+    ///
+    /// 放下去之后**盯能量账**（横幅里那行"生物"）：如果鱼全部饿死，
+    /// 说明生产者拿到的光不够付维持成本；如果数量爆炸，说明负反馈没接上。
+    /// 这两件事在画面上都是"一堆小方块"，只有数字能分辨。
+    fn release_fish(&mut self) {
+        let ids = stock_surface(&mut self.world, &mut self.life, 8, 300);
+        println!("放鱼：水面附近 {} 条", ids.len());
+    }
+
     /// 换一个种子重铺地形。
     ///
     /// 这不只是个玩具：它是**验证增量上传是否真的生效**的手段。
@@ -395,12 +430,17 @@ impl Game {
         // 掩码里留着上一个世界的 tick 戳。虽然戳不匹配本身是安全的，
         // 但重铺之后世界的"活跃区域"完全变了，重建一份更省心也更好推理。
         self.sim = MaterialSim::new();
+        // 生命层也要重建：旧世界里的有机体都站在已经不存在的格子上，
+        // 占格表还指着它们——不重建的话，新地形里会凭空多出一堆幽灵细胞。
+        self.life = LifeSim::new(&mut self.world);
     }
 
     fn frame(&mut self) {
         let tick_start = Instant::now();
         let ticks = self.budget.plan_ticks(self.scale, self.last_tick_cost);
         for _ in 0..ticks {
+            // 生命层先跑：鱼挤开的水要在同一个 tick 里流走。
+            self.life.step(&mut self.world);
             self.sim.step(&mut self.world);
         }
         if ticks > 0 {
@@ -429,15 +469,18 @@ impl Game {
         let stats = self.renderer.stats();
         let sim = self.sim.stats();
         let workers = self.sim.workers();
+        let life = self.life.stats();
         let total = self.world.chunk_count();
         self.window.set_title(&format!(
-            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 工人 {} · 本帧上传 {}/{} 块 · 累计 {} 块",
+            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 工人 {} · 生物 {} · 能量 {} · 本帧上传 {}/{} 块 · 累计 {} 块",
             self.world.tick(),
             self.fps,
             scale_label(self.scale),
             sim.active_chunks,
             total,
             workers,
+            life.organisms,
+            life.energy,
             stats.last_uploaded_chunks,
             total,
             stats.total_uploaded_chunks,
