@@ -345,7 +345,7 @@ fn main() -> ExitCode {
             let s = sim.stats();
             let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  能量 {:>6}  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -355,6 +355,8 @@ fn main() -> ExitCode {
                 s.reacted,
                 l.organisms,
                 l.energy,
+                l.max_generation,
+                l.avg_generation,
                 census_line(&world.census()),
             );
         }
@@ -386,6 +388,10 @@ fn main() -> ExitCode {
     println!(
         "生命层  生物 {} · 细胞 {} · 能量 {} · 出生时挤没的流体 {} 格",
         l.organisms, l.cells, l.energy, l.fluid_lost
+    );
+    println!(
+        "谱系    最大代数 {} · 平均代数 {:.1} · 与初代基因距离 {:.3}",
+        l.max_generation, l.avg_generation, l.gene_distance
     );
     let audit = life.audit(&world);
     println!(

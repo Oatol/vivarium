@@ -403,12 +403,26 @@ impl Default for Facing {
 /// 一个有机体。
 ///
 /// `anchor` 是身体锚点的**绝对**坐标；细胞的绝对坐标 = `anchor + cell.offset`。
+///
+/// ## 水平方向是环面
+///
+/// 世界在 x 方向首尾相接：右边界向右走一格就回到左边界。这条**只对生命层成立**
+/// ——材质层仍然是有界的（水不会从左边流出去又从右边流回来），
+/// 因为材质层的分块并行依赖"两块之间至少隔一整块"这个几何前提，
+/// 而生物的移动是整体平移、取模几乎不要钱。
+///
+/// 做这件事的动机很具体：只给"往右"偏置的手工鱼会全部游到右边界堆成一团，
+/// 然后被领地规则卡住，种群停在 9 条——表面看是"生态平衡"，
+/// 实际是"所有鱼叠在一个角落"。环绕之后它们会自己散开。
 #[derive(Debug, Clone)]
 pub struct Organism {
     /// 编号。同时也是 [`crate::world::CellOwner::organism`] 里存的值。
     pub id: OrganismId,
-    /// 锚点的绝对坐标。
+    /// 锚点的绝对坐标。x 已经取过模，永远落在 `0..width`。
     pub anchor: (i32, i32),
+    /// 世界宽度，用于水平取模。`0` 表示"不知道世界多大，不环绕"——
+    /// 只有测试里手工构造、还没 `spawn` 的有机体是这个状态。
+    pub width: i32,
     /// 身体：每个细胞的类型与相对偏移。
     pub cells: Vec<Cell>,
     /// 生物可用能量（整数点，避免浮点漂移破坏守恒断言）。
@@ -419,6 +433,14 @@ pub struct Organism {
     pub facing: Facing,
     /// 基因组。
     pub genome: Genome,
+    /// 亲代编号。`None` 表示"投放进来的初代"，不是谁生出来的。
+    pub parent: Option<OrganismId>,
+    /// 第几代。初代是 0，子代是亲代 + 1。
+    ///
+    /// 这是 M3 第一个观测指标：**代数在涨，才说明这个种群真的在迭代**。
+    /// 没有它，一个"看起来在动"的种群可能只是同一批个体在活，
+    /// 那和进化是两件完全不同的事。
+    pub generation: u32,
     /// 本 tick 是否已经行动过。
     ///
     /// 生命层是单线程顺序执行的，这一位主要防"繁殖出来的子代在同一个 tick
@@ -428,16 +450,32 @@ pub struct Organism {
 
 impl Organism {
     /// 新建有机体。能量给 0，调用方自己分配。
+    ///
+    /// `width` 从 0 开始（不环绕）；[`crate::life_sim::LifeSim::spawn`]
+    /// 会把它设成世界的真实宽度。
     pub fn new(id: OrganismId, anchor: (i32, i32), cells: Vec<Cell>, genome: Genome) -> Self {
         Self {
             id,
             anchor,
+            width: 0,
             cells,
             energy: 0,
             age: 0,
             facing: Facing::RIGHT,
             genome,
+            parent: None,
+            generation: 0,
             acted: false,
+        }
+    }
+
+    /// 把 x 折回 `0..width`。`width == 0` 时原样返回。
+    #[inline]
+    pub fn wrap_x(&self, x: i32) -> i32 {
+        if self.width > 0 {
+            x.rem_euclid(self.width)
+        } else {
+            x
         }
     }
 
@@ -457,11 +495,11 @@ impl Organism {
         self.cells.iter().map(|c| c.kind.mass()).sum()
     }
 
-    /// 某个细胞的绝对坐标。
+    /// 某个细胞的绝对坐标。x 已折回世界内。
     #[inline]
     pub fn cell_at(&self, cell: &Cell) -> (i32, i32) {
         (
-            self.anchor.0 + cell.offset.0 as i32,
+            self.wrap_x(self.anchor.0 + cell.offset.0 as i32),
             self.anchor.1 + cell.offset.1 as i32,
         )
     }
@@ -483,10 +521,13 @@ impl Organism {
         self.cells.iter().filter(|c| c.kind == kind).count()
     }
 
-    /// 朝向前方那一格的绝对坐标。
+    /// 朝向前方那一格的绝对坐标。x 已折回世界内。
     #[inline]
     pub fn front(&self) -> (i32, i32) {
-        (self.anchor.0 + self.facing.x as i32, self.anchor.1)
+        (
+            self.wrap_x(self.anchor.0 + self.facing.x as i32),
+            self.anchor.1 + self.facing.y as i32,
+        )
     }
 
     /// 把身体写进占格表。调用方保证这些格子当前无主。

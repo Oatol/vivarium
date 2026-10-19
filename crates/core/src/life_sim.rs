@@ -118,6 +118,24 @@ pub const CROWD_RADIUS: i32 = 4;
 /// 半径内有多少个同类时不再繁殖。
 pub const CROWD_LIMIT: usize = 6;
 
+/// 环境容纳量：全世界生产者细胞数的软上限。
+///
+/// 这是**第三道、也是最后一道负反馈**，前两道（局部遮挡、领地）都是"位置相关"的，
+/// 一旦鱼水平散开就都失效了。
+///
+/// 为什么需要它：把左右边界改成环绕之后，鱼不再堆在右墙，于是局部遮挡和领地
+/// 都不再触发——实测 512² 从 8 条一路涨到 **1737 条**，残骸堆满 26% 的世界，
+/// 5.5 ms/tick。那个"240 条的平衡"其实是几何假象，不是生态。
+///
+/// 物理含义是"水体里的营养总量是有限的"：生产者越多，每个分到的越少。
+/// 双曲衰减 `1 / (1 + P/CAP)` 比线性截断温和——永远不会突然归零，
+/// 只会越来越薄，所以种群会平滑地停在平衡点附近而不是硬撞天花板。
+///
+/// 推导平衡点：单条鱼净收益 = `PRODUCER_YIELD × 光 × comp − 维持成本`。
+/// 令其为零、取浅水光 ≈ 0.8、维持 15，得 `P ≈ 0.28 × CAP`。
+/// CAP = 800 对应 **≈ 220 条**，与实测的 240 吻合。
+pub const CARRYING_CAPACITY: f32 = 800.0;
+
 /// 生成失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SpawnError {
@@ -187,7 +205,7 @@ impl EnergyAudit {
 }
 
 /// 一 tick 的生命层统计。
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct LifeStats {
     /// 活着的有机体数。
     pub organisms: usize,
@@ -203,6 +221,15 @@ pub struct LifeStats {
     pub starved: u32,
     /// 本 tick 吃掉的残骸格数。
     pub eaten: u32,
+    /// 当前种群的最大代数。
+    pub max_generation: u32,
+    /// 当前种群的平均代数。
+    pub avg_generation: f32,
+    /// 当前种群与**初代**基因组的平均权重距离（每个权重的平均绝对差）。
+    ///
+    /// 它涨说明基因确实在漂移；但它涨**不等于**适应度提高——
+    /// 中性漂移也会让它涨。要区分这两者，得看 [`LifeStats::energy`] 是否同步上升。
+    pub gene_distance: f32,
     /// 累计被出生动作"挤没"的流体格数。
     ///
     /// 正常应当是 0。它一旦不为 0，就说明 [`displace_fluid`] 走到了兜底二，
@@ -218,6 +245,8 @@ pub struct LifeSim {
     next_id: OrganismId,
     ledger: EnergyLedger,
     rng: Rng,
+    /// 初代基因组，用来度量"种群漂了多远"。取第一次投放的那一条。
+    founder: Option<Genome>,
     stats: LifeStats,
 }
 
@@ -232,6 +261,7 @@ impl Default for LifeSim {
             next_id: 1,
             ledger: EnergyLedger::default(),
             rng: Rng::new(LIFE_SEED),
+            founder: None,
             stats: LifeStats::default(),
         }
     }
@@ -267,6 +297,7 @@ impl LifeSim {
             next_id: 1,
             ledger,
             rng: Rng::new(LIFE_SEED),
+            founder: None,
             stats: LifeStats::default(),
         }
     }
@@ -315,6 +346,11 @@ impl LifeSim {
         if org.cells.is_empty() {
             return Err(SpawnError::EmptyBody);
         }
+        // 水平环绕：先告诉有机体世界有多宽，之后 `cell_at` 自己取模。
+        // 必须在验证之前设——否则贴着右边界的身体会被算成越界。
+        org.width = world.width() as i32;
+        // 锚点也折回界内：调用方可能传进一个刚超出边界的坐标。
+        org.anchor.0 = org.wrap_x(org.anchor.0);
         // 第一遍只验证，不动世界——半途失败会留下一个缺了几块的身体，
         // 那种残缺比"放不进去"难查得多。
         for cell in &org.cells {
@@ -368,6 +404,9 @@ impl LifeSim {
         org: Organism,
     ) -> Result<OrganismId, SpawnError> {
         let energy = org.energy as u64;
+        if self.founder.is_none() {
+            self.founder = Some(org.genome.clone());
+        }
         let id = self.spawn(world, org)?;
         self.ledger.injected += energy;
         Ok(id)
@@ -382,6 +421,33 @@ impl LifeSim {
             org.release(world);
             self.ledger.dissipated += org.energy as u64;
         }
+    }
+
+    /// 初代基因组。没投放过的世界返回 `None`。
+    #[inline]
+    pub fn founder(&self) -> Option<&Genome> {
+        self.founder.as_ref()
+    }
+
+    /// 当前种群与初代基因组的平均距离（每个权重的平均绝对差）。
+    ///
+    /// 这是 M3 的第一个观测指标，也是最容易被误读的一个：
+    /// **它涨不等于适应度提高**。突变是中性的，没有选择压力时基因照样会漂移，
+    /// 只是漂移是随机游走、不会累积成方向。
+    /// 判断"选择有没有发生"要看它与平均能量的关系，而不是它本身。
+    pub fn gene_distance(&self) -> f32 {
+        let Some(founder) = &self.founder else {
+            return 0.0;
+        };
+        if self.organisms.is_empty() {
+            return 0.0;
+        }
+        let sum: f32 = self
+            .organisms
+            .iter()
+            .map(|o| genome_distance(&o.genome, founder))
+            .sum();
+        sum / self.organisms.len() as f32
     }
 
     /// 审计能量账。**不是**每 tick 都该调用——它要扫一遍整张网格。
@@ -452,6 +518,22 @@ impl LifeSim {
         self.stats.organisms = self.organisms.len();
         self.stats.cells = self.organisms.iter().map(|o| o.cell_count()).sum();
         self.stats.energy = self.organisms.iter().map(|o| o.energy as u64).sum();
+        self.stats.max_generation = self
+            .organisms
+            .iter()
+            .map(|o| o.generation)
+            .max()
+            .unwrap_or(0);
+        self.stats.avg_generation = if self.organisms.is_empty() {
+            0.0
+        } else {
+            self.organisms
+                .iter()
+                .map(|o| o.generation as f32)
+                .sum::<f32>()
+                / self.organisms.len() as f32
+        };
+        self.stats.gene_distance = self.gene_distance();
     }
 
     /// 让一个有机体变成残骸。
@@ -490,6 +572,16 @@ impl LifeSim {
     /// （实测 256² 里 400 tick 从 4 条涨到 480 条，还在涨）。
     fn inject_sunlight(&mut self, world: &mut World) {
         let height = world.height().max(1) as f32;
+
+        // 环境容纳量：生产者越多，每个分到的光越少。
+        // 算一次总数就够了——它是全局量，不随位置变。
+        let total_producers: u32 = self
+            .organisms
+            .iter()
+            .map(|o| o.count(CellType::Producer) as u32)
+            .sum();
+        let competition = 1.0 / (1.0 + total_producers as f32 / CARRYING_CAPACITY);
+
         let mut injected = 0u64;
         for org in &mut self.organisms {
             let producers = org.count(CellType::Producer);
@@ -512,7 +604,7 @@ impl LifeSim {
             }
             let shade = (blocked as f32 / SHADE_SATURATION).min(MAX_SHADE);
 
-            let light = (1.0 - depth) * (1.0 - shade);
+            let light = (1.0 - depth) * (1.0 - shade) * competition;
             let gain = (PRODUCER_YIELD as f32 * light) as u32 * producers as u32;
             if gain == 0 {
                 continue;
@@ -602,8 +694,10 @@ impl LifeSim {
         inp[IN_ALIEN_AHEAD] = 0.0;
 
         let (ax, ay) = org.anchor;
-        inp[IN_BLOCKED_LEFT] = (!Self::passable(world, body, ax - 1, ay)) as u8 as f32;
-        inp[IN_BLOCKED_RIGHT] = (!Self::passable(world, body, ax + 1, ay)) as u8 as f32;
+        let left = org.wrap_x(ax - 1);
+        let right = org.wrap_x(ax + 1);
+        inp[IN_BLOCKED_LEFT] = (!Self::passable(world, body, left, ay)) as u8 as f32;
+        inp[IN_BLOCKED_RIGHT] = (!Self::passable(world, body, right, ay)) as u8 as f32;
         inp[IN_BLOCKED_UP] = (!Self::passable(world, body, ax, ay - 1)) as u8 as f32;
         inp[IN_SUPPORTED_BELOW] = (!Self::passable(world, body, ax, ay + 1)) as u8 as f32;
 
@@ -632,7 +726,7 @@ impl LifeSim {
         }
     }
 
-    /// 找一个能吃的残骸格：任何嘴细胞的四邻。
+    /// 找一个能吃的残骸格：任何嘴细胞的四邻。x 方向环绕。
     fn food_target(&self, world: &World, i: usize) -> Option<(isize, isize)> {
         let org = &self.organisms[i];
         for cell in &org.cells {
@@ -641,7 +735,8 @@ impl LifeSim {
             }
             let (x, y) = org.cell_at(cell);
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
-                let (nx, ny) = (x + dx, y + dy);
+                let nx = org.wrap_x(x + dx);
+                let ny = y + dy;
                 if world.get(nx as isize, ny as isize) == MaterialKind::Remains {
                     return Some((nx as isize, ny as isize));
                 }
@@ -663,12 +758,14 @@ impl LifeSim {
             return false;
         }
 
-        let new_anchor = (org.anchor.0 + dx, org.anchor.1 + dy);
+        // 水平方向环绕：锚点取模，身体格也跟着取模。
+        // 这一步让"右边界向右"变成"从左边界出现"，而不是被墙挡住。
+        let new_anchor = (org.wrap_x(org.anchor.0 + dx), org.anchor.1 + dy);
         let old: Vec<(i32, i32)> = org.footprint().collect();
         let mut targets = Vec::with_capacity(body);
         for cell in &org.cells {
             targets.push((
-                new_anchor.0 + cell.offset.0 as i32,
+                org.wrap_x(new_anchor.0 + cell.offset.0 as i32),
                 new_anchor.1 + cell.offset.1 as i32,
             ));
         }
@@ -760,12 +857,22 @@ impl LifeSim {
         // 但一条鱼仍可以在别人都饿着的时候自己攒够能量——所以还需要
         // 一条"地盘"规则，否则种群会在能量总量受限的同时把个体数堆到很高。
         let (ax, ay) = parent.anchor;
+        let width = parent.width;
+        // 水平距离也要按环面算：贴着左右边界的两条鱼其实是邻居。
+        let ring_dx = |a: i32, b: i32| {
+            let d = (a - b).abs();
+            if width > 0 {
+                d.min(width - d)
+            } else {
+                d
+            }
+        };
         let nearby = self
             .organisms
             .iter()
             .filter(|o| o.id != id)
             .filter(|o| {
-                (o.anchor.0 - ax).abs() <= CROWD_RADIUS && (o.anchor.1 - ay).abs() <= CROWD_RADIUS
+                ring_dx(o.anchor.0, ax) <= CROWD_RADIUS && (o.anchor.1 - ay).abs() <= CROWD_RADIUS
             })
             .count();
         if nearby >= CROWD_LIMIT {
@@ -777,17 +884,21 @@ impl LifeSim {
         let anchor = parent.anchor;
         let cells = parent.cells.clone();
         let facing = parent.facing;
+        let generation = parent.generation + 1;
         let mut genome = parent.genome.clone();
         genome.mutate(&mut self.rng, MUTATION_RATE, MUTATION_SIGMA);
 
         let child = Organism {
             id: 0, // spawn 会分配
             anchor,
+            width,
             cells,
             energy: BIRTH_ENERGY,
             age: 0,
             facing,
             genome,
+            parent: Some(id),
+            generation,
             acted: true, // 出生这一 tick 不再行动
         };
 
@@ -813,7 +924,7 @@ impl LifeSim {
 
         for (dx, dy) in offsets {
             let mut candidate = child.clone();
-            candidate.anchor = (anchor.0 + dx, anchor.1 + dy);
+            candidate.anchor = (child.wrap_x(anchor.0 + dx), anchor.1 + dy);
             if !self.fits(world, &candidate) {
                 continue;
             }
@@ -919,6 +1030,21 @@ impl LifeSim {
         org.energy = energy;
         org
     }
+}
+
+/// 两个基因组的平均权重距离（每个权重的平均绝对差）。
+fn genome_distance(a: &Genome, b: &Genome) -> f32 {
+    let n = a.weights.len().min(b.weights.len());
+    if n == 0 {
+        return 0.0;
+    }
+    let sum: f32 = a
+        .weights
+        .iter()
+        .zip(&b.weights)
+        .map(|(x, y)| (x - y).abs())
+        .sum();
+    sum / n as f32
 }
 
 /// 把一格流体从 `(x, y)` 推到附近的空位。返回 `false` 表示没地方放、只能丢弃。
@@ -1275,6 +1401,167 @@ mod tests {
         let mut g = forward_genome();
         g.weights[Genome::b_o(OUT_REPRODUCE)] = 2.0;
         g
+    }
+
+    // -----------------------------------------------------------------------
+    // 水平环绕
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_fish_wraps_around_the_right_edge() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        // 64 宽的世界，锚点 63 向右走一格应当回到 0。
+        let id = sim.spawn_injected(&mut w, swimmer((63, 40), 500)).unwrap();
+        sim.step(&mut w);
+        assert_eq!(sim.organism(id).unwrap().anchor.0, 0, "右边界应当接回左边");
+        assert_eq!(w.occupied_count(), 2, "环绕时身体不能散架");
+    }
+
+    #[test]
+    fn a_fish_wraps_around_the_left_edge() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((0, 40), 500)).unwrap();
+        // 强行让它往左走一步。
+        {
+            let org = &mut sim.organisms_mut()[0];
+            org.genome = Genome::blank();
+            org.genome.weights[Genome::b_o(OUT_LEFT)] = 2.0;
+        }
+        sim.step(&mut w);
+        assert_eq!(sim.organism(id).unwrap().anchor.0, 63, "左边界应当接回右边");
+        assert_eq!(w.occupied_count(), 2);
+    }
+
+    #[test]
+    fn wrapping_keeps_the_body_inside_the_world() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((62, 40), 5000)).unwrap();
+
+        for _ in 0..200 {
+            sim.step(&mut w);
+            let org = sim.organism(id).unwrap();
+            for (x, y) in org.footprint() {
+                assert!(
+                    (0..w.width() as i32).contains(&x),
+                    "环绕之后坐标必须在界内，实际 x={x}"
+                );
+                assert!((0..w.height() as i32).contains(&y));
+            }
+            assert_eq!(w.occupied_count(), 2, "身体始终完整");
+        }
+    }
+
+    #[test]
+    fn wrapping_never_loses_water() {
+        let mut w = pool();
+        let before = w.count_of(MaterialKind::Water);
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, swimmer((62, 40), 5000)).unwrap();
+        let after_spawn = w.count_of(MaterialKind::Water);
+        assert_eq!(after_spawn, before);
+
+        for _ in 0..300 {
+            sim.step(&mut w);
+            assert_eq!(
+                w.count_of(MaterialKind::Water),
+                after_spawn,
+                "环绕移动同样只能搬水，不能吞水"
+            );
+        }
+        assert!(sim.organism(id).is_some());
+    }
+
+    /// 隔着接缝的两条鱼在领地判定里应当算邻居。
+    #[test]
+    fn crowding_counts_across_the_seam() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, swimmer((0, 40), 500)).unwrap();
+        // 身体两格，所以第二条放 62 才不会和第一条跨接缝重叠。
+        sim.spawn_injected(&mut w, swimmer((62, 40), 500)).unwrap();
+        // 两者水平距离是 2（跨接缝算），远小于 CROWD_RADIUS。
+        let org = &mut sim.organisms_mut()[0];
+        org.energy = REPRODUCTION_ENERGY;
+        sim.ledger.injected += REPRODUCTION_ENERGY as u64;
+        // 附近只有 1 条同类，达不到 CROWD_LIMIT，所以能生。
+        assert!(
+            sim.reproduce(&mut w, 1).is_some(),
+            "跨接缝的邻居不该被当成很远"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 谱系与观测
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn a_child_remembers_its_parent_and_generation() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let parent = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 400))
+            .unwrap();
+        assert_eq!(sim.organism(parent).unwrap().generation, 0);
+        assert!(sim.organism(parent).unwrap().parent.is_none());
+
+        let child = sim.reproduce(&mut w, parent).expect("能量够，应当生得出来");
+        let child = sim.organism(child).unwrap();
+        assert_eq!(child.parent, Some(parent));
+        assert_eq!(child.generation, 1);
+    }
+
+    #[test]
+    fn generations_keep_counting_up() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let mut id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 400))
+            .unwrap();
+
+        for expected in 1..=4 {
+            let next = sim.reproduce(&mut w, id).expect("应当生得出来");
+            assert_eq!(sim.organism(next).unwrap().generation, expected);
+            // 给子代足够能量，让它继续生。
+            let deficit = REPRODUCTION_ENERGY.saturating_sub(sim.organism(next).unwrap().energy);
+            sim.organisms_mut()
+                .iter_mut()
+                .find(|o| o.id == next)
+                .unwrap()
+                .energy = REPRODUCTION_ENERGY;
+            sim.ledger.injected += deficit as u64;
+            id = next;
+        }
+    }
+
+    #[test]
+    fn the_founder_is_exactly_the_first_organism() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        assert!(sim.founder().is_none());
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+            .unwrap();
+        assert!(sim.founder().is_some());
+        assert_eq!(sim.gene_distance(), 0.0, "初代自己的距离必须是 0");
+    }
+
+    #[test]
+    fn gene_distance_grows_as_mutations_accumulate() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+            .unwrap();
+        assert_eq!(sim.gene_distance(), 0.0);
+
+        // 手动把一条鱼"变异"成完全不同的基因组，距离必须立刻涨上去。
+        sim.organisms_mut()[0].genome.weights.fill(1.0);
+        assert!(
+            sim.gene_distance() > 0.5,
+            "权重全改成 1.0 之后距离应当接近 1，实际 {}",
+            sim.gene_distance()
+        );
     }
 
     #[test]
