@@ -265,6 +265,11 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
                 // 在那里造残骸就等于凭空往水里塞东西。
                 if world.get(px, py) == MaterialKind::Stone {
                     world.set(px, py, MaterialKind::Remains);
+                    // 天然碎屑带能量（`flags = 25`），这一条有两个作用：
+                    // 1. 它们是可吃的食物，生命层建账时会把这份能量计入注入；
+                    // 2. `flags != 0` 让材质层的分解规则跳过它们——
+                    //    否则没有生物的世界也会一直"腐烂"，M1 的静止契约直接失效。
+                    world.set_flags(px, py, 25);
                 }
             }
         }

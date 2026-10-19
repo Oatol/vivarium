@@ -31,8 +31,8 @@
 use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
-    IN_FACING_Y, IN_FOOD_AHEAD, IN_KIN_AHEAD, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT,
-    OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
+    IN_FACING_Y, IN_FOOD_AHEAD, IN_KIN_AHEAD, IN_LIGHT, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN,
+    OUT_EAT, OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
 use crate::rng::Rng;
@@ -549,7 +549,17 @@ impl LifeSim {
     /// 这一点是免费的。
     fn bury(&mut self, world: &mut World, org: &Organism) {
         let n = org.cells.len().max(1) as u32;
-        let per_cell = (org.energy / n).min(u8::MAX as u32);
+        // 每格分不到 4 点能量的尸体视为"已经被自己烧光了"：flags 直接写 0。
+        //
+        // 这不只是省事——`flags == 0` 是材质层"这具尸体可以被分解"的唯一信号
+        // （见 `sim::tick_remains`）。不归零的话，一具还剩 3 点能量的饿死尸体
+        // 会永远泡在海底不烂，因为它带着能量、分解规则不敢碰它。
+        let per_cell = org.energy / n;
+        let per_cell = if per_cell < 4 {
+            0
+        } else {
+            per_cell.min(u8::MAX as u32)
+        };
         for cell in &org.cells {
             let (x, y) = org.cell_at(cell);
             let (x, y) = (x as isize, y as isize);
@@ -705,6 +715,12 @@ impl LifeSim {
         inp[IN_AGE] = org.age as f32 / MAX_AGE as f32;
         inp[IN_FACING_X] = org.facing.x as f32;
         inp[IN_FACING_Y] = org.facing.y as f32;
+
+        // 光照：只看深度，不算遮挡。算遮挡要扫 84 格，而 `inject_sunlight`
+        // 已经做过一次了——感知这里只给"我在多深"这个粗略信号就够了。
+        // 鱼要学会的是"往浅处游"，不是精确估计自己拿到多少能量。
+        let height = world.height().max(1) as f32;
+        inp[IN_LIGHT] = (1.0 - (ay.max(0) as f32 / height)).clamp(0.0, 1.0);
         inp
     }
 
@@ -1159,7 +1175,7 @@ pub fn stock_surface(
     }
     let width = world.width();
     let step = (width / count).max(1);
-    let genome = handcrafted_fish_genome();
+    let base = handcrafted_fish_genome();
 
     for k in 0..count {
         let x = ((k * step + step / 2).min(width - 1)) as i32;
@@ -1171,8 +1187,21 @@ pub fn stock_surface(
             }
         }
         let Some(y) = surface else { continue };
+        // 每个个体都轻微不同：给自然选择一点原材料。
+        //
+        // 全都一模一样的话，第一代没有任何可选的差异，种群只能靠"繁殖时突变"
+        // 慢慢产生变异——那要等很多代。播种时给一点抖动，选择从第一 tick 就开始。
+        // 幅度刻意压小（sigma 0.12）：大一点就会把手工设计的"会游、会吃"打散，
+        // 鱼连基本行为都没有，选择也就无从谈起。
+        let mut genome = base.clone();
+        genome.mutate(
+            &mut Rng::new(0xF15E_0000 ^ (k as u64).wrapping_mul(0x9E37_79B9)),
+            0.35,
+            0.12,
+        );
+
         // 往下两格：锚点在水面之下，生产者那一格（锚点上方）正好贴着水面。
-        let org = LifeSim::simple_fish((x, y + 2), genome.clone(), energy);
+        let org = LifeSim::simple_fish((x, y + 2), genome, energy);
         if let Ok(id) = sim.spawn_injected(world, org) {
             ids.push(id);
         }
