@@ -10,3 +10,6 @@
 .vscode/
 .idea/
 *.swp
+
+# 打包产物（每版由 scripts/package.ps1 生成，二进制不入库）
+/dist

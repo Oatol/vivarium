@@ -197,6 +197,21 @@ cargo test --workspace
 **工人数**（这一跑实际用到了几个线程），以及
 **能量账的差额**（只要不是 0，就说明有一条能量通道没走记账点）。
 
+## 打包
+
+每完成一版都打一次包，产物是**双击就能跑的单文件 exe**（不需要装 Rust、不需要装任何运行库）：
+
+```powershell
+.\scripts\package.ps1              # → dist\vivarium.exe
+.\scripts\package.ps1 -IncludeSim  # 顺带打包 headless 模拟器
+```
+
+`dist\VERSION.txt` 记录这一份是哪个 commit 构建的。`dist/` 不入库——
+仓库里只有源码和这个脚本。
+
+打包完记得**试运行一次**：编译通过不等于 exe 能跑，wgpu 的适配器初始化
+只有在真的开一次窗口之后才知道成不成。
+
 ### 想看一眼渲染结果
 
 不用开窗口，直接把离屏渲染导成 PNG：
