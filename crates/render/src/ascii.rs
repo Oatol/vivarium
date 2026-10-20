@@ -173,7 +173,7 @@ mod tests {
     fn organisms_render_as_at_signs() {
         let mut w = World::new(64, 64).unwrap();
         w.set(20, 5, MaterialKind::Water);
-        w.set_owner(20, 5, CellOwner::new(1, 0));
+        w.set_owner(20, 5, CellOwner::new(1, 0, 0));
         let mut r = AsciiRenderer::new(Camera::new(20, 5, 4, 2));
         r.render(&w).unwrap();
         let first = r.frame().lines().next().unwrap();

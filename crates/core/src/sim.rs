@@ -1492,7 +1492,7 @@ mod tests {
         for y in 24..27isize {
             for x in 30..33isize {
                 w.set(x, y, MaterialKind::Empty);
-                w.set_owner(x, y, CellOwner::new(1, occupied.len() as u16));
+                w.set_owner(x, y, CellOwner::new(1, occupied.len() as u16, 0));
                 occupied.push((x, y));
             }
         }

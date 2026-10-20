@@ -6,7 +6,7 @@
 //! 调色板刻意不用渐变、不用辉光——那是后处理层的事。
 //! 这里只回答一个问题：这种材质，是什么颜色。
 
-use vivarium_core::MaterialKind;
+use vivarium_core::{CellType, MaterialKind};
 
 /// 背景色，同时也是 [`MaterialKind::Empty`] 的颜色。
 pub const BACKGROUND: [u8; 3] = [12, 13, 18];
@@ -39,6 +39,76 @@ pub const fn glyph(kind: MaterialKind) -> char {
 /// 用一个统一的字符而不是按细胞类型分开：ASCII 视图的价值在于"看得见有没有活物"，
 /// 而身体内部的分工在 1 字符的分辨率下根本读不出来。想看细胞类型请用像素视图。
 pub const CELL_GLYPH: char = '@';
+
+/// 细胞类型 → 颜色。
+///
+/// 按**功能**上色，不按个体上色——这一条是照着 ALIEN 的做法定的。
+/// 按个体上色时，屏幕上是一堆随机色块，你看不出"这条鱼有两个生产者"；
+/// 按功能上色时，一眼就能读出身体的构成，而那正是"细胞结构"的意义。
+///
+/// 色相拉得很开（绿 / 橙 / 青 / 黄 / 紫 / 灰蓝 / 琥珀），因为深色背景下
+/// 相邻色相会糊在一起。饱和度也拉满：活着的东西必须比任何材质都醒目。
+pub const fn cell_rgb(kind: CellType) -> [u8; 3] {
+    match kind {
+        // 吃：橙红，和火同色系但更亮，因为它是主动的。
+        CellType::Mouth => [230, 96, 64],
+        // 光合：绿。这是唯一把光变成能量的地方，绿色是它的功能本身。
+        CellType::Producer => [86, 200, 96],
+        // 运动：青蓝。和水同色系，但亮得多。
+        CellType::Mover => [72, 176, 232],
+        // 感知：黄。像一颗眼点。
+        CellType::Eye => [240, 208, 88],
+        // 攻击：紫红。危险色，但不刺眼。
+        CellType::Killer => [214, 72, 160],
+        // 防御：灰蓝。刻意不抢眼——装甲不该是身体上最亮的部分。
+        CellType::Armor => [128, 152, 176],
+        // 建造：琥珀。和沙同色系，因为它处理的就是材质。
+        CellType::Builder => [196, 152, 72],
+    }
+}
+
+/// sRGB 分量 → 线性。
+///
+/// 着色器输出的是**线性**颜色，硬件负责编码成 sRGB 写进交换链。
+/// 直接把 0..255 除以 255 递过去，画面会明显偏亮——这是 wgpu 里
+/// 最经典的一次"双重转换"。
+fn srgb_to_linear(s: f32) -> f32 {
+    if s <= 0.040_45 {
+        s / 12.92
+    } else {
+        ((s + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+/// 打包成 shader 用的调色板：`[0..6]` 材质，`[8..14]` 细胞类型。
+///
+/// 下标是硬约定，与 `blit.wgsl` 里的 `8u + kind` 对应。中间空一格
+/// 是为了让"材质"和"细胞"在调试时一眼能分开。
+///
+/// `srgb_output` 为真时转成线性——交换链是 sRGB 格式，着色器必须给线性值。
+/// 为假（比如某些平台上拿到的是非 sRGB 格式）就直接给 sRGB 值。
+pub fn scene_palette(srgb_output: bool) -> [[f32; 4]; 16] {
+    let to_uniform = |[r, g, b]: [u8; 3]| -> [f32; 4] {
+        let f = |c: u8| {
+            let s = f32::from(c) / 255.0;
+            if srgb_output {
+                srgb_to_linear(s)
+            } else {
+                s
+            }
+        };
+        [f(r), f(g), f(b), 1.0]
+    };
+
+    let mut out = [[0.0f32; 4]; 16];
+    for kind in MaterialKind::ALL {
+        out[kind.as_u8() as usize] = to_uniform(rgb(kind));
+    }
+    for kind in CellType::ALL {
+        out[8 + kind.as_u8() as usize] = to_uniform(cell_rgb(kind));
+    }
+    out
+}
 
 /// 有机体编号 → 颜色。
 ///

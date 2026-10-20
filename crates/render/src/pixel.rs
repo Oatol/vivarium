@@ -37,14 +37,122 @@ use crate::{palette, RenderError, Renderer};
 // letterbox
 // ---------------------------------------------------------------------------
 
-/// blit 管线的 uniform：裁剪空间下的缩放与平移。
+/// 相机：看世界的哪一块、放大多少。
 ///
-/// 16 字节，正好是 uniform 缓冲的最小对齐要求。
+/// `zoom = 1.0` 表示整个世界刚好铺满窗口（默认，生态视角）。
+/// 想看细胞结构就得放大：512² 的世界在 1100 像素宽的窗口里只有
+/// 2.1 像素/格，一个细胞是两个像素，谈不上"结构"；
+/// `zoom = 8` 是 17 像素/格，这时候细胞才真的是一颗细胞。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Viewport {
+    /// 视口中心（格坐标）。
+    pub center: (f32, f32),
+    /// 放大倍数。`1.0` = 整个世界，越大看得越近。
+    pub zoom: f32,
+}
+
+impl Default for Viewport {
+    fn default() -> Self {
+        Self {
+            center: (0.0, 0.0),
+            zoom: 1.0,
+        }
+    }
+}
+
+/// 放大倍数的上下限。
+///
+/// 下限 1.0：再往外缩就会看到世界之外，而世界之外没有东西可看。
+/// 上限 64.0：一格 130 多像素，再放大只是把同一颗细胞拉成马赛克。
+pub const MIN_ZOOM: f32 = 1.0;
+pub const MAX_ZOOM: f32 = 64.0;
+
+impl Viewport {
+    /// 新建相机，对准世界中心。
+    pub fn centered_on(world: (u32, u32)) -> Self {
+        Self {
+            center: (world.0 as f32 * 0.5, world.1 as f32 * 0.5),
+            zoom: 1.0,
+        }
+    }
+
+    /// 视口覆盖多少格。
+    pub fn view_size(&self, world: (u32, u32)) -> (f32, f32) {
+        let zoom = self.zoom.clamp(MIN_ZOOM, MAX_ZOOM);
+        (world.0 as f32 / zoom, world.1 as f32 / zoom)
+    }
+
+    /// 把相机夹回世界里。
+    ///
+    /// 不夹的话会看到世界之外——那一片是背景色，看起来像"世界被裁掉了"，
+    /// 而实际上只是相机飘出去了。
+    pub fn clamped(self, world: (u32, u32)) -> Self {
+        let (vw, vh) = self.view_size(world);
+        let clamp = |c: f32, size: f32, view: f32| {
+            if view >= size {
+                size * 0.5
+            } else {
+                c.clamp(view * 0.5, size - view * 0.5)
+            }
+        };
+        Self {
+            center: (
+                clamp(self.center.0, world.0 as f32, vw),
+                clamp(self.center.1, world.1 as f32, vh),
+            ),
+            zoom: self.zoom.clamp(MIN_ZOOM, MAX_ZOOM),
+        }
+    }
+}
+
+/// letterbox 的结果：裁剪空间下的缩放与平移。
 #[repr(C)]
-#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
-struct BlitUniforms {
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Letterbox {
     scale: [f32; 2],
     offset: [f32; 2],
+}
+
+/// blit 管线的 uniform。
+///
+/// 除了 letterbox，还带上相机视口与整张调色板。颜色从 CPU 搬到 GPU 之后，
+/// "一格长什么样"就只有 shader 一个地方在回答——不会出现
+/// "CPU 算的颜色和 shader 算的不一致"这种最难查的一类 bug。
+///
+/// 布局必须与 `blit.wgsl` 里的 `Scene` 逐字节一致：304 字节，
+/// 每个 vec4 落在 16 的倍数上。
+#[repr(C)]
+#[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct SceneUniforms {
+    scale: [f32; 2],
+    offset: [f32; 2],
+    view: [f32; 4],
+    world: [f32; 2],
+    px_per_cell: f32,
+    _pad: f32,
+    palette: [[f32; 4]; 16],
+}
+
+impl SceneUniforms {
+    fn new(world: (u32, u32), target: (u32, u32), viewport: Viewport, srgb_output: bool) -> Self {
+        let lb = letterbox(world, target);
+        let vp = viewport.clamped(world);
+        let (vw, vh) = vp.view_size(world);
+        let px_per_cell = if vw > 0.0 {
+            (target.0 as f32 * lb.scale[0]) / vw
+        } else {
+            1.0
+        };
+        Self {
+            scale: lb.scale,
+            offset: lb.offset,
+            view: [vp.center.0 - vw * 0.5, vp.center.1 - vh * 0.5, vw, vh],
+            world: [world.0 as f32, world.1 as f32],
+            px_per_cell,
+            _pad: 0.0,
+            palette: palette::scene_palette(srgb_output),
+        }
+    }
 }
 
 /// 计算 letterbox：把世界按原宽高比塞进目标矩形，多余的部分留黑边。
@@ -54,9 +162,9 @@ struct BlitUniforms {
 ///
 /// 任一维度为 0 时退化为不缩放。这不是防御性编程：窗口最小化时
 /// 交换链尺寸真的会是 0。
-fn letterbox(world: (u32, u32), target: (u32, u32)) -> BlitUniforms {
+fn letterbox(world: (u32, u32), target: (u32, u32)) -> Letterbox {
     if world.0 == 0 || world.1 == 0 || target.0 == 0 || target.1 == 0 {
-        return BlitUniforms {
+        return Letterbox {
             scale: [1.0, 1.0],
             offset: [0.0, 0.0],
         };
@@ -73,7 +181,7 @@ fn letterbox(world: (u32, u32), target: (u32, u32)) -> BlitUniforms {
         [world_aspect / target_aspect, 1.0]
     };
 
-    BlitUniforms {
+    Letterbox {
         scale,
         offset: [0.0, 0.0],
     }
@@ -133,6 +241,13 @@ impl std::fmt::Display for FrameSkip {
 ///
 /// **不持有任何 GPU 资源。** 这是刻意的：这个结构里全是索引算术，
 /// 最容易写错，也最需要测试，而测试不该要求一台有显卡的机器。
+/// 语义键的最高位：这一格是细胞而不是材质。
+///
+/// 用最高位而不是"organism != 0"来判断，是因为 shader 拿到的是一个 u32，
+/// 没有第二个字段告诉它"这是不是生物"。材质 id 只用到低 8 位，
+/// 所以最高位永远空着，拿来做标志位不要钱。
+pub const CELL_BIT: u32 = 0x8000_0000;
+
 /// 一个格子在画面上"长什么样"的紧凑编码。
 ///
 /// - 无主：材质 id（0..7）
@@ -145,7 +260,10 @@ impl std::fmt::Display for FrameSkip {
 fn visual_key(cells: &[MaterialCell], owners: &[CellOwner], i: usize) -> u32 {
     let owner = owners[i];
     if owner.is_some() {
-        0x1_0000 | owner.organism
+        // 最高位标记"这一格是细胞"，中间 23 位是编号，低 8 位是细胞类型。
+        // 这个键同时是**世界纹理的内容**（见 `build_chunk`），
+        // 所以"脏块检测"和"上传的到底是什么"用的是同一个定义，不可能漂移。
+        CELL_BIT | (owner.organism << 8) | owner.kind as u32
     } else {
         cells[i].kind.as_u8() as u32
     }
@@ -292,19 +410,13 @@ impl PixelUploader {
             let base = (cy * CHUNK_SIZE + row) * self.width + cx * CHUNK_SIZE;
             for col in 0..CHUNK_SIZE {
                 let i = base + col;
-                let owner = owners[i];
-                let [r, g, b] = if owner.is_some() {
-                    // 生物永远压过材质：它站在水里时那一格画的是它，不是水。
-                    palette::organism_rgb(owner.organism)
-                } else {
-                    palette::rgb(cells[i].kind)
-                };
-                self.chunk_pixels[out] = r;
-                self.chunk_pixels[out + 1] = g;
-                self.chunk_pixels[out + 2] = b;
-                self.chunk_pixels[out + 3] = 255;
+                // 上传的是**语义键**，不是颜色。颜色、形状、膜的轮廓光
+                // 全在 shader 里算——一格一像素的纹理画不出圆，
+                // 而放大之后一个格子要占十几个像素，那些像素必须有内容可画。
+                let key = visual_key(cells, owners, i);
+                self.chunk_pixels[out..out + 4].copy_from_slice(&key.to_ne_bytes());
                 out += 4;
-                self.shadow[i] = visual_key(cells, owners, i);
+                self.shadow[i] = key;
             }
         }
         &self.chunk_pixels
@@ -336,7 +448,6 @@ struct Blitter {
     world_format: wgpu::TextureFormat,
     bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
-    sampler: wgpu::Sampler,
     uniforms: wgpu::Buffer,
 
     texture: Option<wgpu::Texture>,
@@ -344,6 +455,7 @@ struct Blitter {
     bind_group: Option<wgpu::BindGroup>,
     uploader: Option<PixelUploader>,
     world_size: (u32, u32),
+    viewport: Viewport,
     stats: PixelStats,
 }
 
@@ -361,22 +473,26 @@ impl std::fmt::Debug for Blitter {
 impl Blitter {
     /// 建立管线。这里会编译 WGSL——着色器写错的话，错误在这一步就暴露。
     fn new(device: wgpu::Device, queue: wgpu::Queue, output_format: wgpu::TextureFormat) -> Self {
-        let world_format = if output_format.is_srgb() {
-            wgpu::TextureFormat::Rgba8UnormSrgb
-        } else {
-            wgpu::TextureFormat::Rgba8Unorm
-        };
+        // 语义纹理：每格一个 u32。不再跟随 surface 的 sRGB 属性——
+        // 这里存的是编号，不是颜色，颜色是 shader 查表算出来的。
+        let world_format = wgpu::TextureFormat::R32Uint;
 
         let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("vivarium-blit-layout"),
             entries: &[
                 wgpu::BindGroupLayoutEntry {
                     binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
+                    // 顶点用 scale/offset，片段用视口与调色板——
+                    // 同一个 uniform 两个阶段都要读。
+                    visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                     ty: wgpu::BindingType::Buffer {
                         ty: wgpu::BufferBindingType::Uniform,
                         has_dynamic_offset: false,
-                        min_binding_size: wgpu::BufferSize::new(16),
+                        // 必须写真实的 uniform 大小。写小了 wgpu 会认为
+                        // 着色器要读的数组越界，直接拒绝建管线。
+                        min_binding_size: wgpu::BufferSize::new(
+                            std::mem::size_of::<SceneUniforms>() as u64,
+                        ),
                     },
                     count: None,
                 },
@@ -384,16 +500,12 @@ impl Blitter {
                     binding: 1,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                        // 整数纹理不能被采样器过滤，只能 textureLoad。
+                        // 这正好是我们要的：最近邻、不插值、格边界绝对清晰。
+                        sample_type: wgpu::TextureSampleType::Uint,
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
-                    count: None,
-                },
-                wgpu::BindGroupLayoutEntry {
-                    binding: 2,
-                    visibility: wgpu::ShaderStages::FRAGMENT,
-                    ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                     count: None,
                 },
             ],
@@ -438,22 +550,9 @@ impl Blitter {
             cache: None,
         });
 
-        // 最近邻采样，不是双线性。
-        // 这是像素画的硬要求：双线性会把 1 格宽的生物糊成一团灰。
-        let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            label: Some("vivarium-world-sampler"),
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Nearest,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
         let uniforms = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("vivarium-blit-uniforms"),
-            size: 16,
+            size: std::mem::size_of::<SceneUniforms>() as u64,
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
             mapped_at_creation: false,
         });
@@ -465,13 +564,13 @@ impl Blitter {
             world_format,
             bind_group_layout,
             pipeline,
-            sampler,
             uniforms,
             texture: None,
             view: None,
             bind_group: None,
             uploader: None,
             world_size: (0, 0),
+            viewport: Viewport::default(),
             stats: PixelStats::default(),
         }
     }
@@ -526,14 +625,16 @@ impl Blitter {
                     binding: 1,
                     resource: wgpu::BindingResource::TextureView(&view),
                 },
-                wgpu::BindGroupEntry {
-                    binding: 2,
-                    resource: wgpu::BindingResource::Sampler(&self.sampler),
-                },
             ],
         });
 
         self.uploader = Some(PixelUploader::new(world));
+        // 换世界时相机回到中心。尺寸变了还留着旧中心，会直接飘到世界外。
+        // 只在尺寸**真的变了**时重置：调用方可能刚设过相机，
+        // 每次重建都覆盖的话，设好的视口会莫名其妙失效。
+        if self.world_size != size {
+            self.viewport = Viewport::centered_on(size);
+        }
         self.texture = Some(texture);
         self.view = Some(view);
         self.bind_group = Some(bind_group);
@@ -601,7 +702,12 @@ impl Blitter {
         target: &wgpu::TextureView,
         target_size: (u32, u32),
     ) {
-        let uniforms = letterbox(self.world_size, target_size);
+        let uniforms = SceneUniforms::new(
+            self.world_size,
+            target_size,
+            self.viewport,
+            self.output_format.is_srgb(),
+        );
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
 
@@ -785,6 +891,50 @@ impl PixelRenderer {
     }
 
     /// 世界纹理占多少字节。
+    /// 当前相机。
+    pub fn viewport(&self) -> Viewport {
+        self.blitter.viewport
+    }
+
+    /// 直接设置相机。会被夹回世界范围内。
+    pub fn set_viewport(&mut self, viewport: Viewport) {
+        self.blitter.viewport = viewport.clamped(self.blitter.world_size);
+    }
+
+    /// 按倍数缩放。锚点是视口中心，不是鼠标——没有鼠标坐标时这是唯一合理的选择。
+    pub fn zoom_by(&mut self, factor: f32) {
+        let mut vp = self.blitter.viewport;
+        vp.zoom = (vp.zoom * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        self.blitter.viewport = vp.clamped(self.blitter.world_size);
+    }
+
+    /// 平移多少格。正 `dx` 向右，正 `dy` 向下。
+    pub fn pan_cells(&mut self, dx: f32, dy: f32) {
+        let mut vp = self.blitter.viewport;
+        vp.center.0 += dx;
+        vp.center.1 += dy;
+        self.blitter.viewport = vp.clamped(self.blitter.world_size);
+    }
+
+    /// 把相机对准某一格。
+    pub fn look_at(&mut self, x: f32, y: f32) {
+        let mut vp = self.blitter.viewport;
+        vp.center = (x, y);
+        self.blitter.viewport = vp.clamped(self.blitter.world_size);
+    }
+
+    /// 一格在屏幕上占多少像素。标题栏用它显示"现在是几倍"。
+    pub fn pixels_per_cell(&self, target: (u32, u32)) -> f32 {
+        let world = self.blitter.world_size;
+        let lb = letterbox(world, target);
+        let (vw, _) = self.blitter.viewport.view_size(world);
+        if vw > 0.0 {
+            (target.0 as f32 * lb.scale[0]) / vw
+        } else {
+            1.0
+        }
+    }
+
     pub fn world_texture_bytes(&self) -> u64 {
         self.blitter.world_texture_bytes()
     }
@@ -899,7 +1049,7 @@ impl Renderer for PixelRenderer {
 mod tests {
     use super::*;
     use vivarium_core::life_sim::{stock_surface, LifeSim};
-    use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng};
+    use vivarium_core::{worldgen, CellType, MaterialKind, MaterialSim, Rng};
 
     // --- letterbox ------------------------------------------------------
 
@@ -981,6 +1131,11 @@ mod tests {
 
     // --- 上传器 ---------------------------------------------------------
 
+    /// 从块字节里读出一格的语义键。
+    fn key_at(px: &[u8], off: usize) -> u32 {
+        u32::from_ne_bytes([px[off], px[off + 1], px[off + 2], px[off + 3]])
+    }
+
     fn world_with(cells: &[(isize, isize, MaterialKind)]) -> World {
         let mut w = World::new(128, 128).unwrap();
         for &(x, y, k) in cells {
@@ -1015,7 +1170,7 @@ mod tests {
         assert_eq!(up.prepare(&w), 0, "静止世界不该有脏块");
 
         // 细胞格的材质字段永远是 Empty——只比材质的话这里会漏掉。
-        w.set_owner(10, 10, CellOwner::new(1, 0));
+        w.set_owner(10, 10, CellOwner::new(1, 0, 0));
         assert_eq!(up.prepare(&w), 1, "生物出现必须让所在分块变脏");
     }
 
@@ -1027,29 +1182,63 @@ mod tests {
         assert_eq!(up.prepare(&w), 0);
 
         // 从 (63, 10) 挪到 (64, 10)：跨越 x 方向的块边界。
-        w.set_owner(63, 10, CellOwner::new(1, 0));
+        w.set_owner(63, 10, CellOwner::new(1, 0, 0));
         settle(&mut up, &w);
         w.vacate(63, 10);
-        w.set_owner(64, 10, CellOwner::new(1, 0));
+        w.set_owner(64, 10, CellOwner::new(1, 0, 0));
         assert_eq!(up.prepare(&w), 2, "旧块和新块都得重画");
     }
 
     #[test]
     fn organism_pixels_override_the_material_underneath() {
         let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
-        w.set_owner(10, 10, CellOwner::new(1, 0));
+        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Producer.as_u8()));
         let mut up = PixelUploader::new(&w);
         settle(&mut up, &w);
         let px = up.build_chunk(&w, 0, 0).to_vec();
 
         let off = (10 * CHUNK_SIZE + 10) * 4;
-        let drawn = [px[off], px[off + 1], px[off + 2]];
+        let key = key_at(&px, off);
         assert_ne!(
-            drawn,
-            palette::rgb(MaterialKind::Water),
-            "鱼站在水里时画的是鱼"
+            key,
+            MaterialKind::Water.as_u8() as u32,
+            "鱼站在水里时上传的是鱼，不是水"
         );
-        assert_eq!(drawn, palette::organism_rgb(1));
+        assert_eq!(
+            key,
+            CELL_BIT | (1 << 8) | CellType::Producer.as_u8() as u32,
+            "编号 1 的生产者细胞"
+        );
+    }
+
+    #[test]
+    fn the_cell_type_reaches_the_gpu() {
+        // 这是整个语义纹理的存在理由：渲染层必须知道"这是嘴还是生产者"，
+        // 否则没法按功能上色，也没法画不同的形状。
+        let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
+        w.set_owner(10, 10, CellOwner::new(7, 2, CellType::Mouth.as_u8()));
+        let mut up = PixelUploader::new(&w);
+        settle(&mut up, &w);
+        let px = up.build_chunk(&w, 0, 0).to_vec();
+
+        let key = key_at(&px, (10 * CHUNK_SIZE + 10) * 4);
+        assert_eq!(key & 0xFF, CellType::Mouth.as_u8() as u32, "类型在低 8 位");
+        assert_eq!((key >> 8) & 0x7F_FFFF, 7, "编号在中间 23 位");
+        assert_ne!(key & CELL_BIT, 0, "最高位标记这是细胞");
+    }
+
+    #[test]
+    fn changing_the_cell_type_dirties_the_chunk() {
+        // 同一个编号、同一个位置，只换了细胞类型——画面必须跟着变。
+        // 只按编号比的话这里会漏：器官换了，画面上什么都不变。
+        let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
+        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Mouth.as_u8()));
+        let mut up = PixelUploader::new(&w);
+        settle(&mut up, &w);
+        assert_eq!(up.prepare(&w), 0);
+
+        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Killer.as_u8()));
+        assert_eq!(up.prepare(&w), 1, "换了细胞类型必须重画");
     }
 
     #[test]
@@ -1111,7 +1300,7 @@ mod tests {
     }
 
     #[test]
-    fn chunk_pixels_match_the_palette() {
+    fn chunk_pixels_carry_the_material_id() {
         let mut w = World::new(128, 128).unwrap();
         w.set(3, 1, MaterialKind::Fire);
         let mut u = PixelUploader::new(&w);
@@ -1121,13 +1310,17 @@ mod tests {
 
         // 块内第 1 行第 3 列 → 字节偏移 (row * CHUNK_SIZE + col) * 4。
         let off = (CHUNK_SIZE + 3) * 4;
-        let [r, g, b] = palette::rgb(MaterialKind::Fire);
-        assert_eq!(&pixels[off..off + 4], &[r, g, b, 255]);
+        assert_eq!(
+            key_at(pixels, off),
+            MaterialKind::Fire.as_u8() as u32,
+            "材质格上传的是材质编号"
+        );
 
-        // 旁边一格是空，应当是背景色。
         let off_empty = (CHUNK_SIZE + 4) * 4;
-        let [r, g, b] = palette::rgb(MaterialKind::Empty);
-        assert_eq!(&pixels[off_empty..off_empty + 4], &[r, g, b, 255]);
+        assert_eq!(
+            key_at(pixels, off_empty),
+            MaterialKind::Empty.as_u8() as u32
+        );
     }
 
     #[test]
@@ -1143,12 +1336,11 @@ mod tests {
         let mut u = PixelUploader::new(&w);
         let pixels = u.build_chunk(&w, 0, 0);
 
-        let [sr, sg, sb] = palette::rgb(MaterialKind::Sand);
-        let [wr, wg, wb] = palette::rgb(MaterialKind::Water);
-        let row0 = &pixels[0..4];
-        let row1 = &pixels[CHUNK_SIZE * 4..CHUNK_SIZE * 4 + 4];
-        assert_eq!(row0, &[sr, sg, sb, 255]);
-        assert_eq!(row1, &[wr, wg, wb, 255]);
+        assert_eq!(key_at(pixels, 0), MaterialKind::Sand.as_u8() as u32);
+        assert_eq!(
+            key_at(pixels, CHUNK_SIZE * 4),
+            MaterialKind::Water.as_u8() as u32
+        );
     }
 
     #[test]
@@ -1468,6 +1660,242 @@ mod tests {
         eprintln!("预览已写出：{}", out.display());
         assert!(out.metadata().expect("读不到刚写的文件").len() > 1024);
         out
+    }
+
+    #[test]
+    fn cells_of_one_body_fuse_instead_of_leaving_a_seam() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("跳过：本机没有可用的 wgpu 适配器");
+            return;
+        };
+
+        const SIZE: u32 = 256;
+        let mut blitter = Blitter::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
+        // 16×16 的水，两格同族细胞横着并排。
+        let mut world = World::new(64, 64).unwrap();
+        world.fill_all(MaterialKind::Water);
+        world.set_owner(5, 5, CellOwner::new(1, 0, CellType::Mover.as_u8()));
+        world.set_owner(6, 5, CellOwner::new(1, 1, CellType::Mover.as_u8()));
+
+        // 视口 4×4 格铺满 256 像素 → 每格 64 像素。
+        // 格 5 的屏幕区间是 [96, 160)，格 6 是 [160, 224)，接缝正好在 x = 160。
+        // 世界 64 格除以视口 4 格，所以 zoom = 16。
+        blitter.viewport = Viewport {
+            center: (5.5, 5.5),
+            zoom: 16.0,
+        };
+        let px = blit_to_rgba(
+            &device,
+            &queue,
+            &mut blitter,
+            &world,
+            Viewport {
+                center: (5.5, 5.5),
+                zoom: 16.0,
+            },
+            SIZE,
+        );
+
+        let at = |x: u32, y: u32| -> [u8; 3] {
+            let off = ((y * SIZE + x) * 4) as usize;
+            [px[off], px[off + 1], px[off + 2]]
+        };
+
+        // 两个细胞的中心：格 5 在 x≈128，格 6 在 x≈192，y 都是 5.5 → 128。
+        let left = at(128, 128);
+        let right = at(192, 128);
+        let seam = at(160, 128);
+
+        eprintln!(
+            "格5中心 {:?} 接缝 {:?} 格6中心 {:?} 水 {:?}",
+            left,
+            seam,
+            right,
+            at(40, 128)
+        );
+
+        // 关键断言：接缝处的亮度必须接近两侧，而不是掉回水色。
+        let luma = |c: [u8; 3]| c[0] as i32 + c[1] as i32 + c[2] as i32;
+        let body = luma(left).max(luma(right));
+        let water = luma(at(40, 128));
+        assert!(
+            luma(seam) > (body + water) / 2,
+            "接缝 {:?} 掉回了水色 {:?}——同族的细胞必须连成一片，不能各画各的框",
+            seam,
+            at(40, 128)
+        );
+    }
+
+    /// 跑一遍真正的 blit 管线，把结果读回 CPU。
+    ///
+    /// 刻意走 GPU 而不是在 CPU 上复刻着色器：复刻出来的是一份"我以为
+    /// 着色器会这么画"的实现，它和着色器一起错的时候，看预览图是看不出来的。
+    fn blit_to_rgba(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        blitter: &mut Blitter,
+        world: &World,
+        viewport: Viewport,
+        size: u32,
+    ) -> Vec<u8> {
+        let format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        // 必须先 upload：首次上传会建纹理，而建纹理会把相机重置到世界中心。
+        // 反过来（先设相机再上传）会被那次重置悄悄抹掉，然后你会盯着一张
+        // "细胞不见了"的图查很久——这个坑我踩过了。
+        blitter.upload(world).expect("上传失败");
+        blitter.viewport = viewport.clamped((world.width() as u32, world.height() as u32));
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("preview-target"),
+            size: wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        let mut encoder = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("preview-encoder"),
+        });
+        blitter.draw(&mut encoder, &view, (size, size));
+
+        // 读回的行距必须是 256 的倍数，所以尺寸只能取 4 的倍数再对齐。
+        let bytes_per_row = size * 4;
+        assert_eq!(
+            bytes_per_row % wgpu::COPY_BYTES_PER_ROW_ALIGNMENT,
+            0,
+            "预览尺寸 {size} 的行距 {bytes_per_row} 不是 256 的倍数"
+        );
+        let readback = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("preview-readback"),
+            size: u64::from(bytes_per_row) * u64::from(size),
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        encoder.copy_texture_to_buffer(
+            wgpu::TexelCopyTextureInfo {
+                texture: &target,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            wgpu::TexelCopyBufferInfo {
+                buffer: &readback,
+                layout: wgpu::TexelCopyBufferLayout {
+                    offset: 0,
+                    bytes_per_row: Some(bytes_per_row),
+                    rows_per_image: Some(size),
+                },
+            },
+            wgpu::Extent3d {
+                width: size,
+                height: size,
+                depth_or_array_layers: 1,
+            },
+        );
+        queue.submit(Some(encoder.finish()));
+
+        let slice = readback.slice(..);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            let _ = tx.send(r);
+        });
+        device.poll(wgpu::PollType::wait_indefinitely()).ok();
+        rx.recv().expect("读回通道断了").expect("映射失败");
+
+        let data = slice.get_mapped_range().expect("映射后读不到范围");
+        let out = data.to_vec();
+        drop(data);
+        readback.unmap();
+        out
+    }
+
+    fn write_png_sized(name: &str, pixels: &[u8], size: u32) -> std::path::PathBuf {
+        let out = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target")
+            .join(name);
+        if let Some(parent) = out.parent() {
+            std::fs::create_dir_all(parent).expect("建 target 目录失败");
+        }
+        let file = std::fs::File::create(&out).expect("创建 PNG 失败");
+        let mut encoder = png::Encoder::new(std::io::BufWriter::new(file), size, size);
+        encoder.set_color(png::ColorType::Rgba);
+        encoder.set_depth(png::BitDepth::Eight);
+        let mut writer = encoder.write_header().expect("写 PNG 头失败");
+        writer.write_image_data(pixels).expect("写 PNG 数据失败");
+        drop(writer);
+        eprintln!("预览已写出：{}", out.display());
+        out
+    }
+
+    /// 放大到能看清细胞，检查"细胞到底长什么样"。
+    ///
+    /// ```text
+    /// cargo test -p vivarium-render --lib -- --ignored --nocapture render_preview_cells
+    /// ```
+    #[test]
+    #[ignore = "会写 PNG，按需手动跑"]
+    fn render_preview_cells() {
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("跳过：本机没有可用的 wgpu 适配器");
+            return;
+        };
+
+        const SIZE: u32 = 768;
+        let mut blitter = Blitter::new(
+            device.clone(),
+            queue.clone(),
+            wgpu::TextureFormat::Rgba8UnormSrgb,
+        );
+
+        let mut world = World::new(256, 256).unwrap();
+        let mut rng = Rng::new(42);
+        worldgen::sea_and_islands(&mut world, &mut rng);
+        let mut sim = MaterialSim::new();
+        for _ in 0..400 {
+            sim.step(&mut world);
+        }
+
+        let mut life = LifeSim::new(&mut world);
+        stock_surface(&mut world, &mut life, 14, 300);
+        for _ in 0..200 {
+            life.step(&mut world);
+            sim.step(&mut world);
+        }
+
+        // 挑一条还活着的，把相机对准它的锚点。
+        let Some(target) = life.organisms().first() else {
+            panic!("一条鱼都没活下来，预览无从谈起");
+        };
+        let center = (target.anchor.0 as f32 + 0.5, target.anchor.1 as f32 + 0.5);
+        eprintln!("对准 ({}, {})", center.0, center.1);
+
+        for (name, zoom) in [
+            ("render-cells-wide.png", 3.0),
+            ("render-cells-close.png", 14.0),
+        ] {
+            let px = blit_to_rgba(
+                &device,
+                &queue,
+                &mut blitter,
+                &world,
+                Viewport { center, zoom },
+                SIZE,
+            );
+            write_png_sized(name, &px, SIZE);
+        }
     }
 
     /// 把离屏渲染结果写成 PNG，供人眼检查。

@@ -38,10 +38,11 @@ use vivarium_core::life_sim::{stock_surface, LifeSim};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::pixel::PixelRenderer;
+use vivarium_render::pixel::Viewport;
 use vivarium_render::Renderer;
 
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{Key, NamedKey};
 use winit::window::{Window, WindowId};
@@ -230,6 +231,20 @@ impl ApplicationHandler for App {
                 }
             }
 
+            WindowEvent::MouseWheel { delta, .. } => {
+                // 每格滚轮的放大倍率。1.15 是试出来的：再小要滚很久才看得见变化，
+                // 再大一次误触就从全景跳到细胞内部，找不到自己在哪。
+                let lines = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    // 触控板给的是像素。除以 40 换算成"行"，
+                    // 否则一次轻扫就是十几倍，镜头直接飞出去。
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
+                };
+                if lines != 0.0 {
+                    game.renderer.zoom_by(1.15f32.powf(lines));
+                }
+            }
+
             WindowEvent::RedrawRequested => game.frame(),
 
             _ => {}
@@ -336,7 +351,9 @@ impl Game {
   世界纹理  : {} KiB（脏块增量上传）
   生物      : {} 条 · {} 个细胞 · 能量 {}
 
-  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · L 放鱼 · R 重铺地形 · Esc 退出",
+  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · L 放鱼 · R 重铺地形 · Esc 退出
+
+  滚轮 缩放 · 方向键 平移 · 0 回到全景",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -367,6 +384,10 @@ impl Game {
                     TimeScale::Paused
                 };
             }
+            Key::Named(NamedKey::ArrowLeft) => self.pan(-1.0, 0.0),
+            Key::Named(NamedKey::ArrowRight) => self.pan(1.0, 0.0),
+            Key::Named(NamedKey::ArrowUp) => self.pan(0.0, -1.0),
+            Key::Named(NamedKey::ArrowDown) => self.pan(0.0, 1.0),
             Key::Character(text) => match text.as_str() {
                 "1" => self.scale = TimeScale::X1,
                 "2" => self.scale = TimeScale::X5,
@@ -375,10 +396,28 @@ impl Game {
                 "f" | "F" => self.ignite_peak(),
                 "l" | "L" => self.release_fish(),
                 "r" | "R" => self.reseed(),
+                // 缩放：`+` 和 `=` 都收，因为大多数键盘上 `+` 要按 shift。
+                "+" | "=" => self.renderer.zoom_by(1.5),
+                "-" | "_" => self.renderer.zoom_by(1.0 / 1.5),
+                "0" => {
+                    let size = (self.world.width() as u32, self.world.height() as u32);
+                    self.renderer.set_viewport(Viewport::centered_on(size));
+                }
                 _ => {}
             },
             _ => {}
         }
+    }
+
+    /// 按视口宽度的比例平移相机。
+    ///
+    /// 用"视口的一成"而不是固定的格数：放大之后固定格数会显得太慢
+    /// （一按只挪动一个细胞的距离），缩到全景时又会一步跨过大半个世界。
+    fn pan(&mut self, dx: f32, dy: f32) {
+        let size = (self.world.width() as u32, self.world.height() as u32);
+        let vp = self.renderer.viewport();
+        let (vw, vh) = vp.view_size(size);
+        self.renderer.pan_cells(dx * vw * 0.1, dy * vh * 0.1);
     }
 
     /// 在最高的岛顶点一把火。
@@ -471,10 +510,13 @@ impl Game {
         let workers = self.sim.workers();
         let life = self.life.stats();
         let total = self.world.chunk_count();
+        let size = self.window.inner_size();
+        let px = self.renderer.pixels_per_cell((size.width, size.height));
         self.window.set_title(&format!(
-            "Vivarium — tick {} · {:.0} fps · {} · 活跃块 {}/{} · 工人 {} · 生物 {} · 能量 {} · 本帧上传 {}/{} 块 · 累计 {} 块",
+            "Vivarium — tick {} · {:.0} fps · {:.1} px/格 · {} · 活跃块 {}/{} · 工人 {} · 生物 {} · 能量 {} · 本帧上传 {}/{} 块 · 累计 {} 块",
             self.world.tick(),
             self.fps,
+            px,
             scale_label(self.scale),
             sim.active_chunks,
             total,

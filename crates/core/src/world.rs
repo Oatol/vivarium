@@ -55,6 +55,14 @@ pub struct CellOwner {
     pub organism: u32,
     /// 该格是这个有机体的第几个细胞。
     pub cell: u16,
+    /// 这一格细胞的类型（`crate::life::CellType::as_u8`）。
+    ///
+    /// 渲染层靠它决定画什么形状、上什么颜色。之所以存一份在占格表里，
+    /// 而不是让渲染器去查生命层：渲染器只拿得到 `&World`，为了知道
+    /// "这是嘴还是生产者"而让它持有整个 `LifeSim`，是把两层焊死。
+    ///
+    /// 加这个字段**没有多占内存**——`u32 + u16` 本来就要 padding 到 8 字节。
+    pub kind: u8,
 }
 
 impl CellOwner {
@@ -62,12 +70,17 @@ impl CellOwner {
     pub const NONE: Self = Self {
         organism: 0,
         cell: 0,
+        kind: 0,
     };
 
-    /// 由有机体编号与细胞下标构造。
+    /// 由有机体编号、细胞下标与细胞类型构造。
     #[inline]
-    pub const fn new(organism: u32, cell: u16) -> Self {
-        Self { organism, cell }
+    pub const fn new(organism: u32, cell: u16, kind: u8) -> Self {
+        Self {
+            organism,
+            cell,
+            kind,
+        }
     }
 
     /// 这一格是否被占用。
@@ -544,6 +557,10 @@ impl World {
                 h = h.wrapping_mul(FNV_PRIME);
                 h ^= owner.cell as u64;
                 h = h.wrapping_mul(FNV_PRIME);
+                // 细胞类型也要进哈希：同一个编号、同一个下标，换成另一种细胞
+                // 就是另一个世界，而"世界变了哈希没变"会让回放对不上。
+                h ^= owner.kind as u64;
+                h = h.wrapping_mul(FNV_PRIME);
             }
         }
         h
@@ -846,13 +863,13 @@ mod tests {
         assert!(!w.is_occupied(10, 10));
         assert_eq!(w.owner(10, 10), CellOwner::NONE);
 
-        assert!(w.set_owner(10, 10, CellOwner::new(7, 3)));
+        assert!(w.set_owner(10, 10, CellOwner::new(7, 3, 0)));
         assert!(w.is_occupied(10, 10));
-        assert_eq!(w.owner(10, 10), CellOwner::new(7, 3));
+        assert_eq!(w.owner(10, 10), CellOwner::new(7, 3, 0));
         assert_eq!(w.occupied_count(), 1);
 
         // 同一个值再写一次不该有任何变化。
-        assert!(!w.set_owner(10, 10, CellOwner::new(7, 3)));
+        assert!(!w.set_owner(10, 10, CellOwner::new(7, 3, 0)));
 
         assert!(w.vacate(10, 10));
         assert!(!w.is_occupied(10, 10));
@@ -865,7 +882,7 @@ mod tests {
         assert_eq!(w.owner(-1, 0), CellOwner::NONE);
         assert_eq!(w.owner(0, 128), CellOwner::NONE);
         assert!(!w.is_occupied(128, 0));
-        assert!(!w.set_owner(-1, -1, CellOwner::new(1, 0)));
+        assert!(!w.set_owner(-1, -1, CellOwner::new(1, 0, 0)));
         assert_eq!(w.occupied_count(), 0);
     }
 
@@ -879,7 +896,7 @@ mod tests {
         // 空位对沙是"可以让开"的。
         assert!(w.yields_to(20, 20, MaterialKind::Sand));
 
-        w.set_owner(20, 20, CellOwner::new(1, 0));
+        w.set_owner(20, 20, CellOwner::new(1, 0, 0));
         assert!(!w.yields_to(20, 20, MaterialKind::Sand));
         assert!(!w.yields_to(20, 20, MaterialKind::Water));
 
@@ -892,7 +909,7 @@ mod tests {
     fn occupying_marks_dirty() {
         let mut w = World::new(128, 128).unwrap();
         w.clear_dirty();
-        w.set_owner(30, 30, CellOwner::new(1, 0));
+        w.set_owner(30, 30, CellOwner::new(1, 0, 0));
         assert_eq!(w.dirty_chunk_count(), 1, "占格会改变邻居能不能流进来");
     }
 
@@ -923,11 +940,11 @@ mod tests {
     fn occupancy_changes_the_hash() {
         let mut w = World::new(128, 128).unwrap();
         let before = w.hash();
-        w.set_owner(5, 5, CellOwner::new(1, 0));
+        w.set_owner(5, 5, CellOwner::new(1, 0, 0));
         assert_ne!(w.hash(), before);
         // 同一个世界、同一格换个细胞下标，哈希也该变。
         let with_first = w.hash();
-        w.set_owner(5, 5, CellOwner::new(1, 1));
+        w.set_owner(5, 5, CellOwner::new(1, 1, 0));
         assert_ne!(w.hash(), with_first);
     }
 }
