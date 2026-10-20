@@ -34,8 +34,8 @@ use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
     IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
-    IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP,
-    REMAINS_ENERGY,
+    IN_ORGANISM_DIR_X, IN_ORGANISM_DIR_Y, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT,
+    OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
 use crate::rng::Rng;
@@ -49,6 +49,27 @@ use crate::world::World;
 /// 产出就得落在 `14 / 0.8 ≈ 17.5` 到 `14 / 0.15 ≈ 93` 之间。
 /// 取 24 意味着浅水每 tick 净赚 5、深水每 tick 亏 11——
 /// 攒够一次繁殖（200 点）大约 40 tick，而沉到深处 20 tick 就开始挨饿。
+///
+/// ## 试过降到 15，失败了，所以是 24
+///
+/// 目的是把生态从"光照受限"推到"觅食受限"：24 的时候一条 4 生产者的鱼
+/// 在光 0.8 下净赚 +26.8/tick，光本身就够活，于是"跑得快 / 看得远"
+/// 永远不如"多长一个生产者"，体型只能朝一个方向走。
+///
+/// 降到 15（甚至 18、20）之后发生的事，比数字本身有用：
+///
+/// 1. **48 条鱼 4000 tick 内全灭**，而海底的藻席堆到 800 格没人吃。
+/// 2. 原因不是"鱼不想吃"，是**几何**：海深 184 格，一趟下潜往返的移动成本
+///    是 `质量 × 距离 ≈ 13 × 368 ≈ 4800`，而一格藻只有 120 能量——
+///    整片藻席吃下去也回不了本。**海底的藻席对水面上的鱼是不可达的。**
+/// 3. 改成"浮游藻"（悬在透光层里）之后鱼能吃到，但藻是**静态固体**，
+///    悬在水里会把水流切成碎块——1500 格就让 `活跃块` 掉到 3/64，
+///    3000 格时整个世界静止（`移动 0`），鱼全被顶进空气。
+///
+/// 结论：**这不是调参能解决的。** 要让食物可达又不成障碍，藻需要一套
+/// 自己的移动规则（随水漂、可被水挤开），那是一次材质层的改动，不是一次调参。
+/// 在它做出来之前，这里保持 24——**宁可"光照受限"但生态健康，
+/// 也不要"觅食受限"但世界冻住。**
 pub const PRODUCER_YIELD: u32 = 24;
 
 // 能量上限 / 繁殖门槛 / 子代携带能量**都按细胞数算**，见 `life::MAX_ENERGY_PER_CELL`。
@@ -149,6 +170,14 @@ pub const CORPSE_ROT_PERCENT: u32 = 20;
 pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 
 /// 每次清扫时，一格符合条件的海底水格长出藻的概率（百分比）。
+///
+/// **v0.18 起从 8 提到 40。** 光降到 15 之后，鱼必须靠吃活命，
+/// 而藻的**通量**（不是存量）决定能养活多少条鱼：每列一格 ≈ 330 格，
+/// 8% 每 25 tick 只能供 330/312 ≈ 1 格/tick ≈ 127 能量/tick，够两三条鱼。
+/// 40% 把它抬到约 5 格/tick ≈ 640 能量/tick，能撑住一个几十条的种群。
+///
+/// 提高它同时改变了"食物"的性质：藻席基本**总是满的**，限制不再是
+/// "藻长得慢"，而是"鱼能吃多快"——这正是"觅食受限"想要的样子。
 pub const FOOD_GROWTH_PERCENT: u32 = 8;
 
 /// 这一格是不是泡在水下。
@@ -932,6 +961,11 @@ impl LifeSim {
         let mut grown = 0u64;
         let mut rotted = 0u64;
         let mut rotted_cells = 0u32;
+        // 浮游藻的存量用**上一轮扫出来的数**判断。滞后一轮无所谓——
+        // 上限是软的，而每一轮都重新数一遍要多扫一遍世界（262k 格）。
+        // 封顶用**本轮边扫边数**的存量（`algae_seen + pelagic`），
+        // 不用上一轮的总数：第一轮扫的时候存量还是 0，用旧数会一口气长过头
+        // ——实测藻一度涨到 21600 格，把整片海的水都换成了藻。
 
         for y in 0..h {
             for x in 0..w {
@@ -1140,6 +1174,7 @@ impl LifeSim {
         // 射线是 48 格。而且射线天然表达遮挡——一条鱼闻到隔壁岩架后面的藻
         // 是没有道理的，它得绕过去。
         let (mut smell_x, mut smell_y) = (0.0f32, 0.0f32);
+        let (mut org_x, mut org_y) = (0.0f32, 0.0f32);
         let smell_radius = org.smell_radius();
         for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
             for d in 1..=smell_radius {
@@ -1147,6 +1182,14 @@ impl LifeSim {
                 let sy = org.anchor.1 + dy * d;
                 let (sxs, sys) = (sx as isize, sy as isize);
                 if !world.in_bounds(sxs, sys) {
+                    break;
+                }
+                // 生物要先看：身体格的材质是 `Empty`，不挡射线，
+                // 按材质判的话会"穿过"一条鱼继续往后闻。
+                let owner = world.owner(sxs, sys);
+                if owner.organism != 0 && owner.organism != org.id {
+                    org_x += dx as f32 / d as f32;
+                    org_y += dy as f32 / d as f32;
                     break;
                 }
                 if matches!(
@@ -1169,6 +1212,8 @@ impl LifeSim {
         }
         inp[IN_FOOD_DIR_X] = smell_x.clamp(-1.0, 1.0);
         inp[IN_FOOD_DIR_Y] = smell_y.clamp(-1.0, 1.0);
+        inp[IN_ORGANISM_DIR_X] = org_x.clamp(-1.0, 1.0);
+        inp[IN_ORGANISM_DIR_Y] = org_y.clamp(-1.0, 1.0);
         inp
     }
 
@@ -1672,17 +1717,40 @@ fn pick_direction(out: &[f32; OUTPUTS]) -> Option<(i32, i32)> {
     best.map(|(_, dx, dy)| (dx, dy))
 }
 
+/// 手工基因组的"社交倾向"：**有没有牙决定往哪边走**。
+///
+/// 这不是替进化写策略，而是给两套完全不同的身体一个**能活的起点**：
+/// 有杀手细胞的身体如果一见到别人就躲，它永远吃不上一口；
+/// 没牙的身体如果一见到别人就凑上去，它是自己在送死。
+/// 之后怎么调，交给突变。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Tactic {
+    /// 有牙：靠近别的生物。
+    Hunt,
+    /// 没牙：远离别的生物。
+    ///
+    /// **手工起点不用它，留给进化。** 实测：猎物一躲，捕食者就在三种尺度下
+    /// 全部灭绝（512² 起步 24 条 / 120 条、128² 起步 20 条，16000 tick 时
+    /// `杀手 0 枚`）——因为捕食者和猎物**速度一样**，追的一方永远追不上，
+    /// 只能吃被逼到角落的，而那种机会少到养不活自己。
+    ///
+    /// 这不是"逃"写错了，是"逃"太有效了：它把捕食这个生态位变得需要**技巧**，
+    /// 而手工基因组没有技巧。所以手工起点只给"追"，"逃"作为一条通道
+    /// 留给突变——真到了那一天，捕食者也该跟着变快或变聪明。
+    Flee,
+    /// 不理会别的生物。手工起点给非捕食者用。
+    Ignore,
+}
+
 /// 一条手工设计的"食腐鱼"的大脑。
 ///
-/// 三件事：往前游、撞墙就掉头、看到什么就吃、攒够能量就生。
-/// 它不会躲、不会追、不会转向猎物——**这就是 M2 想要的水平**：
-/// 先证明"感知 → 决策 → 移动 → 进食 → 繁殖 → 死亡 → 残骸"这条链是通的，
-/// 再谈网络能学到什么。一个会追猎物的基因组在没有猎物时和这个没有区别。
+/// 四件事：往前游、撞墙就掉头、看到什么就吃、攒够能量就生。
+/// 加上一条社交倾向（[`Tactic`]）：有牙的靠近、没牙的躲开。
 ///
 /// "撞墙掉头"不是装饰：只给"往右"的偏置时，所有鱼都会游到右边界堆成一团，
 /// 于是互相拥挤、停止繁殖，整个种群卡在 9 条（实测）。一条能被墙推回来的鱼
 /// 才会把水域用满——这是 M2 里第一次看到"行为影响生态"的地方。
-pub fn handcrafted_fish_genome() -> Genome {
+pub fn handcrafted_fish_genome(tactic: Tactic) -> Genome {
     let mut g = Genome::blank();
     g.weights[Genome::b_o(OUT_RIGHT)] = 1.0;
     g.weights[Genome::b_o(OUT_EAT)] = 2.0;
@@ -1721,6 +1789,27 @@ pub fn handcrafted_fish_genome() -> Genome {
     // 具体是好事还是坏事，取决于它自己有没有牙。
     g.connect(IN_ALIEN_AHEAD, OUT_RIGHT, 1.5);
     g.connect(IN_ALIEN_AHEAD, OUT_LEFT, -1.5);
+
+    // --- 社交：有牙的靠过去，没牙的躲开 -----------------------------------
+    //
+    // 这是"追 / 逃"的全部实现，也是捕食第一次不只是"碰巧撞上"。
+    // 权重 3.0 比觅食（1.5）强：别人比食物更紧急。
+    // 但仍然压不过"撞墙掉头"（10.0）——贴到墙上时先脱身再说。
+    // 权重不对称：**追得狠，逃得迟**。
+    //
+    // 对称（两边都 3.0）时捕食者会全灭——猎物和捕食者速度一样，
+    // 一旦猎物在 20 格就开始躲，追的一方永远追不上，只能吃被逼到角落的。
+    // 实测 512² 起步 120 条、16000 tick：`杀手 0 枚`。
+    // 猎物只在该反应的时候反应（约 6 格内）才留得出捕食的余地。
+    let (toward, away) = match tactic {
+        Tactic::Hunt => (3.0, -3.0),
+        Tactic::Flee => (-3.0, 3.0),
+        Tactic::Ignore => (0.0, 0.0),
+    };
+    g.connect(IN_ORGANISM_DIR_X, OUT_RIGHT, toward);
+    g.connect(IN_ORGANISM_DIR_X, OUT_LEFT, away);
+    g.connect(IN_ORGANISM_DIR_Y, OUT_DOWN, toward);
+    g.connect(IN_ORGANISM_DIR_Y, OUT_UP, away);
 
     // --- 续命：暗了就往上 ------------------------------------------------
     //
@@ -1768,10 +1857,36 @@ pub fn stock_surface(
     }
     let width = world.width();
     let step = (width / count).max(1);
-    let base = handcrafted_fish_genome();
+    // 倾向按**长出来的身体**决定，不按体型表：形态发生模式下
+    // "这是不是捕食者"只有长完才知道。
+    let tactic_of = |cells: &[Cell]| {
+        if cells.iter().any(|c| c.kind == CellType::Killer) {
+            Tactic::Hunt
+        } else {
+            Tactic::Ignore
+        }
+    };
 
     for k in 0..count {
         let plan = &PLANS[k % PLANS.len()];
+
+        // **先算出身体，再配基因组。**
+        //
+        // 顺序不能反过来：社交倾向（追 / 逃）要看"这条鱼有没有牙"，
+        // 而形态发生模式下"有没有牙"只有长完才知道。
+        //
+        // 形态发生模式：基因组里塞一份**从手工体型反推出来的生长程序**，
+        // 身体由它长出来。这一步只是热启动——之后子代继承的是规则，
+        // 突变改到的就是形状本身了。
+        let grn = morph.then(|| {
+            Grn::from_plan(plan)
+                .or_else(|| Grn::from_plan(&PLANS[0]))
+                .unwrap_or_default()
+        });
+        let cells = match &grn {
+            Some(g) => g.develop(),
+            None => plan.cells(),
+        };
 
         // 每个个体都轻微不同：给自然选择一点原材料。
         //
@@ -1779,26 +1894,15 @@ pub fn stock_surface(
         // 慢慢产生变异——那要等很多代。播种时给一点抖动，选择从第一 tick 就开始。
         // 幅度刻意压小（sigma 0.12）：大一点就会把手工设计的"会游、会吃"打散，
         // 鱼连基本行为都没有，选择也就无从谈起。
-        let mut genome = base.clone();
+        let mut genome = handcrafted_fish_genome(tactic_of(&cells));
         genome.mutate(
             &mut Rng::new(0xF15E_0000 ^ (k as u64).wrapping_mul(0x9E37_79B9)),
             0.35,
             0.12,
         );
-
-        // 形态发生模式：基因组里塞一份**从手工体型反推出来的生长程序**，
-        // 身体由它长出来。这一步只是热启动——之后子代继承的是规则，
-        // 突变改到的就是形状本身了。
-        if morph {
-            genome.grn = Grn::from_plan(plan)
-                .or_else(|| Grn::from_plan(&PLANS[0]))
-                .unwrap_or_default();
+        if let Some(g) = grn {
+            genome.grn = g;
         }
-        let cells = if morph {
-            genome.grn.develop()
-        } else {
-            plan.cells()
-        };
 
         // 身体在 x 方向的左右伸出量，用来把锚点夹在界内——
         // 否则贴边的个体整个投放会失败，水面看起来"有一段没鱼"。
@@ -2475,7 +2579,7 @@ mod tests {
     fn the_handcrafted_fish_swims_toward_its_face() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        let mut genome = handcrafted_fish_genome();
+        let mut genome = handcrafted_fish_genome(Tactic::Ignore);
         // 关掉繁殖，否则它会半路生孩子，锚点就不好断言了。
         genome.weights[Genome::b_o(OUT_REPRODUCE)] = 0.0;
         let mut fish = LifeSim::simple_fish((20, 40), genome, 2_000);
@@ -2585,7 +2689,7 @@ mod tests {
     /// 权重压到和巡航偏置同一量级——**要不要用它，交给突变。**
     #[test]
     fn the_smell_channel_is_wired_in_the_right_direction() {
-        let mut g = handcrafted_fish_genome();
+        let mut g = handcrafted_fish_genome(Tactic::Ignore);
         g.weights[Genome::b_o(OUT_REPRODUCE)] = 0.0;
 
         let mut inputs = [0.0f32; INPUTS];
@@ -2762,6 +2866,71 @@ mod tests {
                 "第 {tick} tick 水位漂了：出生借的水和尸体还的水对不上"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 追 / 逃
+    // -----------------------------------------------------------------------
+
+    /// 感知到"别的生物在哪边"——射线撞到别人就停。
+    ///
+    /// 判据必须是**占格表**而不是材质：身体格的材质是 `Empty`，
+    /// 按材质判的话射线会"穿过"一条鱼继续往后看。
+    #[test]
+    fn a_body_senses_where_the_nearest_neighbour_is() {
+        let sense_with_neighbour_at = |y: i32| {
+            let mut w = pool();
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            let me = sim.spawn_injected(&mut w, swimmer((20, 40), 400)).unwrap();
+            sim.spawn_injected(&mut w, swimmer((20, y), 400)).unwrap();
+            let i = sim.organisms.iter().position(|o| o.id == me).unwrap();
+            sim.sense(&w, i)
+        };
+
+        let below = sense_with_neighbour_at(50);
+        assert!(
+            below[IN_ORGANISM_DIR_Y] > 0.0,
+            "别人在正下方，垂直分量应当为正：{}",
+            below[IN_ORGANISM_DIR_Y]
+        );
+        assert!(
+            below[IN_ORGANISM_DIR_X].abs() < 1e-6,
+            "正下方不该有水平分量"
+        );
+
+        let above = sense_with_neighbour_at(30);
+        assert!(
+            above[IN_ORGANISM_DIR_Y] < 0.0,
+            "别人在正上方，垂直分量应当为负：{}",
+            above[IN_ORGANISM_DIR_Y]
+        );
+    }
+
+    /// 有牙的靠过去，没牙的躲开——同一个输入，两种倾向给出相反的动作。
+    ///
+    /// 这条是"追 / 逃"的全部实现。它刻意做成**基因组里的权重**而不是引擎里的规则：
+    /// 引擎只提供"别人在哪边"，怎么反应是基因的事，突变能改。
+    #[test]
+    fn hunters_approach_and_prey_flee() {
+        let mut inputs = [0.0f32; INPUTS];
+        inputs[IN_ORGANISM_DIR_Y] = 0.5; // 别人在下方
+
+        let hunt = handcrafted_fish_genome(Tactic::Hunt).think(&inputs);
+        assert!(
+            hunt[OUT_DOWN] > hunt[OUT_UP],
+            "有牙的应当往下（追）：down {} vs up {}",
+            hunt[OUT_DOWN],
+            hunt[OUT_UP]
+        );
+
+        let flee = handcrafted_fish_genome(Tactic::Ignore).think(&inputs);
+        assert!(
+            flee[OUT_UP] > flee[OUT_DOWN],
+            "没牙的应当往上（逃）：up {} vs down {}",
+            flee[OUT_UP],
+            flee[OUT_DOWN]
+        );
     }
 
     // -----------------------------------------------------------------------

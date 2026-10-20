@@ -54,6 +54,16 @@ pub const MAX_ENERGY_PER_CELL: u32 = 350;
 /// 67 让三格鱼算出来是 201，对上旧的 `BIRTH_ENERGY = 200`。
 pub const BIRTH_ENERGY_PER_CELL: u32 = 67;
 
+/// 每次繁殖改几条**形态发生规则**。
+///
+/// 单独一个常数，因为规则表的变异不能用权重的变异率：规则表有几千个槽，
+/// 按概率逐槽掷会一次改掉上百条（见 `Grn::mutate`）。这里按"改几条"算。
+///
+/// 1 → 2 的理由：32000 tick 只有 39~54 代，每次只改 1 条规则，
+/// 一条谱系累计下来只有几十次改动——**远不足以"发明"一个更好的身体**。
+/// 实测形态发生只能收敛到手工体型里最好的那个，从没长出新东西。
+pub const GRN_EDITS_PER_BIRTH: usize = 2;
+
 /// 细胞类型（SPEC §3.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -184,7 +194,7 @@ impl Cell {
 /// 输入刻意做成"抽象感知"而不是逐格 one-hot：9 个邻格 × 5 类要 45 个输入，
 /// 权重表会膨胀到 640 个数字，手工设计一条鱼基本不可能。
 /// 这里只保留"前方有没有吃的/有没有挡路的/自己还剩多少力气"这类决策真正需要的信息。
-pub const INPUTS: usize = 15;
+pub const INPUTS: usize = 17;
 
 /// 隐藏层宽度。
 pub const HIDDEN: usize = 8;
@@ -256,6 +266,18 @@ pub const IN_LIGHT: usize = 12;
 pub const IN_FOOD_DIR_X: usize = 13;
 /// 输入下标：最近的含能量食物在垂直方向的相对位置（−1..+1，+1 是下方）。
 pub const IN_FOOD_DIR_Y: usize = 14;
+/// 输入下标：最近的**别的生物**在水平方向的相对位置（−1..+1）。
+///
+/// 和 `IN_ALIEN_AHEAD` 的区别就是"前方一格"和"二十格内哪边"。
+/// 只有前者的时候，"追"和"逃"都做不到——你只能撞上才知道有别人，
+/// 于是捕食全靠运气，猎物也从不躲。
+///
+/// 这一路让"追 / 逃"第一次成为可能，而**要不要追、要不要逃由基因组决定**：
+/// 手工基因组给的是"有牙的靠过去、没牙的躲开"（见
+/// `life_sim::handcrafted_fish_genome`），之后突变自己去调。
+pub const IN_ORGANISM_DIR_X: usize = 15;
+/// 输入下标：最近的别的生物在垂直方向的相对位置（−1..+1，+1 是下方）。
+pub const IN_ORGANISM_DIR_Y: usize = 16;
 
 /// 嗅觉射线的基础长度（格）：**没有眼**的身体能闻多远。
 ///
@@ -405,7 +427,7 @@ impl Genome {
         // 规则表有上千个槽，用 `rate` 逐个掷骰子的话，一个正常的 5% 就会
         // 一次改掉几十条规则——身体立刻变成随机团。所以这里按"改几条"算，
         // 而且一次只改 1 条（见 `Grn::mutate` 的注释）。
-        self.grn.mutate(rng, 1);
+        self.grn.mutate(rng, GRN_EDITS_PER_BIRTH);
         for w in &mut self.weights {
             if rng.next_f32() < rate {
                 // Box–Muller：两个均匀分布 → 一个正态分布。
