@@ -226,6 +226,11 @@ cargo run --release -p vivarium-game -- --width 128 --height 128 --fish 20
 打包完记得**试运行一次**：编译通过不等于 exe 能跑，wgpu 的适配器初始化
 只有在真的开一次窗口之后才知道成不成。
 
+> 中文提交信息在 `VERSION.txt` 里会乱码，除非调 git 之前把
+> `[Console]::OutputEncoding` 改成 UTF-8。PowerShell 解码外部程序 stdout 时用的是它，
+> 而它在中文 Windows 上默认是 GBK(936)——git 吐出的 UTF-8 字节被按 GBK 解，
+> 就成了"璁╃粏鑳炵湅寰楄"。不是 git 的问题，是宿主的问题。
+
 ### 想看一眼渲染结果
 
 不用开窗口，直接把离屏渲染导成 PNG：

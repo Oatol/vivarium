@@ -61,13 +61,26 @@ if ($IncludeSim) {
 }
 
 # --- 4. 记一笔"这是哪一版" -------------------------------------------------
-Push-Location $repo
+#
+# 中文提交信息会变成乱码，除非在调 git 之前把控制台的输出编码改成 UTF-8。
+# PowerShell 解码外部程序的 stdout 时用的是 [Console]::OutputEncoding，
+# 而它在中文 Windows 上默认是 GBK(936)，于是 git 吐出的 UTF-8 字节被按 GBK 解——
+# VERSION.txt 里就成了"璁╃粏鑳炵湅寰楄"。这不是 git 的问题，是宿主的问题。
+$prevOut = [Console]::OutputEncoding
 try {
-    $commit = (git rev-parse --short HEAD 2>$null)
-    $dirty = if (git status --porcelain 2>$null) { '（工作区有未提交改动）' } else { '' }
-    $subject = (git log -1 --pretty=%s 2>$null)
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+
+    Push-Location $repo
+    try {
+        $commit = (git rev-parse --short HEAD 2>$null)
+        $dirty = if (git status --porcelain 2>$null) { '（工作区有未提交改动）' } else { '' }
+        $subject = (git log -1 --pretty=%s 2>$null)
+    } finally {
+        Pop-Location
+    }
 } finally {
-    Pop-Location
+    [Console]::OutputEncoding = $prevOut
 }
 
 $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm'
