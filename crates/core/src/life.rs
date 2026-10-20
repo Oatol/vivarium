@@ -146,16 +146,30 @@ pub struct Cell {
     pub offset: (i16, i16),
     /// 这个细胞活了多少 tick。
     pub age: u32,
+    /// **出生时它是不是占着一格水。**
+    ///
+    /// 这是水量守恒的全部秘密。出生时身体会把它占住的那格水"借走"
+    /// （见 [`crate::life_sim::LifeSim::spawn`]），死的时候再还回来——
+    /// 但只有当初真的借了才该还。
+    ///
+    /// 一条鱼贴着水面出生，上半身泡在空气里，那几格它从没借过水；
+    /// 后来它沉下去死了，尸体泡在水里、按"水解"规则腐烂成水，
+    /// 于是凭空多出几格水。实测 32000 tick 多了一万八千格，
+    /// 而能量账一分不差、生物数还在涨——从任何别的指标上都看不出来。
+    ///
+    /// 债务必须在**出生那一刻**定死，不能到死的时候按"当时泡不泡在水里"倒推。
+    pub wet: bool,
 }
 
 impl Cell {
-    /// 新建一个细胞。
+    /// 新建一个细胞。`wet` 由 `spawn` 按出生位置填。
     #[inline]
     pub const fn new(kind: CellType, offset: (i16, i16)) -> Self {
         Self {
             kind,
             offset,
             age: 0,
+            wet: false,
         }
     }
 }
@@ -686,9 +700,13 @@ impl Organism {
 ///
 /// 集中在一处，是因为"死亡 → 残骸"是 SPEC §2.1 点名不能省的能量回流通道。
 /// 如果哪天想让装甲细胞留下石头、生产者留下可燃物，只改这里。
+///
+/// 返回 [`MaterialKind::Corpse`] 而不是 [`MaterialKind::Remains`]：
+/// 前者是"生命制造的"，会腐烂；后者是 worldgen 撒下的天然碎屑，永远稳定。
+/// 这个区分是材质层的事（见 `MaterialKind::Corpse` 的注释）。
 #[inline]
 pub const fn remains_of(_kind: CellType) -> MaterialKind {
-    MaterialKind::Remains
+    MaterialKind::Corpse
 }
 
 #[cfg(test)]

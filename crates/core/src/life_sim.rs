@@ -129,14 +129,48 @@ pub const CROWD_LIMIT: usize = 6;
 // 藻席：海底的可再生食物
 // ---------------------------------------------------------------------------
 
-/// 藻席尝试生长的间隔（tick）。
+/// 尸体腐烂 + 藻席生长的间隔（tick）。
 ///
-/// 和残骸分解一样走**周期性全局清扫**：海底是世界最先静下来的地方，
-/// 塞进分块访问里就永远不会执行（见 `REMAINS_DECAY_INTERVAL`）。
-pub const FOOD_GROWTH_INTERVAL: u64 = 25;
+/// 两者都走**周期性全局清扫**：海底是世界最先静下来的地方，塞进分块访问里
+/// 就永远不会执行（静止的块没人访问）。
+pub const ORGANICS_INTERVAL: u64 = 25;
+
+/// 每次清扫时，一格泡在水里的尸体被分解的概率（百分比）。⇒ 平均 125 tick 消失。
+pub const CORPSE_ROT_PERCENT: u32 = 20;
+
+/// 露在空气里的尸体被分解的概率（百分比）。
+///
+/// 慢七倍——"腐烂是水解过程"这个说法没错，水里的确烂得快得多。
+///
+/// 但**不能是 0**。最初写的就是 0（"干着的尸体不会烂"），而 0 是一个
+/// **吸收态**：鱼会游到水面之上的天空里死掉，那层尸体永远不消失，
+/// 实测 8000 tick 堆了 4.3 万格。
+pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 
 /// 每次清扫时，一格符合条件的海底水格长出藻的概率（百分比）。
 pub const FOOD_GROWTH_PERCENT: u32 = 8;
+
+/// 这一格是不是泡在水下。
+///
+/// 沿列向上找，**跳过其他固体**——尸体和碎屑会堆成堆，堆内部的格子四周全是
+/// 同类，但它们确实泡在水下，照样该烂。遇到水算在水下，遇到空气或固体就不算。
+///
+/// 从材质层搬过来的：腐烂规则现在住在生命层（它要记账），
+/// 这个判据跟着一起搬，免得两处各写一份、慢慢走样。
+fn underwater(world: &World, x: usize, y: usize) -> bool {
+    for ny in (0..y).rev() {
+        match world.get(x as isize, ny as isize) {
+            MaterialKind::Water => return true,
+            // 空气意味着这一格露在水面之上，不烂。
+            MaterialKind::Empty => return false,
+            _ => continue,
+        }
+    }
+    false
+}
+
+/// 尸体腐烂用的位置派生随机盐。必须和藻席生长、以及材质层的盐都不同。
+const SALT_CORPSE_ROT: u32 = 0xDEAD;
 
 /// 藻席生长用的位置派生随机盐。
 ///
@@ -263,6 +297,11 @@ pub struct LifeStats {
     pub eaten: u32,
     /// 本 tick 新长出的藻席格数。
     pub food_grown: u32,
+    /// 本 tick 腐烂掉的尸体格数。
+    ///
+    /// 和 `food_grown` 是一对：一个进、一个出。生态有没有在"堆尸体"，
+    /// 看这两个数就够了——它们长期失衡时，`Corpse` 的格数会一路涨。
+    pub corpses_rotted: u32,
     /// 当前种群的最大代数。
     pub max_generation: u32,
     /// 当前种群的平均代数。
@@ -329,7 +368,7 @@ impl LifeSim {
         let mut ledger = EnergyLedger::default();
         for idx in 0..world.cells().len() {
             let cell = world.cells()[idx];
-            if cell.kind != MaterialKind::Remains {
+            if !matches!(cell.kind, MaterialKind::Remains | MaterialKind::Corpse) {
                 continue;
             }
             let (x, y) = (idx % world.width(), idx / world.width());
@@ -429,28 +468,19 @@ impl LifeSim {
         }
         // 第二遍落地：把身体格腾空，然后占格。
         //
-        // ## 那一格水去哪了：被**借走**了，不是被挤走、也不是被销毁
+        // ## 那一格水去哪了：被**借走**了
         //
-        // 早先的写法是"把水挤到附近的空位"，挤不下就顶到这一列的水面之上
-        // （水面上升一格，阿基米德）。听着物理，但它有一个致命后果：
-        // **被顶上去的水成了下一条鱼出生的落脚点。**
-        //
-        // 一条鱼贴着水面生孩子，子代的水被顶到亲代头顶；那条子代再生一个，
-        // 新子代就站在刚才那格水上；水又被顶高一层……每代往上爬三四格。
-        // 实测 512² 跑 8000 tick：水面从 y=153 被顶到 y=107，
-        // 四十多条鱼骑在水面上，既不能动也不能繁殖，整个种群冻死在那儿。
-        //
-        // 现在的规则简单得多：**一格身体占住一格水，那格水记在身体头上。**
-        // 身体变成尸体时水还欠着（尸体占着同一格），尸体腐烂（
-        // `sweep_remains`）或者被吃掉（`eat_remains`）时还回来。
-        // 于是「水 + 活细胞 + 残骸」是个守恒量，水位不会因为出生而漂移，
-        // 也没有任何水被搬到高处去。
-        //
-        // 代价是出生瞬间水位会掉一点点（借走了），尸体腐烂之后回补。
-        // 这比"水位被永久顶高"好得多——后者是不可逆的。
-        for cell in &org.cells {
-            let (x, y) = org.cell_at(cell);
-            if world.get(x as isize, y as isize).is_fluid() {
+        // 身体占住的那格水记在细胞头上（`Cell::wet`），变成尸体、
+        // 尸体腐烂或被吃掉时还回来。**债务在出生这一刻定死**，
+        // 不能到死的时候按"当时泡不泡在水里"倒推——那样一条在空气里出生的鱼
+        // 沉下去死了，会还出一格它从没借过的水。实测 32000 tick 多了一万八千格。
+        // 落点先算好再动 cells：`cell_at` 要借 `org`，而下面要 `&mut org.cells`。
+        let spots: Vec<(i32, i32)> = org.cells.iter().map(|c| org.cell_at(c)).collect();
+        for (cell, &(x, y)) in org.cells.iter_mut().zip(&spots) {
+            let kind = world.get(x as isize, y as isize);
+            // 只有水才算借。气体、火被挤掉不算债务——它们本来就不是水。
+            cell.wet = kind == MaterialKind::Water;
+            if kind.is_fluid() {
                 world.set(x as isize, y as isize, MaterialKind::Empty);
             }
         }
@@ -524,7 +554,10 @@ impl LifeSim {
     pub fn audit(&self, world: &World) -> EnergyAudit {
         let mut remains = 0u64;
         for cell in world.cells() {
-            if cell.kind == MaterialKind::Remains {
+            if matches!(
+                cell.kind,
+                MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+            ) {
                 remains += cell.flags as u64;
             }
         }
@@ -549,8 +582,8 @@ impl LifeSim {
         // 1) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
         self.inject_sunlight(world);
 
-        // 1b) 藻席。第二条能量注入通道，见 `FOOD_GROWTH_INTERVAL`。
-        self.grow_algae(world);
+        // 1b) 尸体腐烂 + 藻席生长。第二条能量注入通道，见 `tick_organics`。
+        self.tick_organics(world);
 
         // 2) 行为。
         self.act(world);
@@ -628,25 +661,33 @@ impl LifeSim {
     fn bury(&mut self, world: &mut World, org: &Organism) {
         let n = org.cells.len().max(1) as u32;
         // 每格分不到 4 点能量的尸体视为"已经被自己烧光了"：flags 直接写 0。
-        //
-        // 这不只是省事——`flags == 0` 是材质层"这具尸体可以被分解"的唯一信号
-        // （见 `sim::tick_remains`）。不归零的话，一具还剩 3 点能量的饿死尸体
-        // 会永远泡在海底不烂，因为它带着能量、分解规则不敢碰它。
+        // （腐烂已经不看 `flags` 了——那套判据被 `Corpse` 材质取代。
+        // 这里仍然把零头归零，只是为了不留下"1 点能量的尸体"这种噪声。）
         let per_cell = org.energy / n;
         let per_cell = if per_cell < 4 {
             0
         } else {
             per_cell.min(u8::MAX as u32)
         };
+        let mut placed = 0u32;
         for cell in &org.cells {
             let (x, y) = org.cell_at(cell);
             let (x, y) = (x as isize, y as isize);
             world.vacate(x, y);
-            world.set(x, y, remains_of(cell.kind));
-            // `set` 会把 flags 清 0，所以能量必须写在它之后。
-            world.set_flags(x, y, per_cell as u8);
+            // **没借过水的细胞不留下尸体。**
+            //
+            // 出生时泡在空气里那几格从没占过水，死后也不该变成"会烂成水"的
+            // 尸体——否则凭空多出几格水（见 `Cell::wet` 的注释）。
+            if cell.wet {
+                world.set(x, y, remains_of(cell.kind));
+                // `set` 会把 flags 清 0，所以能量必须写在它之后。
+                world.set_flags(x, y, per_cell as u8);
+                placed += 1;
+            }
         }
-        self.ledger.dissipated += (org.energy - per_cell * n) as u64;
+        // 摊不尽的零头 + **没能落到任何一格上的那份**（干细胞的份额）都要记账。
+        // 少记这一项，守恒断言会报"少了 N 点"——实测 32000 tick 少了 22657 点。
+        self.ledger.dissipated += (org.energy - per_cell * placed) as u64;
     }
 
     /// 生产者按光照产能量。
@@ -707,75 +748,114 @@ impl LifeSim {
         self.ledger.injected += injected;
     }
 
-    /// 海底长藻：第二条能量注入通道。
+    /// 海底的日常维护：**尸体腐烂** + **藻席生长**。
     ///
-    /// ## 为什么需要它
+    /// 两件事合在一个扫描里，因为它们都是"全网格、低频、和格子位置无关"的工作，
+    /// 分开写就要扫两遍世界（262144 格 × 2 / 25 tick，实测能吃掉四成帧率）。
     ///
-    /// 光只从上往下射，生产者只能待在浅水——于是"待在哪儿"这个问题
-    /// 有一个平凡的最优解：**待在最浅的地方**。行为网络没有需要权衡的东西，
-    /// 选择压力只能筛出"别沉下去"，筛不出任何策略。
+    /// ## 尸体腐烂
     ///
-    /// 把食物放到海底，问题就变成真的了：**浅处晒得到太阳，深处才有吃的。**
-    /// 一条鱼必须决定什么时候下潜、下潜多深、什么时候浮上来续命。
+    /// 只有 [`MaterialKind::Corpse`]（生命制造的）会烂，
+    /// [`MaterialKind::Remains`]（worldgen 撒下的天然碎屑）永远稳定——
+    /// 否则"没有生物的世界也能完全静止"这条就不成立了。
     ///
-    /// ## 藻席是被"借"出去的水
+    /// 早先两者是同一种材质，靠 `flags == 0` 来区分"尸体"和"碎屑"。
+    /// 那个判据混淆了两件事，而且**带能量的尸体永远不烂**：
+    /// 实测残骸占比从 1.7% 涨到 3.3% 还在爬。
     ///
-    /// 一格水变成一格藻，水就欠在那儿；藻被吃掉（`eat_remains`）时变回水。
-    /// 和身体借水是同一本账，所以水位不会因为长藻而漂移。
+    /// 腐烂要把尸体身上剩下的能量记进 `dissipated`：那是热量，
+    /// 离开了生物可用池但仍在账上。这正是"腐烂规则必须住在生命层"的理由——
+    /// 材质层没有账本，它悄悄清掉一格带能量的尸体，守恒断言就会报"多了 N 点"。
     ///
-    /// ## 为什么不需要"总量上限"
+    /// ## 藻席生长
     ///
-    /// 第一版按"全世界含能量的残骸格数"封顶 1500 格，结果 512² 里
-    /// 天然碎屑本身就有 2791 格——上限一开始就满了，**一格藻都长不出来**。
-    /// 按总数封顶的判据从根上就是错的：它把"天然碎屑"和"新长出来的藻"
-    /// 混成了一件事。
+    /// 光只从上往下射，生产者只能待在浅水——于是"待在哪儿"有一个平凡的
+    /// 最优解：**待在最浅的地方**。把食物放到海底，问题才变成真的：
+    /// **浅处晒得到太阳，深处才有吃的。**
     ///
-    /// 现在的上限是**结构自限**：藻只长在"水 / 矿物"界面上，而一格水变成藻
-    /// 之后，它上面那格水的下方就是藻（不是矿物）——不再符合条件。
-    /// 所以**每一列最多一格藻**，总量天然被世界宽度卡住（512² 里约 280 格）。
-    /// 吃掉一格就变回水，界面上又空出一个位置，可以再长。
+    /// 藻是"借出去的水"：一格水变成一格藻，水就欠在那儿；
+    /// 被吃掉（`eat_remains`）时变回空位。和身体借水是同一本账。
     ///
-    /// 这不是"能长的藻被限制了"，而是"藻席本来就是贴着海底的一层薄膜"。
-    /// 一层薄膜既够一群鱼吃，又远不够喂饱整个海洋——这正是想要的稀缺度。
+    /// **上限是结构自限的，不是常数。** 第一版按"全世界含能量的残骸格数"
+    /// 封顶 1500 格，结果 512² 里天然碎屑本身就有 2791 格——上限一开始就满了，
+    /// 一格藻都长不出来。按总数封顶的判据从根上就是错的：它把"天然碎屑"
+    /// 和"新长出来的藻"混成了一件事。
     ///
-    /// ## 能量要记账
-    ///
-    /// 藻的能量是**新进入生物可用池的能量**（光 → 藻 → 鱼），
-    /// 所以必须记进 `injected`。忘了记，守恒断言会报"多了 N 点"；
-    /// 记成耗散，会报"少了 N 点"。
-    fn grow_algae(&mut self, world: &mut World) {
-        if !self.food_growth {
+    /// 现在藻只长在"水 / 矿物"界面，而一格水变成藻之后，它上面那格水的下方
+    /// 就是藻（不是矿物）——不再符合条件。所以**每列最多一格**，
+    /// 总量天然被世界宽度卡住（512² 里约 280 格）。吃掉一格就变回水，
+    /// 界面上又空出一个位置，可以再长。这不是"能长的藻被限制了"，
+    /// 而是"藻席本来就是贴着海底的一层薄膜"。
+    fn tick_organics(&mut self, world: &mut World) {
+        if world.tick() % ORGANICS_INTERVAL != 0 {
             return;
         }
-        if world.tick() % FOOD_GROWTH_INTERVAL != 0 {
-            return;
-        }
+        let tick = world.tick();
         let (w, h) = (world.width(), world.height());
         let mut grown = 0u64;
-        let tick = world.tick();
+        let mut rotted = 0u64;
+        let mut rotted_cells = 0u32;
+
         for y in 0..h {
             for x in 0..w {
                 let (xs, ys) = (x as isize, y as isize);
-                if world.get(xs, ys) != MaterialKind::Water || world.is_occupied(xs, ys) {
+                let kind = world.get(xs, ys);
+
+                // --- 尸体腐烂 ---
+                if kind == MaterialKind::Corpse {
+                    let wet = underwater(world, x, y);
+                    let percent = if wet {
+                        CORPSE_ROT_PERCENT
+                    } else {
+                        DRY_CORPSE_ROT_PERCENT
+                    };
+                    if !Rng::at_percent(x, y, tick, SALT_CORPSE_ROT, percent) {
+                        continue;
+                    }
+                    rotted += world.flags(xs, ys) as u64;
+                    rotted_cells += 1;
+                    // 泡在水里的尸体烂掉之后**变回水**——那一格水是身体出生时
+                    // 借走的，身体彻底消失了就该还回来。露在空气里的变成空位。
+                    world.set(
+                        xs,
+                        ys,
+                        if wet {
+                            MaterialKind::Water
+                        } else {
+                            MaterialKind::Empty
+                        },
+                    );
+                    continue;
+                }
+
+                // --- 藻席生长 ---
+                if !self.food_growth || kind != MaterialKind::Water || world.is_occupied(xs, ys) {
                     continue;
                 }
                 // 只长在**贴着矿物**的那一层水上——也就是海底与浅滩。
-                // 刻意不接受"下面也是残骸"：那样藻会一层层往上叠，
+                // 刻意不接受"下面也是残骸/尸体"：那样藻会一层层往上叠，
                 // 重新变成需要封顶的东西。
-                let below = world.get(xs, ys + 1);
-                if !matches!(below, MaterialKind::Stone | MaterialKind::Sand) {
+                if !matches!(
+                    world.get(xs, ys + 1),
+                    MaterialKind::Stone | MaterialKind::Sand
+                ) {
                     continue;
                 }
                 if !Rng::at_percent(x, y, tick, SALT_FOOD_GROWTH, FOOD_GROWTH_PERCENT) {
                     continue;
                 }
-                world.set(xs, ys, MaterialKind::Remains);
+                world.set(xs, ys, MaterialKind::Algae);
                 world.set_flags(xs, ys, FOOD_ENERGY as u8);
                 grown += 1;
             }
         }
+
+        // 腐烂的能量是热量：离开生物可用池，但仍在账上。
+        self.ledger.dissipated += rotted;
+        // 藻的能量是新进入生物可用池的（光 → 藻 → 鱼），记注入。
         self.ledger.injected += grown * FOOD_ENERGY as u64;
         self.stats.food_grown = grown as u32;
+        self.stats.corpses_rotted = rotted_cells;
     }
 
     /// 世界里有多少格含能量的食物（藻席 + 有能量的残骸）。
@@ -788,7 +868,11 @@ impl LifeSim {
         for y in 0..h {
             for x in 0..w {
                 let (xs, ys) = (x as isize, y as isize);
-                if world.get(xs, ys) == MaterialKind::Remains && world.flags(xs, ys) > 0 {
+                if matches!(
+                    world.get(xs, ys),
+                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                ) && world.flags(xs, ys) > 0
+                {
                     n += 1;
                 }
             }
@@ -860,8 +944,10 @@ impl LifeSim {
         let mut inp = [0.0f32; INPUTS];
 
         let (fx, fy) = org.front();
-        inp[IN_FOOD_AHEAD] =
-            (world.get(fx as isize, fy as isize) == MaterialKind::Remains) as u8 as f32;
+        inp[IN_FOOD_AHEAD] = matches!(
+            world.get(fx as isize, fy as isize),
+            MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+        ) as u8 as f32;
         inp[IN_BLOCKED_AHEAD] = (!Self::passable(world, body, fx, fy)) as u8 as f32;
 
         let owner = world.owner(fx as isize, fy as isize);
@@ -915,7 +1001,11 @@ impl LifeSim {
                 if !world.in_bounds(sxs, sys) {
                     break;
                 }
-                if world.get(sxs, sys) == MaterialKind::Remains && world.flags(sxs, sys) > 0 {
+                if matches!(
+                    world.get(sxs, sys),
+                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                ) && world.flags(sxs, sys) > 0
+                {
                     smell_x += dx as f32 / d as f32;
                     smell_y += dy as f32 / d as f32;
                     break;
@@ -963,7 +1053,10 @@ impl LifeSim {
             for (dx, dy) in [(1, 0), (-1, 0), (0, 1), (0, -1)] {
                 let nx = org.wrap_x(x + dx);
                 let ny = y + dy;
-                if world.get(nx as isize, ny as isize) == MaterialKind::Remains {
+                if matches!(
+                    world.get(nx as isize, ny as isize),
+                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                ) {
                     return Some((nx as isize, ny as isize));
                 }
             }
@@ -1285,7 +1378,11 @@ impl LifeSim {
     /// 超过上限的那部分凭空蒸发——账面上看不出来，直到某条鱼在满能量时
     /// 咬了一口尸体，守恒断言就差了 20 点。
     pub fn eat_remains(&mut self, world: &mut World, id: OrganismId, x: isize, y: isize) -> bool {
-        if world.get(x, y) != MaterialKind::Remains {
+        let kind = world.get(x, y);
+        if !matches!(
+            kind,
+            MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+        ) {
             return false;
         }
         let Some(idx) = self.organisms.iter().position(|o| o.id == id) else {
@@ -1300,13 +1397,24 @@ impl LifeSim {
             return false;
         }
         if taken == gain {
-            // 吃掉之后**变回水**，和尸体腐烂走同一条路。
+            // 吃掉之后**变回水**——但只对尸体。
             //
-            // 那一格原本是身体格——身体出生时借走了这一格的水（见 `spawn`）。
+            // 那一格原本是身体格，身体出生时借走了这一格的水（见 `spawn`）。
             // 尸体被吃掉等于身体彻底消失，水就该还回来。
-            // 写成 `Empty` 的话每吃掉一具尸体就凭空少一格水，
-            // 而"鱼吃尸体"是常态，于是水会随生态活跃度单调减少。
-            world.set(x, y, MaterialKind::Water);
+            //
+            // 天然碎屑与藻不同：它们不是从身体借来的，本来就是"别的东西"
+            // （worldgen 的沉积物、光长出来的藻），吃掉之后只留下空位。
+            // 早先两者都是 `Remains`，一律还水，于是水位随"吃了多少碎屑"漂移——
+            // 实测 16000 tick 漂了约二十格。
+            world.set(
+                x,
+                y,
+                if kind == MaterialKind::Corpse {
+                    MaterialKind::Water
+                } else {
+                    MaterialKind::Empty
+                },
+            );
         } else {
             // 留一部分在尸体上，下一顿再来。
             world.set_flags(x, y, (gain - taken) as u8);
@@ -1553,6 +1661,8 @@ mod tests {
         world.count_of(MaterialKind::Water)
             + world.occupied_count()
             + world.count_of(MaterialKind::Remains)
+            + world.count_of(MaterialKind::Corpse)
+            + world.count_of(MaterialKind::Algae)
     }
 
     #[test]
@@ -1601,8 +1711,8 @@ mod tests {
         for (x, y) in spots {
             assert_eq!(
                 w.get(x as isize, y as isize),
-                MaterialKind::Remains,
-                "({x}, {y}) 应该是残骸"
+                MaterialKind::Corpse,
+                "({x}, {y}) 应该是尸体"
             );
         }
     }
@@ -1633,9 +1743,9 @@ mod tests {
         }
         assert!(sim.organisms().is_empty(), "这条鱼应该已经饿死");
         assert_eq!(
-            w.count_of(MaterialKind::Remains),
+            w.count_of(MaterialKind::Corpse),
             3,
-            "尸体必须以残骸形式回到环境"
+            "尸体必须以尸体材质回到环境"
         );
         // 饿死的尸体是被自己烧光的，能量可能已经接近 0——
         // 这里只要求账平，不要求残骸里还有能量（见 `bury` 的注释）。
@@ -1649,8 +1759,10 @@ mod tests {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
+        // 必须放在**水里**（pool 的水面在 y=30）：身体格泡在空气里时
+        // 出生那一刻没借过水，死后也就不留尸体（见 `Cell::wet`）。
         let id = sim
-            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 300))
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 45), Genome::blank(), 300))
             .unwrap();
         sim.organisms_mut()[0].age = MAX_AGE - 1;
 
@@ -1660,7 +1772,7 @@ mod tests {
         let audit = sim.audit(&w);
         assert!(audit.remains > 0, "尸体应该带着能量：{audit:?}");
         assert!(audit.is_balanced(), "差额 {}", audit.leak());
-        assert_eq!(w.count_of(MaterialKind::Remains), 3);
+        assert_eq!(w.count_of(MaterialKind::Corpse), 3);
     }
 
     #[test]
@@ -1687,8 +1799,9 @@ mod tests {
 
         let before = sim.audit(&w);
         assert!(sim.eat_remains(&mut w, id, 22, 25));
-        // 尸体被吃掉 = 那格身体彻底消失，出生时借走的水还回来。
-        assert_eq!(w.get(22, 25), MaterialKind::Water);
+        // 这里吃的是**天然碎屑**（`Remains`），不是尸体：它不是从身体借来的，
+        // 吃掉之后只留下空位，不还水。尸体才还水。
+        assert_eq!(w.get(22, 25), MaterialKind::Empty);
         assert_eq!(sim.organism(id).unwrap().energy, 50 + REMAINS_ENERGY);
         let after = sim.audit(&w);
         assert_eq!(after.accounted(), before.accounted(), "进食只是搬运");
@@ -1698,6 +1811,7 @@ mod tests {
     fn sunlight_feeds_producers_only_in_shallow_water() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let shallow = sim
             .spawn_injected(&mut w, LifeSim::simple_fish((10, 2), Genome::blank(), 100))
             .unwrap();
@@ -1959,6 +2073,7 @@ mod tests {
     fn movement_costs_energy_and_the_upkeep() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((10, 40), 100)).unwrap();
 
         sim.step(&mut w);
@@ -2226,16 +2341,13 @@ mod tests {
         for y in 0..h {
             for x in 0..ww {
                 let (xs, ys) = (x as isize, y as isize);
-                if w.get(xs, ys) != MaterialKind::Remains || w.flags(xs, ys) == 0 {
+                if w.get(xs, ys) != MaterialKind::Algae || w.flags(xs, ys) == 0 {
                     continue;
                 }
                 found += 1;
                 assert!(
-                    matches!(
-                        w.get(xs, ys + 1),
-                        MaterialKind::Stone | MaterialKind::Sand | MaterialKind::Remains
-                    ),
-                    "({x}, {y}) 的藻悬在半空里，下面没有东西托着"
+                    matches!(w.get(xs, ys + 1), MaterialKind::Stone | MaterialKind::Sand),
+                    "({x}, {y}) 的藻长在悬空的地方，下面既不是沙也不是石"
                 );
             }
         }
@@ -2327,6 +2439,138 @@ mod tests {
         assert!(sim.audit(&w).is_balanced());
     }
 
+    /// 尸体泡在水里会烂掉，而且**剩下的能量要记进耗散**。
+    ///
+    /// 这条规则从材质层搬到了生命层，理由是记账：材质层没有账本，
+    /// 它悄悄清掉一格带能量的尸体，守恒断言就会报"多了 N 点"。
+    /// 而"只烂 `flags == 0` 的尸体"那条老规则正是为了绕开这个——
+    /// 代价是**带能量的尸体永远不烂**（实测残骸占比从 1.7% 爬到 3.3%）。
+    #[test]
+    fn corpses_rot_and_their_leftover_energy_is_dissipated() {
+        let mut w = pool();
+        w.set(30, 40, MaterialKind::Corpse);
+        w.set_flags(30, 40, 60);
+        let mut sim = LifeSim::new(&mut w);
+        let injected = sim.audit(&w).injected;
+        assert_eq!(injected, 60, "尸体的能量要算进初始注入");
+
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        assert_eq!(w.count_of(MaterialKind::Corpse), 0, "尸体应当烂光");
+        let audit = sim.audit(&w);
+        assert!(
+            audit.dissipated >= 60,
+            "烂掉的尸体带走了 60 点能量，必须记进耗散：{audit:?}"
+        );
+        assert!(audit.is_balanced(), "差额 {}", audit.leak());
+    }
+
+    /// 天然碎屑**不会**烂——否则"没有生物的世界也能完全静止"就不成立了。
+    #[test]
+    fn natural_debris_never_rots() {
+        let mut w = pool();
+        w.set(30, 40, MaterialKind::Remains);
+        w.set_flags(30, 40, 25);
+        let mut sim = LifeSim::new(&mut w);
+        // 关掉藻席：藻也是 `Remains`，会把"碎屑有几格"数乱。
+        sim.set_food_growth(false);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..4000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+        assert_eq!(
+            w.count_of(MaterialKind::Remains),
+            1,
+            "天然碎屑是沉积物，不该消失"
+        );
+    }
+
+    /// 露在空气里的尸体也会烂，但慢得多——**不能是"永远不烂"**。
+    ///
+    /// 概率给 0 就是个吸收态：鱼会游到水面之上的天空里死掉，
+    /// 那层尸体永远不消失，实测 8000 tick 堆了 4.3 万格。
+    #[test]
+    fn dry_corpses_rot_much_slower_than_submerged_ones() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone); // 海底
+        w.fill_rect(0, 30, 64, 30, MaterialKind::Water); // 水体
+        w.fill_rect(4, 20, 24, 1, MaterialKind::Stone); // 水面之上的石台
+        w.fill_rect(4, 19, 24, 1, MaterialKind::Corpse); // 24 格干尸体
+        w.fill_rect(36, 40, 24, 1, MaterialKind::Corpse); // 24 格湿尸体
+
+        let mut sim = LifeSim::new(&mut w);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..600 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let dry = (4..28)
+            .filter(|&x| w.get(x as isize, 19) == MaterialKind::Corpse)
+            .count();
+        let wet = w.count_of(MaterialKind::Corpse) - dry;
+        assert!(wet <= 6, "泡在水里的尸体应当烂掉大半，还剩 {wet} 格");
+        assert!(dry >= 12, "露在空气里的尸体应当还在，只剩 {dry} 格");
+    }
+
+    /// 堆到水面之上的尸体也必须能烂掉。
+    ///
+    /// 这是"吸收态"那条规则的回归测试：早期版本里堆顶露出空气就永远不烂，
+    /// 于是堆越高 → 越多格子露在空气里 → 越不烂 → 堆越高。
+    #[test]
+    fn a_corpse_pile_above_the_waterline_still_rots() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 20, 64, 40, MaterialKind::Water);
+        w.fill_rect(30, 0, 1, 60, MaterialKind::Corpse);
+        assert_eq!(w.count_of(MaterialKind::Corpse), 60);
+
+        let mut sim = LifeSim::new(&mut w);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..6000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let left = w.count_of(MaterialKind::Corpse);
+        assert!(left < 5, "堆到水面之上的尸体也必须分解，实际还剩 {left} 格");
+    }
+
+    /// **繁殖也不能让水位漂移。**
+    ///
+    /// 出生借水、尸体腐烂还水，一来一回必须严丝合缝。这条测试盯的就是那个"来回"：
+    /// 只要有一边算错（比如子代生在空气里、没借到水，死后却还了一格），
+    /// 水位就会随繁殖次数单调上涨——实测过：32000 tick 涨了 18000 格，
+    /// 而能量账一分不差、生物数还在涨，从任何别的指标上都看不出来。
+    #[test]
+    fn reproduction_does_not_drift_the_water_level() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let before = water_volume(&w);
+        // 一个只会生孩子、不会游的基因组：把繁殖路径压到最密。
+        let mut genome = Genome::blank();
+        genome.weights[Genome::b_o(OUT_REPRODUCE)] = 3.0;
+        genome.weights[Genome::b_o(OUT_EAT)] = 3.0;
+        let mut fish = LifeSim::simple_fish((20, 40), genome, 2000);
+        fish.energy = fish.reproduction_energy() * 4;
+        sim.spawn_injected(&mut w, fish).unwrap();
+
+        for tick in 0..600 {
+            sim.step(&mut w);
+            assert_eq!(
+                water_volume(&w),
+                before,
+                "第 {tick} tick 水位漂了：出生借的水和尸体还的水对不上"
+            );
+        }
+    }
+
     // -----------------------------------------------------------------------
     // 生态
     // -----------------------------------------------------------------------
@@ -2394,6 +2638,7 @@ mod tests {
         w.fill_rect(0, 8, 64, 52, MaterialKind::Water);
 
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let id = sim
             .spawn_injected(
                 &mut w,

@@ -36,10 +36,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex, RwLock};
 
-use crate::material::{
-    ignite_chance, react, MaterialKind, MoveRule, DRY_REMAINS_DECAY_PERCENT, FIRE_LIFETIME,
-    REMAINS_DECAY_INTERVAL, REMAINS_DECAY_PERCENT,
-};
+use crate::material::{ignite_chance, react, MaterialKind, MoveRule, FIRE_LIFETIME};
 use crate::rng::Rng;
 use crate::world::{MaterialCell, World, CHUNK_SIZE};
 
@@ -56,31 +53,10 @@ mod salt {
     pub const GAS_SIDE: u32 = 3;
     /// 点燃判定。四个邻格用 `IGNITE + 0..3` 区分。
     pub const IGNITE: u32 = 16;
-    /// 残骸被水分解。
-    pub const REMAINS_DECAY: u32 = 24;
 }
 
 /// 四邻域偏移。
 const NEIGHBORS_4: [(isize, isize); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
-
-/// 这一格是不是泡在水下。
-///
-/// 沿列向上找，**跳过其他残骸**——残骸会堆成堆，堆内部的格子四周全是残骸，
-/// 但它们确实泡在水下，照样该烂。遇到水算在水下，遇到空气或固体就不算。
-fn underwater(world: &World, x: usize, y: usize) -> bool {
-    for ny in (0..y).rev() {
-        match world.get(x as isize, ny as isize) {
-            MaterialKind::Water => return true,
-            // 空气意味着这一格露在水面之上，不烂。
-            MaterialKind::Empty => return false,
-            // 残骸、沙、石都跳过——埋进沉积层里的有机物照样会分解，
-            // 否则"残骸变沙 → 沙埋住更多残骸 → 残骸不再分解"会形成一个
-            // 越滚越大的正反馈，实测 16000 tick 后残骸涨到 1.3 万格。
-            _ => continue,
-        }
-    }
-    false
-}
 
 /// 液体找平 / 气体扩散时，一次最多横向探查多少格。
 ///
@@ -269,8 +245,6 @@ pub struct StepStats {
     pub reacted: usize,
     /// 本 tick 实际用了几个工人。`1` 表示走的是顺序路径。
     pub threads: usize,
-    /// 本次清扫分解掉的残骸格数（只在清扫那一 tick 非零）。
-    pub decayed: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -732,75 +706,7 @@ impl MaterialSim {
             }
         }
 
-        // --- 4：残骸分解 ---------------------------------------------------
-        //
-        // 全局清扫而不是逐块检查，理由见 `REMAINS_DECAY_INTERVAL`：
-        // 残骸沉到海底后世界就静止了，静止的块没人访问，逐块检查等于永不执行。
-        if tick % REMAINS_DECAY_INTERVAL == 0 {
-            self.sweep_remains(world, tick);
-        }
-
         world.advance_tick();
-    }
-
-    /// 清扫无能量的残骸：泡在水里的按概率溶解掉。
-    ///
-    /// **变成空而不是沙**。最初写的是"矿化成沙"（物理上更顺），
-    /// 但沙不会消失，于是残骸分解得越多、海底沉积得越厚——
-    /// 实测 20000 tick 之后沙从 2826 格涨到 32052 格，占掉世界 12%，
-    /// 再跑下去会把整片水域填平。物质守恒在这里是个陷阱：
-    /// 任何"转化"都会让某种材质单调累积，而这个世界没有出海口。
-    ///
-    /// 溶解成空可以解释为"有机物被水分解、被水流带走"。代价是材质总量不守恒，
-    /// 但残骸本来就是从生物身上来的，而生物的物质来自光——这条链上
-    /// 真正要守的是**能量**，不是格子数。
-    fn sweep_remains(&mut self, world: &mut World, tick: u64) {
-        let (w, h) = (world.width(), world.height());
-        for y in 0..h {
-            for x in 0..w {
-                let idx = y * w + x;
-                let cell = world.cells()[idx];
-                if cell.kind != MaterialKind::Remains || cell.flags != 0 {
-                    continue;
-                }
-                // "泡在水里"不能只看四邻：残骸会堆成堆，堆内部的格子四周全是残骸，
-                // 但它们是泡在水下的，照样会烂。所以沿这一列向上找，
-                // 跳过其他残骸，遇到水就算在水下，遇到空气或固体就不算。
-                //
-                // 露在空气里的也烂，只是慢 7 倍——见 `DRY_REMAINS_DECAY_PERCENT`。
-                // 给"干的"留一个 0 概率会形成一个只进不出的吸收态。
-                let submerged = underwater(world, x, y);
-                let percent = if submerged {
-                    REMAINS_DECAY_PERCENT
-                } else {
-                    DRY_REMAINS_DECAY_PERCENT
-                };
-                if !Rng::at_percent(x, y, tick, salt::REMAINS_DECAY, percent) {
-                    continue;
-                }
-                // 泡在水里的残骸烂掉之后**变回水**，不是变成空。
-                //
-                // 这一条是被一次真实的崩坏逼出来的：生物出生时会把身上的水
-                // 挤到这一列的上方（水面上升一格，见 `push_fluid_out`），
-                // 而尸体腐烂之后原来那几格变成**空**——水没有回来。
-                // 于是海底攒出一堆空气腔、水面被一路顶高：实测 512² 跑 8000 tick
-                // 水面从 y=153 涨到 y=107，四十多条鱼骑在水面上，
-                // 既不能动也不能繁殖，整个种群冻死在那里。
-                //
-                // 体积是守恒的：一格有机物烂掉，水就该回来占住这一格。
-                // 露在空气里的残骸烂掉则变成空——那里本来就没有水可还。
-                world.set(
-                    x as isize,
-                    y as isize,
-                    if submerged {
-                        MaterialKind::Water
-                    } else {
-                        MaterialKind::Empty
-                    },
-                );
-                self.stats.decayed += 1;
-            }
-        }
     }
 
     /// 顺序跑一个相位。
@@ -1580,122 +1486,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // 残骸分解
     // -----------------------------------------------------------------------
-
-    /// 没有能量的残骸泡在水里会烂掉，而且是**消失**不是变成沙。
-    ///
-    /// 这条规则存在的理由很具体：饿死的鱼留下的尸体没有能量（`flags == 0`），
-    /// 鱼不会去吃它，于是它只会在海底越堆越厚——实测 12000 tick 后
-    /// 残骸占掉世界 6%，再跑下去会把整个世界填满。
-    ///
-    /// 为什么是"消失"而不是"矿化成沙"：沙不会消失，转化只会把问题
-    /// 从"尸体堆积"换成"沉积物堆积"（实测 20000 tick 后沙涨到世界的 12%）。
-    #[test]
-    fn energy_free_remains_rots_away() {
-        let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        w.fill_rect(0, 20, 64, 40, MaterialKind::Water);
-        w.set(30, 40, MaterialKind::Remains); // flags 默认 0 = 没有能量
-        let before = w.census();
-
-        let mut sim = MaterialSim::new();
-        for _ in 0..2000 {
-            sim.step(&mut w);
-        }
-
-        // 残骸是粉末，会先沉到海底，所以只能按"数量"断言，不能按固定坐标。
-        assert_eq!(
-            w.count_of(MaterialKind::Remains),
-            0,
-            "无能量的残骸应当全部溶解掉"
-        );
-        assert_eq!(
-            w.count_of(MaterialKind::Sand),
-            before[MaterialKind::Sand.as_u8() as usize],
-            "溶解不该产生沙——那只是把堆积问题换个名字"
-        );
-    }
-
-    /// **带着能量的残骸不会烂**——它是食物，不该凭空消失。
-    ///
-    /// 这条与上一条合起来才说明 `flags == 0` 这个判据是对的：
-    /// 如果所有残骸都会烂，鱼就永远吃不到东西；如果都不会烂，世界会被尸体填满。
-    #[test]
-    fn remains_with_energy_do_not_rot() {
-        let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        w.fill_rect(0, 20, 64, 40, MaterialKind::Water);
-        w.set(30, 40, MaterialKind::Remains);
-        w.set_flags(30, 40, 25);
-
-        let mut sim = MaterialSim::new();
-        for _ in 0..2000 {
-            sim.step(&mut w);
-        }
-
-        assert_eq!(
-            w.count_of(MaterialKind::Remains),
-            1,
-            "有能量的残骸是食物，不能烂掉"
-        );
-        assert_eq!(w.count_of(MaterialKind::Sand), 0, "不该变成沙");
-    }
-
-    /// 露在空气里的残骸也会烂，但慢得多——**不能是"永远不烂"**。
-    ///
-    /// 最初这里断言的是"干着的残骸不会烂"，理由是"腐烂是水解过程"。
-    /// 加大体型之后这条断言变成了 bug：鱼会游到水面之上的天空里
-    /// （光照越往上越亮，而空气对生物是放行的），死在那儿留下一层
-    /// 永远不烂的尸体——实测 8000 tick 堆了 4.3 万格，空位从 7 万掉到 2.7 万。
-    ///
-    /// 概率给 0 就是一个**吸收态**。慢可以，零不行。
-    #[test]
-    fn dry_remains_rot_much_slower_than_submerged_ones() {
-        let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone); // 海底
-        w.fill_rect(0, 30, 64, 30, MaterialKind::Water); // 水体
-        w.fill_rect(4, 20, 24, 1, MaterialKind::Stone); // 水面之上的石台
-        w.fill_rect(4, 19, 24, 1, MaterialKind::Remains); // 24 格干残骸
-        w.fill_rect(36, 40, 24, 1, MaterialKind::Remains); // 24 格湿残骸
-
-        let mut sim = MaterialSim::new();
-        for _ in 0..600 {
-            sim.step(&mut w);
-        }
-
-        let dry = (4..28)
-            .filter(|&x| w.get(x as isize, 19) == MaterialKind::Remains)
-            .count();
-        let wet = w.count_of(MaterialKind::Remains) - dry;
-        assert!(wet <= 6, "泡在水里的残骸应当烂掉大半，还剩 {wet} 格");
-        assert!(dry >= 12, "露在空气里的残骸应当还在，只剩 {dry} 格");
-        assert_eq!(w.count_of(MaterialKind::Sand), 0, "溶解不该产生沙");
-    }
-
-    /// 一堆堆到水面之上的残骸也必须能烂掉。
-    ///
-    /// 这一条是加大体型之后才暴露出来的：三格鱼的尸体堆不到水面，
-    /// 而十四格鱼的尸体数量是它的四倍多，实测 16000 tick 后残骸占掉世界
-    /// **28.7%**，并且把空位吃光、开始挤死水。
-    ///
-    /// 猜想是"堆顶露出空气就永远不烂"，于是形成一个吸收态：
-    /// 堆越高 → 越多格子露在空气里 → 越不烂 → 堆越高。
-    #[test]
-    fn a_pile_that_reaches_above_the_waterline_still_rots() {
-        let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        w.fill_rect(0, 20, 64, 40, MaterialKind::Water);
-        // 一整列 40 格残骸，比水深（40）还高——堆完必然露出水面。
-        w.fill_rect(30, 0, 1, 60, MaterialKind::Remains);
-        assert_eq!(w.count_of(MaterialKind::Remains), 60);
-
-        let mut sim = MaterialSim::new();
-        for _ in 0..6000 {
-            sim.step(&mut w);
-        }
-
-        let left = w.count_of(MaterialKind::Remains);
-        assert!(left < 5, "堆到水面之上的残骸也必须分解，实际还剩 {left} 格");
-    }
 
     #[test]
     fn water_puts_out_fire() {

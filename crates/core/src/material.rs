@@ -30,13 +30,35 @@ pub enum MaterialKind {
     Fire = 4,
     /// 气——气体，向上 / 向两侧，可燃。
     Gas = 5,
-    /// 残骸——细胞死亡后的产物，可被分解 / 吃掉，缓慢沉降为沙。
+    /// 残骸——**天然**碎屑（worldgen 撒下的沉积物），可被吃掉，但不会自己消失。
     Remains = 6,
+    /// 尸体——**生命制造**的残骸：细胞死亡后留下的那几格。
+    ///
+    /// 和 [`MaterialKind::Remains`] 分开，是因为它们**腐烂规则不同**：
+    /// 尸体是有机物，泡在水里会烂；天然碎屑是沉积物，永远稳定——
+    /// 否则"没有生物的世界也能完全静止"这条就不成立了。
+    ///
+    /// 早先两者是同一种材质，靠 `flags == 0`（"这格没能量了"）来区分
+    /// "尸体"和"碎屑"。那个判据混淆了两件事，后果是**带能量的尸体永远不烂**：
+    /// 实测残骸占比从 1.7% 涨到 3.3%。而且它分不清"该不该还水"，
+    /// 吃掉天然碎屑时也把水还了回去，水位因此漂了二十格。
+    Corpse = 7,
+    /// 藻——长在海底与浅滩上的食物。
+    ///
+    /// 和尸体 / 碎屑分开的三条理由，每一条都对应一次真实的故障：
+    ///
+    /// 1. **它是静止的。** 藻如果是粉末，就会从"水 / 矿物"界面上掉下来，
+    ///    界面上空出一格又长出新的——"每列最多一格"的自限根本不成立，
+    ///    实测 32000 tick 藻堆到 4300 格，同时把水抽走了 4800 格。
+    /// 2. **它不烂。** 藻是资源，不是垃圾；烂掉就等于"长出来又自己消失"。
+    /// 3. **它需要被数出来。** 之前复用 `Remains`，想给藻封顶只能数
+    ///    "全世界含能量的残骸"，而那里面还有天然碎屑——上限一开始就满了。
+    Algae = 8,
 }
 
 impl MaterialKind {
     /// 材质种类总数。
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 9;
 
     /// 全部材质，便于遍历与建表。
     pub const ALL: [MaterialKind; Self::COUNT] = [
@@ -47,6 +69,8 @@ impl MaterialKind {
         Self::Fire,
         Self::Gas,
         Self::Remains,
+        Self::Corpse,
+        Self::Algae,
     ];
 
     /// 从 `u8` 还原；越界时回退到 [`MaterialKind::Empty`]。
@@ -59,6 +83,8 @@ impl MaterialKind {
             4 => Self::Fire,
             5 => Self::Gas,
             6 => Self::Remains,
+            7 => Self::Corpse,
+            8 => Self::Algae,
             _ => Self::Empty,
         }
     }
@@ -80,7 +106,10 @@ impl MaterialKind {
             Self::Fire => 2,
             Self::Water => 4,
             Self::Sand => 6,
-            Self::Remains => 7,
+            // 尸体和天然碎屑一样沉，互相顶不开——它们都是"已经落定的东西"。
+            Self::Remains | Self::Corpse => 7,
+            // 藻不动，密度只用于"谁能挤开谁"，而它谁也挤不开。
+            Self::Algae => 5,
             Self::Stone => 8,
         }
     }
@@ -90,7 +119,10 @@ impl MaterialKind {
     /// 注意 [`MaterialKind::Sand`] 也是固体——它靠重力堆积，不靠流动。
     #[inline]
     pub const fn is_solid(self) -> bool {
-        matches!(self, Self::Stone | Self::Sand | Self::Remains)
+        matches!(
+            self,
+            Self::Stone | Self::Sand | Self::Remains | Self::Corpse | Self::Algae
+        )
     }
 
     /// 是否为流体（会移动的材质）。
@@ -115,8 +147,8 @@ impl MaterialKind {
         match self {
             // 气体易燃：一旦点着就顺着气团迅速蔓延。
             Self::Gas => 90,
-            // 残骸是有机物，烧得起来但没那么猛。
-            Self::Remains => 40,
+            // 残骸、尸体、藻都是有机物，烧得起来但没那么猛。
+            Self::Remains | Self::Corpse | Self::Algae => 40,
             _ => 0,
         }
     }
@@ -145,8 +177,10 @@ impl MaterialKind {
     pub const fn move_rule(self) -> MoveRule {
         match self {
             Self::Stone | Self::Empty => MoveRule::Static,
-            // 沙与残骸都是粉末：往下掉，按休止角堆积。
-            Self::Sand | Self::Remains => MoveRule::Falls,
+            // 沙、残骸、尸体都是粉末：往下掉，按休止角堆积。
+            Self::Sand | Self::Remains | Self::Corpse => MoveRule::Falls,
+            // 藻长在哪儿就在哪儿——**它必须是静止的**，否则自限不成立。
+            Self::Algae => MoveRule::Static,
             Self::Water => MoveRule::Flows,
             // 火和气体一样向上走；火的额外行为（寿命、点燃）在模拟层。
             Self::Fire | Self::Gas => MoveRule::Rises,
@@ -199,6 +233,9 @@ impl MaterialKind {
             Self::Fire => '*',
             Self::Gas => ':',
             Self::Remains => '%',
+            // 尸体用 `&`：一眼能和天然碎屑区分开，"哪儿死过人"看得出来。
+            Self::Corpse => '&',
+            Self::Algae => '"',
         }
     }
 
@@ -213,6 +250,8 @@ impl MaterialKind {
             Self::Fire => "fire",
             Self::Gas => "gas",
             Self::Remains => "remains",
+            Self::Corpse => "corpse",
+            Self::Algae => "algae",
         }
     }
 }
@@ -336,36 +375,6 @@ impl Reaction {
 /// 它们需要新增材质种类，而第 2.1 节自己写着"材质种类必须少"。
 /// 先让七种材质把生态跑起来，等真的需要相变时再加——那时候加两种材质
 /// 也只改这张表，不改循环。
-/// 残骸清扫的间隔（tick）。
-///
-/// 分解**不能**塞进分块访问里：残骸沉到海底之后世界就静止了，静止的块没人访问，
-/// 塞在 `visit` 里的分解永远不会发生（实测 2000 tick 一格都没烂）。
-/// 所以改成周期性的全局清扫——它不依赖任何块保持活跃。
-pub const REMAINS_DECAY_INTERVAL: u64 = 50;
-
-/// 每次清扫时，一格无能量残骸被分解的概率（百分比）。
-///
-/// 只有 `flags == 0` 的残骸会分解——也就是**饿死**留下的那些。
-/// 带着能量的残骸是食物，不该凭空消失；天然碎屑的 `flags` 非零，
-/// 所以它们永远稳定。这一条区分是"世界能不能静下来"的关键：
-/// worldgen 撒下的碎屑如果也会消失，没有生物的世界就永远在动。
-///
-/// 20% / 50 tick ⇒ 平均 250 tick 消失。
-pub const REMAINS_DECAY_PERCENT: u32 = 20;
-
-/// 露在空气里的无能量残骸，每次清扫被分解的概率（百分比）。
-///
-/// 比泡在水里慢 7 倍——"腐烂是水解过程"这个说法没错，水里的确烂得快得多。
-///
-/// 但**不能是 0**。最初写的就是 0（"干着的残骸不会烂"），而 0 是一个
-/// **吸收态**：加大体型之后鱼会游到水面之上的天空里（光照越往上越亮，
-/// 而空气对生物是放行的），死在那儿留下一层永远不烂的尸体，
-/// 实测 8000 tick 堆了 4.3 万格，空位从 7 万掉到 2.7 万。
-///
-/// 教训和 §3.7 里"残骸不能矿化成沙"是同一条：
-/// **封闭世界里任何"只进不出"的状态都会单调累积。** 慢可以，零不行。
-pub const DRY_REMAINS_DECAY_PERCENT: u32 = 3;
-
 pub static REACTIONS: &[Reaction] = &[
     // 火 × 气：气体被点燃，火势顺气团扩散。
     Reaction::new(
@@ -456,7 +465,10 @@ mod tests {
             let rule = k.move_rule();
             let expected = match k {
                 MaterialKind::Empty | MaterialKind::Stone => MoveRule::Static,
-                MaterialKind::Sand | MaterialKind::Remains => MoveRule::Falls,
+                MaterialKind::Sand | MaterialKind::Remains | MaterialKind::Corpse => {
+                    MoveRule::Falls
+                }
+                MaterialKind::Algae => MoveRule::Static,
                 MaterialKind::Water => MoveRule::Flows,
                 MaterialKind::Fire | MaterialKind::Gas => MoveRule::Rises,
             };

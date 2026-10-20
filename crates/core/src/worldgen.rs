@@ -520,9 +520,17 @@ mod tests {
     #[test]
     fn demo_world_uses_every_material() {
         // 预览图要能一眼看出调色板有没有配错，所以每种材质都得出现。
+        //
+        // 例外是**生命制造的**材质：尸体只能由细胞死亡产生，worldgen 永远
+        // 不该产出它。用排除列表而不是"只查这几种"——将来新增地貌材质时，
+        // 这条测试仍然会抓到"忘了铺进世界"。
+        let life_made = [MaterialKind::Corpse, MaterialKind::Algae];
         let (world, _) = build(512, 512, SEED);
         let census = world.census();
         for kind in MaterialKind::ALL {
+            if life_made.contains(&kind) {
+                continue;
+            }
             assert!(
                 census[kind.as_u8() as usize] > 0,
                 "{} 在生成的世界里没出现",

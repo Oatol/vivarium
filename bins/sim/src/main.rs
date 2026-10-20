@@ -161,6 +161,8 @@ fn material_label(kind: MaterialKind) -> &'static str {
         MaterialKind::Fire => "火",
         MaterialKind::Gas => "气",
         MaterialKind::Remains => "骸",
+        MaterialKind::Corpse => "尸",
+        MaterialKind::Algae => "藻",
     }
 }
 
@@ -203,9 +205,9 @@ struct RunStats {
     visited_sum: u64,
     moved_sum: u64,
     reacted_sum: u64,
-    /// 累计被分解掉的残骸格数。
+    /// 累计腐烂掉的尸体格数。
     ///
-    /// 这个数字必须能看见：残骸是唯一一种"生物制造、材质层消化"的材质，
+    /// 这个数字必须能看见：尸体是唯一一种"生物制造、生物层消化"的材质，
     /// 消化速度跟不上制造速度时世界会被尸体填满，而那种崩坏从
     /// "生物数"和"能量账"上完全看不出来——两者都会是健康的。
     decayed_sum: u64,
@@ -214,16 +216,17 @@ struct RunStats {
 }
 
 impl RunStats {
-    fn record(&mut self, sim: &MaterialSim) {
+    fn record(&mut self, sim: &MaterialSim, life: &LifeSim) {
         let s = sim.stats();
         self.active_chunk_sum += s.active_chunks as u64;
         self.visited_sum += s.visited as u64;
         self.moved_sum += s.moved as u64;
         self.reacted_sum += s.reacted as u64;
-        self.decayed_sum += s.decayed as u64;
+
         // 峰值而不是末值：跑到最后世界已经快静了，只剩一两块在动，
         // 那时的工人数反映不了这次运行实际用到的并行度。
         self.workers_max = self.workers_max.max(sim.workers());
+        self.decayed_sum += life.stats().corpses_rotted as u64;
         self.ticks += 1;
     }
 }
@@ -352,7 +355,7 @@ fn main() -> ExitCode {
     for i in 0..args.ticks {
         life.step(&mut world);
         sim.step(&mut world);
-        stats.record(&sim);
+        stats.record(&sim, &life);
 
         if args.report_every > 0 && (i + 1) % args.report_every == 0 {
             let s = sim.stats();
@@ -390,7 +393,7 @@ fn main() -> ExitCode {
             stats.workers_max
         );
         println!(
-            "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次 · 分解残骸 {} 格",
+            "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次 · 腐烂尸体 {} 格",
             stats.visited_sum, stats.moved_sum, stats.reacted_sum, stats.decayed_sum
         );
     }
@@ -420,7 +423,7 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 藻席 {} 格",
+        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 食物 {} 格",
         l.organisms,
         l.cells,
         l.energy,
