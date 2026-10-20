@@ -278,6 +278,42 @@ mod tests {
         }
     }
 
+    /// 形状必须**换得到东西**：移动细胞买速度，眼买嗅觉半径。
+    ///
+    /// 这两条是"形态发生能进化"的全部前提。在那之前，一个 6 移动细胞的蠕虫
+    /// 和一个 3 移动细胞的银鱼跑得一样快，眼则纯粹是白付维持成本的装饰——
+    /// 于是"多长几格移动细胞"永远是个坏买卖，突变没有方向可走，
+    /// 形态发生只能收敛到"已知最好的那个"，长不出新的。
+    #[test]
+    fn movers_buy_speed_and_eyes_buy_reach() {
+        use crate::life::{Genome, Organism};
+        let build = |p: &BodyPlan| Organism::new(0, (0, 0), p.cells(), Genome::blank());
+
+        for plan in PLANS {
+            let org = build(plan);
+            let movers = plan.count(CellType::Mover) as i32;
+            let eyes = plan.count(CellType::Eye) as i32;
+            assert_eq!(
+                org.speed(),
+                (1 + movers / 4).min(3),
+                "「{}」的速度不对",
+                plan.name
+            );
+            assert_eq!(
+                org.smell_radius(),
+                20 + eyes * 4,
+                "「{}」的嗅觉半径不对",
+                plan.name
+            );
+        }
+
+        // 至少得有一个体型真的靠形状换到了东西，否则这两条映射等于没接。
+        assert!(
+            PLANS.iter().any(|p| build(p).speed() > 1),
+            "没有任何体型能从移动细胞换到速度"
+        );
+    }
+
     #[test]
     fn plans_fit_inside_the_body_limit() {
         for plan in PLANS {

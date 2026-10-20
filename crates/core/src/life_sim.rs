@@ -31,9 +31,9 @@
 use crate::body::{BodyPlan, PLANS};
 use crate::grn::Grn;
 use crate::life::{
-    remains_of, Cell, CellType, Genome, Organism, OrganismId, FOOD_SMELL_RADIUS, INPUTS, IN_AGE,
-    IN_ALIEN_AHEAD, IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY,
-    IN_FACING_X, IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
+    remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
+    IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
+    IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
     IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP,
     REMAINS_ENERGY,
 };
@@ -1061,7 +1061,14 @@ impl LifeSim {
         }
 
         if let Some((dx, dy)) = pick_direction(&out) {
-            self.try_move(world, i, dx, dy);
+            // 移动细胞多就跑得远（见 `Organism::speed`）。每一格都独立验通行性，
+            // 所以不会穿墙——走不动就停在撞上的前一格。
+            let speed = self.organisms[i].speed();
+            for _ in 0..speed {
+                if !self.try_move(world, i, dx, dy) {
+                    break;
+                }
+            }
         }
 
         if out[OUT_REPRODUCE] > 0.0 {
@@ -1133,8 +1140,9 @@ impl LifeSim {
         // 射线是 48 格。而且射线天然表达遮挡——一条鱼闻到隔壁岩架后面的藻
         // 是没有道理的，它得绕过去。
         let (mut smell_x, mut smell_y) = (0.0f32, 0.0f32);
+        let smell_radius = org.smell_radius();
         for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
-            for d in 1..=FOOD_SMELL_RADIUS {
+            for d in 1..=smell_radius {
                 let sx = org.wrap_x(org.anchor.0 + dx * d);
                 let sy = org.anchor.1 + dy * d;
                 let (sxs, sys) = (sx as isize, sy as isize);
@@ -1212,7 +1220,12 @@ impl LifeSim {
     fn try_move(&mut self, world: &mut World, i: usize, dx: i32, dy: i32) -> bool {
         let org = &self.organisms[i];
         let body = org.cells.len();
-        let cost = MOVE_COST * org.mass().max(1);
+        // 成本按**速度摊**：走 `speed` 格的总成本仍是 `质量`。
+        //
+        // 不这么摊的话，多走一格就多付一份质量，于是"移动细胞多 = 跑得快但更烧钱"，
+        // 而虫子的净收益只有 +13.8/tick——它会立刻饿死。多长移动细胞应该买的是
+        // "同样的钱跑得更远"，代价已经由维持成本和重量付过了。
+        let cost = (MOVE_COST * org.mass().max(1)).div_ceil(org.speed().max(1) as u32);
         if org.energy < cost {
             return false;
         }
@@ -2749,6 +2762,99 @@ mod tests {
                 "第 {tick} tick 水位漂了：出生借的水和尸体还的水对不上"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 形状 → 能力
+    // -----------------------------------------------------------------------
+
+    /// 一格移动细胞的对照体型。
+    const ONE_MOVER: crate::body::BodyPlan = crate::body::BodyPlan {
+        name: "单动",
+        cells: &[
+            (CellType::Mover, 0, 0),
+            (CellType::Mouth, 1, 0),
+            (CellType::Producer, 0, -1),
+        ],
+    };
+
+    /// 同上，但多一只眼：嗅觉半径 20 + 4 = 24。
+    const ONE_MOVER_EYE: crate::body::BodyPlan = crate::body::BodyPlan {
+        name: "单动带眼",
+        cells: &[
+            (CellType::Mover, 0, 0),
+            (CellType::Mouth, 1, 0),
+            (CellType::Producer, 0, -1),
+            (CellType::Eye, 0, 1),
+        ],
+    };
+
+    /// 四格移动细胞：按 `MOVERS_PER_EXTRA_STEP = 4`，它每 tick 该走 2 格。
+    const FOUR_MOVERS: crate::body::BodyPlan = crate::body::BodyPlan {
+        name: "四动",
+        cells: &[
+            (CellType::Mover, 0, 0),
+            (CellType::Mover, -1, 0),
+            (CellType::Mover, -2, 0),
+            (CellType::Mover, -3, 0),
+            (CellType::Mouth, 1, 0),
+            (CellType::Producer, 0, -1),
+        ],
+    };
+
+    /// 移动细胞多就跑得远——**一个 tick 走两格**，不是"看起来快"。
+    #[test]
+    fn more_movers_means_more_cells_per_tick() {
+        let mut moved = Vec::new();
+        for plan in [&ONE_MOVER, &FOUR_MOVERS] {
+            let mut w = pool();
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            let id = sim
+                .spawn_injected(
+                    &mut w,
+                    LifeSim::from_plan(plan, (10, 40), forward_genome(), 500),
+                )
+                .unwrap();
+            sim.step(&mut w);
+            moved.push(sim.organism(id).unwrap().anchor.0 - 10);
+        }
+        assert_eq!(moved[0], 1, "一格移动细胞只该走一格");
+        assert_eq!(moved[1], 2, "四格移动细胞应当走两格，实际 {}", moved[1]);
+    }
+
+    /// 眼多就闻得远：食物在 22 格外，零只眼（半径 20）闻不到，一只眼（24）闻得到。
+    #[test]
+    fn more_eyes_means_a_longer_smell_ray() {
+        let smell = |plan: &crate::body::BodyPlan, food: bool| {
+            let mut w = pool();
+            if food {
+                // 正下方 22 格：基础半径 20 够不着，加一只眼刚好够。
+                w.set(20, 52, MaterialKind::Algae);
+                w.set_flags(20, 52, FOOD_ENERGY as u8);
+            }
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            let id = sim
+                .spawn_injected(
+                    &mut w,
+                    LifeSim::from_plan(plan, (20, 30), Genome::blank(), 500),
+                )
+                .unwrap();
+            let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+            sim.sense(&w, i)[IN_FOOD_DIR_Y]
+        };
+
+        assert_eq!(smell(&ONE_MOVER, false), 0.0, "没有食物时不该闻到东西");
+        assert_eq!(
+            smell(&ONE_MOVER, true),
+            0.0,
+            "零只眼、22 格外的食物——半径 20 不该闻到"
+        );
+        assert!(
+            smell(&ONE_MOVER_EYE, true) > 0.0,
+            "加一只眼（半径 24）就该闻到 22 格外的食物"
+        );
     }
 
     // -----------------------------------------------------------------------
