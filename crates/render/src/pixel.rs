@@ -1891,7 +1891,7 @@ mod tests {
         }
 
         let mut life = LifeSim::new(&mut world);
-        stock_surface(&mut world, &mut life, 14, 300);
+        stock_surface(&mut world, &mut life, 14, 300, false);
         for _ in 0..200 {
             life.step(&mut world);
             sim.step(&mut world);
@@ -2081,7 +2081,7 @@ mod tests {
         // 细胞格的材质字段永远是 `Empty`，如果脏块检测只看材质，
         // 这条鱼在水里游的时候渲染器会认为什么都没变，画面上一条鱼也没有。
         let mut life = LifeSim::new(&mut world);
-        let ids = stock_surface(&mut world, &mut life, 80, 300);
+        let ids = stock_surface(&mut world, &mut life, 80, 300, false);
         assert!(!ids.is_empty(), "水面附近应当放得下鱼");
 
         for _ in 0..300 {

@@ -29,6 +29,7 @@
 //! 但这条必须写在这里，免得以后有人拿"守恒测试没过"当谜题查一整天。
 
 use crate::body::{BodyPlan, PLANS};
+use crate::grn::Grn;
 use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, FOOD_SMELL_RADIUS, INPUTS, IN_AGE,
     IN_ALIEN_AHEAD, IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY,
@@ -321,6 +322,15 @@ pub struct LifeStats {
     pub eaten: u32,
     /// 本 tick 发生的捕食次数（一枚杀手细胞咬到一口算一次）。
     pub bitten: u32,
+    /// 最小的身体有多少格。
+    ///
+    /// 和 `max_cells` 一起看：形态发生模式下这两个数会**分开**——
+    /// 一开始所有身体都是 9~14 格，跑上几万 tick 之后如果 min 掉到 4、max 涨到 18，
+    /// 就说明突变真的改到了形状。只看平均值是看不出来的（平均值不动，
+    /// 可能只是个体大小在两端互换）。
+    pub min_cells: usize,
+    /// 最大的身体有多少格。
+    pub max_cells: usize,
     /// 当前活着的杀手细胞数。
     ///
     /// 这个数归零就说明**捕食者灭绝了**——而"生物数""细胞数""能量账"
@@ -656,6 +666,18 @@ impl LifeSim {
         // 5) 统计。
         self.stats.organisms = self.organisms.len();
         self.stats.cells = self.organisms.iter().map(|o| o.cell_count()).sum();
+        self.stats.min_cells = self
+            .organisms
+            .iter()
+            .map(|o| o.cell_count())
+            .min()
+            .unwrap_or(0);
+        self.stats.max_cells = self
+            .organisms
+            .iter()
+            .map(|o| o.cell_count())
+            .max()
+            .unwrap_or(0);
         self.stats.stranded = self
             .organisms
             .iter()
@@ -1559,6 +1581,18 @@ impl LifeSim {
         org
     }
 
+    /// 让基因组**自己长**出身体来（M3 · 3b）。
+    ///
+    /// 这是 `from_plan` 的对应物：那边身体是给定的，这边身体是发育出来的。
+    /// 差别看起来只在"多调一次 `develop()`"，但意义完全不同——
+    /// 子代继承的是**规则**，不是形状，所以突变能改到身体。
+    pub fn from_genome(genome: Genome, anchor: (i32, i32), energy: u32) -> Organism {
+        let cells = genome.grn.develop();
+        let mut org = Organism::new(0, anchor, cells, genome);
+        org.energy = energy;
+        org
+    }
+
     /// 给一个体型配一份"够活到能繁殖"的启动能量。
     ///
     /// 不能所有体型都给 300：三格鱼 300 点是 75% 的繁殖门槛，
@@ -1713,6 +1747,7 @@ pub fn stock_surface(
     sim: &mut LifeSim,
     count: usize,
     energy: u32,
+    morph: bool,
 ) -> Vec<OrganismId> {
     let mut ids = Vec::new();
     if count == 0 || world.width() == 0 || PLANS.is_empty() {
@@ -1724,20 +1759,6 @@ pub fn stock_surface(
 
     for k in 0..count {
         let plan = &PLANS[k % PLANS.len()];
-        // 身体在 x 方向的左右伸出量，用来把锚点夹在界内——
-        // 否则贴边的个体整个投放会失败，水面看起来"有一段没鱼"。
-        let reach_left = plan.cells.iter().map(|c| -c.1).max().unwrap_or(0) as i32;
-        let reach_right = plan.cells.iter().map(|c| c.1).max().unwrap_or(0) as i32;
-        let x = ((k * step + step / 2) as i32).clamp(reach_left, width as i32 - 1 - reach_right);
-
-        let mut surface = None;
-        for y in 0..world.height() as i32 {
-            if world.get(x as isize, y as isize) == MaterialKind::Water {
-                surface = Some(y);
-                break;
-            }
-        }
-        let Some(y) = surface else { continue };
 
         // 每个个体都轻微不同：给自然选择一点原材料。
         //
@@ -1752,11 +1773,44 @@ pub fn stock_surface(
             0.12,
         );
 
+        // 形态发生模式：基因组里塞一份**从手工体型反推出来的生长程序**，
+        // 身体由它长出来。这一步只是热启动——之后子代继承的是规则，
+        // 突变改到的就是形状本身了。
+        if morph {
+            genome.grn = Grn::from_plan(plan)
+                .or_else(|| Grn::from_plan(&PLANS[0]))
+                .unwrap_or_default();
+        }
+        let cells = if morph {
+            genome.grn.develop()
+        } else {
+            plan.cells()
+        };
+
+        // 身体在 x 方向的左右伸出量，用来把锚点夹在界内——
+        // 否则贴边的个体整个投放会失败，水面看起来"有一段没鱼"。
+        let reach_left = cells.iter().map(|c| -c.offset.0).max().unwrap_or(0) as i32;
+        let reach_right = cells.iter().map(|c| c.offset.0).max().unwrap_or(0) as i32;
+        let x = ((k * step + step / 2) as i32).clamp(reach_left, width as i32 - 1 - reach_right);
+
+        let mut surface = None;
+        for y in 0..world.height() as i32 {
+            if world.get(x as isize, y as isize) == MaterialKind::Water {
+                surface = Some(y);
+                break;
+            }
+        }
+        let Some(y) = surface else { continue };
+
         // 让最上面那一格贴着水面：生产者要光。
-        let top = plan.cells.iter().map(|c| c.2).min().unwrap_or(0) as i32;
+        let top = cells.iter().map(|c| c.offset.1).min().unwrap_or(0) as i32;
         let anchor = (x, y - top);
-        let energy = energy.max(LifeSim::starter_energy(plan));
-        let org = LifeSim::from_plan(plan, anchor, genome, energy);
+        // 启动能量按**实际长出来的格数**算，不是按体型表的格数——
+        // 形态发生模式下这两者可能不一样，而"够不够活到能繁殖"只看前者。
+        let n = cells.len().max(1) as u32;
+        let energy = energy.max(crate::life::BIRTH_ENERGY_PER_CELL * n * 6 / 5);
+        let mut org = Organism::new(0, anchor, cells, genome);
+        org.energy = energy;
         if let Ok(id) = sim.spawn_injected(world, org) {
             ids.push(id);
         }

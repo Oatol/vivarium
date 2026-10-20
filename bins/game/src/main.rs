@@ -65,6 +65,7 @@ struct Options {
     ticks: u64,
     /// 启动时在水面附近投放多少条鱼。0 表示不放。
     fish: usize,
+    morph: bool,
 }
 
 impl Default for Options {
@@ -76,6 +77,7 @@ impl Default for Options {
             seed: DEFAULT_SEED,
             ticks: 60,
             fish: 0,
+            morph: false,
         }
     }
 }
@@ -94,6 +96,7 @@ fn print_help() {
   --seed <N>         随机种子（默认 {DEFAULT_SEED}）
   --ticks <N>        仅 --ascii：先跑多少 tick 再打印（默认 60）
   --fish <N>         启动时在水面附近投放 N 条鱼（默认 0，按 L 也可以随时放）
+  --morph            身体由基因组**长出来**（形态发生），而不是用手工体型表
   -h, --help         显示这份帮助"
     );
 }
@@ -110,6 +113,7 @@ fn parse_args() -> Result<Options, String> {
             "--seed" => opts.seed = take_number(&mut args, "--seed")?,
             "--ticks" => opts.ticks = take_number(&mut args, "--ticks")?,
             "--fish" => opts.fish = take_number(&mut args, "--fish")? as usize,
+            "--morph" => opts.morph = true,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -274,6 +278,8 @@ struct Game {
     layout: WorldLayout,
     rng: Rng,
     seed: u64,
+    /// 放鱼时用形态发生还是手工体型表。跟着命令行开关走，中途不变。
+    morph: bool,
 
     scale: TimeScale,
     budget: FrameBudget,
@@ -312,7 +318,7 @@ impl Game {
         // 建生命层时会扫一遍地形，把天然碎屑折成"初始能量"记进账。
         let mut life = LifeSim::new(&mut world);
         if opts.fish > 0 {
-            let ids = stock_surface(&mut world, &mut life, opts.fish, 300);
+            let ids = stock_surface(&mut world, &mut life, opts.fish, 300, opts.morph);
             println!("启动时投放 {} 条鱼", ids.len());
         }
 
@@ -326,6 +332,7 @@ impl Game {
             layout,
             rng,
             seed: opts.seed,
+            morph: opts.morph,
             scale: TimeScale::X1,
             budget: FrameBudget::default(),
             last_tick_cost: Duration::ZERO,
@@ -455,7 +462,7 @@ impl Game {
         // 16 而不是 8：捕食者要活下来需要**猎物密度**。
         // 512² 里 24 条起步时，掠食者在 8000 tick 内全灭（实测 `杀手 0 枚`）；
         // 120 条起步时稳定在 14 枚杀手。按几次 L 就能跨过那道门槛。
-        let ids = stock_surface(&mut self.world, &mut self.life, 16, 300);
+        let ids = stock_surface(&mut self.world, &mut self.life, 16, 300, self.morph);
         println!("放鱼：水面附近 {} 条", ids.len());
     }
 

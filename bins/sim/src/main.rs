@@ -53,6 +53,8 @@ struct Args {
     report_every: u64,
     /// 关掉海底的藻席。用来做 A/B：想知道藻席改变了什么，就得能跑没有它的世界。
     no_algae: bool,
+    /// 形态发生模式：身体由基因组长出来，而不是用手工体型表。
+    morph: bool,
 }
 
 impl Default for Args {
@@ -69,6 +71,7 @@ impl Default for Args {
             quiet: false,
             report_every: 0,
             no_algae: false,
+            morph: false,
         }
     }
 }
@@ -91,6 +94,7 @@ Vivarium headless 模拟器
     --threads <N>        材质层的并行工人数  [默认 0 = 自动：按本机核数与当 tick 活量收敛]
     --report-every <N>   每 N 个 tick 打印一次进度     [默认 0 = 只在结束时打印]
     --no-algae           关掉海底的藻席（对照实验用）
+    --morph              身体由基因组**长出来**（形态发生），而不是用手工体型表
     --ascii              结束时打印 ASCII 视图
     --quiet              只输出最终报告
     -h, --help           显示本帮助"
@@ -112,6 +116,7 @@ fn parse_args() -> Result<Parsed, String> {
             "--ascii" => args.ascii = true,
             "--quiet" => args.quiet = true,
             "--no-algae" => args.no_algae = true,
+            "--morph" => args.morph = true,
             "--width" => args.width = take_usize(&mut it, "--width")?,
             "--height" => args.height = take_usize(&mut it, "--height")?,
             "--ticks" => args.ticks = take_u64(&mut it, "--ticks")?,
@@ -343,7 +348,7 @@ fn main() -> ExitCode {
     let mut life = LifeSim::new(&mut world);
     life.set_food_growth(!args.no_algae);
     if args.fish > 0 {
-        let ids = stock_surface(&mut world, &mut life, args.fish, 300);
+        let ids = stock_surface(&mut world, &mut life, args.fish, 300, args.morph);
         if !args.quiet {
             println!("投放 {} 条鱼（水面附近）", ids.len());
             println!();
@@ -361,7 +366,7 @@ fn main() -> ExitCode {
             let s = sim.stats();
             let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  飘 {:>2}  杀手 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  体型 {:>2}-{:<2}  飘 {:>2}  杀手 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -370,6 +375,8 @@ fn main() -> ExitCode {
                 s.moved,
                 s.reacted,
                 l.organisms,
+                l.min_cells,
+                l.max_cells,
                 l.stranded,
                 l.killers,
                 l.energy,
@@ -424,9 +431,11 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
+        "生命层  生物 {} · 细胞 {} · 体型 {}-{} 格 · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
         l.organisms,
         l.cells,
+        l.min_cells,
+        l.max_cells,
         l.energy,
         l.stranded,
         l.killers,

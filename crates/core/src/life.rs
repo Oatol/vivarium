@@ -26,6 +26,7 @@
 //! 而细胞级能量需要额外定义"能量怎么在细胞间流动"，那是一整套新规则。
 //! 年龄仍然记在细胞上，因为"某个部位先老死"是 M3 才要的东西。
 
+use crate::grn::Grn;
 use crate::material::MaterialKind;
 use crate::world::World;
 
@@ -266,48 +267,12 @@ pub const IN_FOOD_DIR_Y: usize = 14;
 /// 20 格 × 300 条鱼 = 每 tick 2.4 万次，已经和材质层的访问量同一量级。
 pub const FOOD_SMELL_RADIUS: i32 = 20;
 
-/// 基因调控网络（GRN）。
-///
-/// M2 **不跑形态发生**——手工生物的身体是直接给定的，形状还不由基因决定。
-/// 这个结构在这里是为了让 [`Genome`] 的形状从第一天起就包含它，
-/// 免得 M3 加形态发生时要改所有序列化与变异代码。
-/// 字段留空（`Vec::new()`）是合法的：空网络 = "不发育，用给定形状"。
-#[derive(Debug, Clone, Default, PartialEq)]
-pub struct Grn {
-    /// 基因节点。每个节点描述"产物类型 + 阈值 + 位置提示"。
-    pub nodes: Vec<GeneNode>,
-    /// 调控边。
-    pub edges: Vec<Regulation>,
-}
-
-/// GRN 的一个节点。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct GeneNode {
-    /// 这个基因让细胞变成什么类型。
-    pub product: CellType,
-    /// 激活阈值。
-    pub activate_at: f32,
-    /// 抑制阈值。
-    pub inhibit_at: f32,
-}
-
-/// GRN 的一条调控边。
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub struct Regulation {
-    /// 源节点。
-    pub from: u16,
-    /// 目标节点。
-    pub to: u16,
-    /// 权重。负值是抑制。
-    pub weight: f32,
-}
-
 /// 基因组：行为网络权重 + 形态发生网络。
 #[derive(Debug, Clone, PartialEq)]
 pub struct Genome {
     /// 行为网络权重，布局见 [`WEIGHT_COUNT`]。
     pub weights: Vec<f32>,
-    /// 形态发生网络。M2 为空。
+    /// 形态发生：这套规则决定身体长成什么样。见 [`crate::grn`]。
     pub grn: Grn,
 }
 
@@ -417,6 +382,12 @@ impl Genome {
     ///
     /// 随机性全部来自调用方传入的 [`crate::rng::Rng`]，所以整个流程仍然确定性。
     pub fn mutate(&mut self, rng: &mut crate::rng::Rng, rate: f32, sigma: f32) {
+        // 形态发生基因**必须单独算变异率**。
+        //
+        // 规则表有上千个槽，用 `rate` 逐个掷骰子的话，一个正常的 5% 就会
+        // 一次改掉几十条规则——身体立刻变成随机团。所以这里按"改几条"算，
+        // 而且一次只改 1 条（见 `Grn::mutate` 的注释）。
+        self.grn.mutate(rng, 1);
         for w in &mut self.weights {
             if rng.next_f32() < rate {
                 // Box–Muller：两个均匀分布 → 一个正态分布。
