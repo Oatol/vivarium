@@ -452,7 +452,10 @@ impl Game {
     /// 说明生产者拿到的光不够付维持成本；如果数量爆炸，说明负反馈没接上。
     /// 这两件事在画面上都是"一堆小方块"，只有数字能分辨。
     fn release_fish(&mut self) {
-        let ids = stock_surface(&mut self.world, &mut self.life, 8, 300);
+        // 16 而不是 8：捕食者要活下来需要**猎物密度**。
+        // 512² 里 24 条起步时，掠食者在 8000 tick 内全灭（实测 `杀手 0 枚`）；
+        // 120 条起步时稳定在 14 枚杀手。按几次 L 就能跨过那道门槛。
+        let ids = stock_surface(&mut self.world, &mut self.life, 16, 300);
         println!("放鱼：水面附近 {} 条", ids.len());
     }
 

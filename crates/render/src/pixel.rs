@@ -130,7 +130,7 @@ struct SceneUniforms {
     world: [f32; 2],
     px_per_cell: f32,
     _pad: f32,
-    palette: [[f32; 4]; 16],
+    palette: [[f32; 4]; palette::PALETTE_LEN],
 }
 
 impl SceneUniforms {

@@ -168,11 +168,43 @@ pub const JELLY: BodyPlan = BodyPlan {
     ],
 };
 
+/// 掠食者：前端两枚杀手细胞，像一对颚。
+///
+/// 它是**唯一**一种"收入不只来自光"的体型：杀手细胞每 tick 从邻格的
+/// 别的生物身上咬下一口能量（见 `LifeSim::predate`）。所以它的生产者比别的
+/// 体型少——它靠吃别人补上那一份。
+///
+/// 这也是"身体即策略"的第一个例子：**要不要当捕食者，是长成什么样决定的**，
+/// 不是网络输出决定的。杀手细胞自己就要付维持成本，养不起就饿死。
+///
+/// 账：4 生产者 + 3 移动 + 2 杀手 + 1 嘴 = 10 格，
+/// 维持 40、质量 13、浅水收入 76.8 → **净 +23.8/tick**（不含捕食）。
+///
+/// 生产者给到 4 是**必须的**，不是保守：第一版只给 3（净 +10.6 是在光 0.8 下算的），
+/// 而实际水面在 y≈155/512，光只有 0.70——净收益掉到 +3/tick，
+/// 捕食者还没碰到猎物就饿死了。实测 8000 tick 时 `杀手 0 枚`：
+/// 捕食者全灭，而"生物数""细胞数""能量账"三项都完全正常。
+pub const HUNTER: BodyPlan = BodyPlan {
+    name: "掠食者",
+    cells: &[
+        (CellType::Killer, 1, 0),
+        (CellType::Killer, 2, 0),
+        (CellType::Mouth, 0, 1),
+        (CellType::Mover, 0, 0),
+        (CellType::Mover, -1, 0),
+        (CellType::Mover, -2, 0),
+        (CellType::Producer, 0, -1),
+        (CellType::Producer, 1, -1),
+        (CellType::Producer, -1, -1),
+        (CellType::Producer, -2, -1),
+    ],
+};
+
 /// 全部手工体型。
 ///
 /// 顺序有意义：[`crate::life_sim::stock_surface`] 按它轮换投放，
 /// 所以换顺序会改变同一个种子里"哪条鱼长什么样"。
-pub const PLANS: &[BodyPlan] = &[SILVERFISH, LEAFBACK, WORM, JELLY];
+pub const PLANS: &[BodyPlan] = &[SILVERFISH, LEAFBACK, WORM, JELLY, HUNTER];
 
 /// 最大的手工体型有多少格。
 ///
@@ -260,17 +292,20 @@ mod tests {
 
     #[test]
     fn plans_have_distinct_shapes() {
-        // 四个体型必须真的不一样，否则"混合投放"没有意义。
+        // 体型必须真的不一样，否则"混合投放"没有意义。
+        //
+        // 判据是**细胞构成**，不是格数：早先比的是 `cells.len()`，而掠食者
+        // 加进来之后和银鱼都是 10 格——但一个是「2 嘴 + 1 眼」，另一个是
+        // 「2 杀手」，画面上（橙红 vs 紫红）一眼就能分开。
+        // 格数只是个粗糙的替身，构成才是"形状"本身。
         for (i, a) in PLANS.iter().enumerate() {
             for b in &PLANS[i + 1..] {
                 assert_ne!(a.name, b.name);
-                assert_ne!(
-                    a.cells.len(),
-                    b.cells.len(),
-                    "「{}」与「{}」格数相同，形状容易撞",
-                    a.name,
-                    b.name
-                );
+                let mut ca: Vec<(CellType, i16, i16)> = a.cells.to_vec();
+                let mut cb: Vec<(CellType, i16, i16)> = b.cells.to_vec();
+                ca.sort_by_key(|c| (c.0.as_u8(), c.1, c.2));
+                cb.sort_by_key(|c| (c.0.as_u8(), c.1, c.2));
+                assert_ne!(ca, cb, "「{}」与「{}」是同一个形状", a.name, b.name);
             }
         }
     }

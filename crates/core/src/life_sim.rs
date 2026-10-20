@@ -169,6 +169,9 @@ fn underwater(world: &World, x: usize, y: usize) -> bool {
     false
 }
 
+/// 四邻域偏移。捕食判定用它找"隔壁是谁"。
+const NEIGHBORS_4: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
+
 /// 尸体腐烂用的位置派生随机盐。必须和藻席生长、以及材质层的盐都不同。
 const SALT_CORPSE_ROT: u32 = 0xDEAD;
 
@@ -191,6 +194,27 @@ const SALT_FOOD_GROWTH: u32 = 0xF00D;
 /// 第一版取 40 的实测结果是**负收益**：种群从 52 掉到 37，
 /// 细胞数从 688 掉到 442。不是藻没长出来，是长得再多也不值得去。
 pub const FOOD_ENERGY: u32 = 120;
+
+// ---------------------------------------------------------------------------
+// 捕食
+// ---------------------------------------------------------------------------
+
+/// 一枚杀手细胞每 tick 从邻格猎物身上咬下多少能量。
+///
+/// 捕食是**能量转移**，不是注入：猎物少多少，捕食者就多多少（装不下的部分
+/// 记进耗散）。所以它不会破坏守恒，只会改变能量的分布——
+/// 这正是"捕食会带来频率依赖选择"的物理来源。
+pub const PREDATION_BITE: u32 = 30;
+
+/// 猎物身上每有一格装甲，一口咬下去少掉多少。
+///
+/// 这一条给了装甲一个**存在的理由**。在此之前装甲只是"加重、不产出"的配重，
+/// 纯粹是设计上的减分项——叶背鱼驮着三格装甲，除了变重什么也没换来。
+///
+/// 取 8：叶背鱼（3 装甲）只挨 6 点，水母（2 装甲）挨 14，
+/// 银鱼和蠕虫一格装甲都没有，挨满 30。**软的身体成为猎物**，
+/// 于是"要不要长装甲"第一次是个真问题。
+pub const ARMOR_ABSORB: u32 = 8;
 
 /// 环境容纳量：全世界生产者细胞数的软上限。
 ///
@@ -295,6 +319,14 @@ pub struct LifeStats {
     pub starved: u32,
     /// 本 tick 吃掉的残骸格数。
     pub eaten: u32,
+    /// 本 tick 发生的捕食次数（一枚杀手细胞咬到一口算一次）。
+    pub bitten: u32,
+    /// 当前活着的杀手细胞数。
+    ///
+    /// 这个数归零就说明**捕食者灭绝了**——而"生物数""细胞数""能量账"
+    /// 三项全都看不出这件事。捕食者灭绝后世界看起来一切正常，
+    /// 只是少了一整个营养级。
+    pub killers: usize,
     /// 本 tick 新长出的藻席格数。
     pub food_grown: u32,
     /// 本 tick 腐烂掉的尸体格数。
@@ -571,7 +603,8 @@ impl LifeSim {
 
     /// 推进一个 tick 的生命层。
     ///
-    /// 顺序：太阳能 → 行为（移动 / 进食 / 繁殖）→ 代谢（可能饿死）→ 清理尸体 → 统计。
+    /// 顺序：太阳能 → 有机物（腐烂 / 长藻）→ 行为（移动 / 进食 / 繁殖）→ 捕食
+    /// → 代谢（可能饿死）→ 清理尸体 → 统计。
     ///
     /// 行为放在代谢之前，是因为"这一 tick 能动"应该由"这一 tick 开始时还剩多少能量"
     /// 决定。反过来的话，一个刚好付得起维持成本的生物会先被扣光、再判定能不能动，
@@ -587,6 +620,9 @@ impl LifeSim {
 
         // 2) 行为。
         self.act(world);
+
+        // 2b) 捕食。放在行为之后：这一 tick 游到嘴边的猎物，这一 tick 就该被咬。
+        self.predate(world);
 
         // 3) 代谢。付不起维持成本就饿死。
         let mut starved: Vec<usize> = Vec::new();
@@ -628,6 +664,16 @@ impl LifeSim {
                 !Self::touches_water(world, o.width, &cells)
             })
             .count();
+        self.stats.killers = self
+            .organisms
+            .iter()
+            .map(|o| {
+                o.cells
+                    .iter()
+                    .filter(|c| c.kind == CellType::Killer)
+                    .count()
+            })
+            .sum();
         self.stats.energy = self.organisms.iter().map(|o| o.energy as u64).sum();
         self.stats.max_generation = self
             .organisms
@@ -688,6 +734,75 @@ impl LifeSim {
         // 摊不尽的零头 + **没能落到任何一格上的那份**（干细胞的份额）都要记账。
         // 少记这一项，守恒断言会报"少了 N 点"——实测 32000 tick 少了 22657 点。
         self.ledger.dissipated += (org.energy - per_cell * placed) as u64;
+    }
+
+    /// 捕食：杀手细胞咬邻格的其他生物。
+    ///
+    /// ## 为什么是自动的，不是网络输出
+    ///
+    /// 没有 `OUT_BITE` 这一路输出，也刻意不加。理由和"手工基因组不该被硬塞
+    /// 觅食策略"（§3.11）是同一条：**要不要当捕食者，是长成什么样决定的。**
+    /// 杀手细胞自己就要付维持成本（3/tick，和生产者一样贵），
+    /// 养不起就饿死——这已经是足够强的选择压力了。
+    ///
+    /// 再加一个"咬不咬"的输出，只会让网络有机会长出"长了牙但不用"的个体，
+    /// 而那是个纯亏的局部最优。
+    ///
+    /// ## 能量是转移，不是凭空产生
+    ///
+    /// 猎物少 `dealt`，捕食者最多拿 `dealt`（受自己能量上限限制），
+    /// 装不下的那份记进耗散——咬了但咽不下去，能量变成热。
+    /// 这样守恒断言依然成立，而"捕食"只改变能量的分布，不改变总量。
+    fn predate(&mut self, world: &World) {
+        // 先收集再结算：结算要同时改两个有机体，边遍历边改借不过编译器。
+        let mut bites: Vec<(OrganismId, OrganismId)> = Vec::new();
+        for org in &self.organisms {
+            let mut killers = org.cells.iter().filter(|c| c.kind == CellType::Killer);
+            if killers.next().is_none() {
+                continue;
+            }
+            for cell in org.cells.iter().filter(|c| c.kind == CellType::Killer) {
+                let (kx, ky) = org.cell_at(cell);
+                for (dx, dy) in NEIGHBORS_4 {
+                    let nx = org.wrap_x(kx + dx);
+                    let ny = ky + dy;
+                    let owner = world.owner(nx as isize, ny as isize);
+                    if owner.organism != 0 && owner.organism != org.id {
+                        bites.push((org.id, owner.organism));
+                    }
+                }
+            }
+        }
+        if bites.is_empty() {
+            return;
+        }
+
+        for (predator, prey) in bites {
+            let Some(qi) = self.organisms.iter().position(|o| o.id == prey) else {
+                continue;
+            };
+            let armor = self.organisms[qi]
+                .cells
+                .iter()
+                .filter(|c| c.kind == CellType::Armor)
+                .count() as u32;
+            let bite = PREDATION_BITE.saturating_sub(armor * ARMOR_ABSORB);
+            let dealt = bite.min(self.organisms[qi].energy);
+            if dealt == 0 {
+                continue;
+            }
+            let Some(pi) = self.organisms.iter().position(|o| o.id == predator) else {
+                continue;
+            };
+            self.organisms[qi].energy -= dealt;
+            let room = self.organisms[pi]
+                .max_energy()
+                .saturating_sub(self.organisms[pi].energy);
+            let gained = dealt.min(room);
+            self.organisms[pi].energy += gained;
+            self.ledger.dissipated += (dealt - gained) as u64;
+            self.stats.bitten += 1;
+        }
     }
 
     /// 生产者按光照产能量。
@@ -952,9 +1067,12 @@ impl LifeSim {
 
         let owner = world.owner(fx as isize, fy as isize);
         inp[IN_KIN_AHEAD] = (owner.is_some() && owner.organism != org.id) as u8 as f32;
-        // M2 没有物种概念，"异种"暂时恒为 0。留着这个通道是为了让网络形状
-        // 从第一天起就固定，M3 加上物种之后它才有值。
-        inp[IN_ALIEN_AHEAD] = 0.0;
+        // "前方有别的生物"——对捕食者就是"前方有猎物"。
+        //
+        // 还没有物种概念，所以"异种"就是"别的个体"。这和 `IN_KIN_AHEAD`
+        // 目前同值，但两路的**用途**不同：亲缘那一路将来要喂给"别吃同类"，
+        // 异种那一路喂给"扑上去"。现在合并着，等有了物种再分开。
+        inp[IN_ALIEN_AHEAD] = inp[IN_KIN_AHEAD];
 
         let (_, ay) = org.anchor;
         // 探针必须贴着**身体表面**，不能是 `anchor ± 1`。
@@ -1548,6 +1666,14 @@ pub fn handcrafted_fish_genome() -> Genome {
     g.connect(IN_FOOD_DIR_X, OUT_LEFT, -1.5);
     g.connect(IN_FOOD_DIR_Y, OUT_DOWN, 1.5);
     g.connect(IN_FOOD_DIR_Y, OUT_UP, -1.5);
+
+    // --- 捕食：前方有别的生物就往那边靠 --------------------------------
+    //
+    // 同样是"只给通道，不给策略"：权重和觅食一样是 1.5。
+    // 对掠食者它意味着"扑上去"，对其他体型它意味着"旁边有东西"——
+    // 具体是好事还是坏事，取决于它自己有没有牙。
+    g.connect(IN_ALIEN_AHEAD, OUT_RIGHT, 1.5);
+    g.connect(IN_ALIEN_AHEAD, OUT_LEFT, -1.5);
 
     // --- 续命：暗了就往上 ------------------------------------------------
     //
@@ -2569,6 +2695,106 @@ mod tests {
                 "第 {tick} tick 水位漂了：出生借的水和尸体还的水对不上"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // 捕食
+    // -----------------------------------------------------------------------
+
+    /// 摆一对"捕食者在左、猎物在右"的邻居。
+    ///
+    /// 位置是算出来的，不是试出来的：掠食者的两枚杀手在锚点 `+1`/`+2`，
+    /// 所以它的身体占 `x ∈ [18, 22]`；猎物锚点放 25 时身体从 23 起，
+    /// 正好让 `(22, 45)` 的杀手贴住 `(23, 45)` 的移动细胞。
+    fn hunter_and_prey(plan: &crate::body::BodyPlan) -> (World, LifeSim, OrganismId, OrganismId) {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let hunter = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::from_plan(&crate::body::HUNTER, (20, 45), Genome::blank(), 100),
+            )
+            .expect("掠食者应当放得下");
+        let prey = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::from_plan(plan, (25, 45), Genome::blank(), 1000),
+            )
+            .expect("猎物应当放得下");
+        (w, sim, hunter, prey)
+    }
+
+    /// 杀手细胞咬邻格的**别的生物**，能量是转移不是凭空产生。
+    #[test]
+    fn killer_cells_bite_neighbours_and_energy_only_moves() {
+        let (mut w, mut sim, hunter, prey) = hunter_and_prey(&crate::body::SILVERFISH);
+
+        // 先单独跑一次 `predate`：不掺阳光、不掺代谢，账面上必须分毫不差。
+        let before = sim.audit(&w).accounted();
+        let prey_before = sim.organism(prey).unwrap().energy;
+        let hunter_before = sim.organism(hunter).unwrap().energy;
+        sim.predate(&w);
+        let prey_after = sim.organism(prey).unwrap().energy;
+        let hunter_after = sim.organism(hunter).unwrap().energy;
+        assert!(prey_after < prey_before, "猎物应当掉能量");
+        assert!(hunter_after > hunter_before, "捕食者应当涨能量");
+        assert_eq!(
+            sim.audit(&w).accounted(),
+            before,
+            "捕食是转移：生物 + 残骸的总量必须不变（咽不下的进耗散）"
+        );
+
+        for _ in 0..5 {
+            sim.step(&mut w);
+        }
+        assert!(sim.stats().bitten > 0, "应当发生过咬");
+        assert!(sim.audit(&w).is_balanced(), "差额 {}", sim.audit(&w).leak());
+    }
+
+    /// 装甲挡住一部分咬——这是装甲细胞存在的理由。
+    #[test]
+    fn armor_cells_absorb_part_of_the_bite() {
+        let (mut w, mut sim, _hunter, soft) = hunter_and_prey(&crate::body::SILVERFISH);
+        for _ in 0..5 {
+            sim.step(&mut w);
+        }
+        let soft_loss = 1000 - sim.organism(soft).map_or(0, |o| o.energy);
+
+        let (mut w2, mut sim2, _hunter2, hard) = hunter_and_prey(&crate::body::LEAFBACK);
+        for _ in 0..5 {
+            sim2.step(&mut w2);
+        }
+        let hard_loss = 1000 - sim2.organism(hard).map_or(0, |o| o.energy);
+
+        assert!(
+            hard_loss * 2 < soft_loss,
+            "叶背鱼有三格装甲，挨的咬应当远少于银鱼：{hard_loss} vs {soft_loss}"
+        );
+        assert!(hard_loss > 0, "装甲不该完全免疫");
+    }
+
+    /// 没有杀手细胞的生物不会咬人——哪怕贴在一起。
+    #[test]
+    fn a_body_without_killer_cells_never_bites() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        sim.spawn_injected(
+            &mut w,
+            LifeSim::from_plan(&crate::body::SILVERFISH, (20, 45), Genome::blank(), 1000),
+        )
+        .unwrap();
+        sim.spawn_injected(
+            &mut w,
+            LifeSim::from_plan(&crate::body::SILVERFISH, (25, 45), Genome::blank(), 1000),
+        )
+        .unwrap();
+
+        for _ in 0..5 {
+            sim.step(&mut w);
+        }
+        assert_eq!(sim.stats().bitten, 0, "银鱼没有杀手细胞，不该咬到任何东西");
     }
 
     // -----------------------------------------------------------------------

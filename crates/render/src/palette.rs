@@ -8,6 +8,16 @@
 
 use vivarium_core::{CellType, MaterialKind};
 
+/// 细胞类型在调色板里的起始下标。**必须与 `blit.wgsl` 里的同名常数一致。**
+pub const CELL_PALETTE_BASE: usize = 16;
+
+/// 调色板长度。材质占 `[0, CELL_PALETTE_BASE)`，细胞占 `[16, 23)`。
+pub const PALETTE_LEN: usize = 24;
+
+// 下标够不够用是**编译期**的事，不该等到跑测试才发现。
+const _: () = assert!(MaterialKind::COUNT <= CELL_PALETTE_BASE);
+const _: () = assert!(CELL_PALETTE_BASE + CellType::COUNT <= PALETTE_LEN);
+
 /// 背景色，同时也是 [`MaterialKind::Empty`] 的颜色。
 pub const BACKGROUND: [u8; 3] = [12, 13, 18];
 
@@ -88,14 +98,20 @@ fn srgb_to_linear(s: f32) -> f32 {
     }
 }
 
-/// 打包成 shader 用的调色板：`[0..6]` 材质，`[8..14]` 细胞类型。
+/// 打包成 shader 用的调色板：`[0..15]` 材质，`[16..22]` 细胞类型。
 ///
-/// 下标是硬约定，与 `blit.wgsl` 里的 `8u + kind` 对应。中间空一格
-/// 是为了让"材质"和"细胞"在调试时一眼能分开。
+/// 下标是硬约定，与 `blit.wgsl` 里的 `CELL_PALETTE_BASE + kind` 对应。
+/// 中间空出整整一段，是为了让"材质"和"细胞"在调试时一眼能分开。
+///
+/// **这个偏移原本是 8，撞过车。** 材质种类从 7 涨到 9 之后，
+/// `Algae = 8` 正好落在细胞的起始下标上——两个循环都往 `palette[8]` 写，
+/// 后写的细胞配色覆盖了先写的材质配色，于是**藻被画成了嘴的橙红色**。
+/// 画面上它只是"海底有一层橙色"，看起来像 bug 又不像 bug。
+/// 现在偏移是 16，材质最多 16 种、细胞最多 7 种，两边都碰不到对方。
 ///
 /// `srgb_output` 为真时转成线性——交换链是 sRGB 格式，着色器必须给线性值。
 /// 为假（比如某些平台上拿到的是非 sRGB 格式）就直接给 sRGB 值。
-pub fn scene_palette(srgb_output: bool) -> [[f32; 4]; 16] {
+pub fn scene_palette(srgb_output: bool) -> [[f32; 4]; PALETTE_LEN] {
     let to_uniform = |[r, g, b]: [u8; 3]| -> [f32; 4] {
         let f = |c: u8| {
             let s = f32::from(c) / 255.0;
@@ -108,12 +124,12 @@ pub fn scene_palette(srgb_output: bool) -> [[f32; 4]; 16] {
         [f(r), f(g), f(b), 1.0]
     };
 
-    let mut out = [[0.0f32; 4]; 16];
+    let mut out = [[0.0f32; 4]; PALETTE_LEN];
     for kind in MaterialKind::ALL {
         out[kind.as_u8() as usize] = to_uniform(rgb(kind));
     }
     for kind in CellType::ALL {
-        out[8 + kind.as_u8() as usize] = to_uniform(cell_rgb(kind));
+        out[CELL_PALETTE_BASE + kind.as_u8() as usize] = to_uniform(cell_rgb(kind));
     }
     out
 }
@@ -163,6 +179,32 @@ mod tests {
             if kind != MaterialKind::Empty {
                 assert_ne!(c, BACKGROUND, "{kind} shares the background color");
             }
+        }
+    }
+
+    /// 材质和细胞共用一张调色板，**两边的下标不能撞**。
+    ///
+    /// 这条测试是被一次真实的撞车逼出来的：材质从 7 种涨到 9 种之后，
+    /// `Algae = 8` 正好落在细胞的起始下标（当时的 8）上，两个循环都往
+    /// `palette[8]` 写，后写的细胞配色盖掉了先写的材质配色——
+    /// **藻被画成了嘴的橙红色**，而画面上看起来只是"海底有一层橙色"。
+    #[test]
+    fn material_and_cell_palettes_do_not_collide() {
+        // 下标够不够用由编译期断言保证（见 `PALETTE_LEN` 附近）；
+        // 这里检查**实际写进去的颜色**。
+        let p = scene_palette(false);
+        let same = |a: [f32; 4], b: [u8; 3]| (0..3).all(|i| (a[i] * 255.0).round() as u8 == b[i]);
+        for kind in MaterialKind::ALL {
+            assert!(
+                same(p[kind.as_u8() as usize], rgb(kind)),
+                "{kind} 的配色被别的东西覆盖了"
+            );
+        }
+        for kind in CellType::ALL {
+            assert!(
+                same(p[CELL_PALETTE_BASE + kind.as_u8() as usize], cell_rgb(kind)),
+                "细胞 {kind:?} 的配色被别的东西覆盖了"
+            );
         }
     }
 

@@ -361,7 +361,7 @@ fn main() -> ExitCode {
             let s = sim.stats();
             let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  飘 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  飘 {:>2}  杀手 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -371,6 +371,7 @@ fn main() -> ExitCode {
                 s.reacted,
                 l.organisms,
                 l.stranded,
+                l.killers,
                 l.energy,
                 l.max_generation,
                 l.avg_generation,
@@ -423,11 +424,12 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 食物 {} 格",
+        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
         l.organisms,
         l.cells,
         l.energy,
         l.stranded,
+        l.killers,
         life.food_cells(&world)
     );
     println!(

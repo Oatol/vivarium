@@ -23,9 +23,17 @@ struct Scene {
     // 一格在屏幕上占多少像素。用来算抗锯齿宽度。
     px_per_cell: f32,
     _pad: f32,
-    // 0..6 材质，8..14 细胞类型。只用 rgb，a 空着。
-    palette: array<vec4<f32>, 16>,
+    // 0..15 材质，16..22 细胞类型。只用 rgb，a 空着。
+    //
+    // 中间那一段空隙不是浪费：材质和细胞是两套编号，共用一个数组时必须
+    // 划清界限。**这个偏移原本是 8，而材质涨到 9 种时 `Algae = 8` 正好
+    // 撞上细胞的起点**——后写的细胞配色盖掉了先写的材质配色，
+    // 藻被画成了嘴的橙红色。
+    palette: array<vec4<f32>, 24>,
 };
+
+// 细胞类型在 `palette` 里的起始下标。必须与 `palette.rs` 的同名常数一致。
+const CELL_PALETTE_BASE: u32 = 16u;
 
 @group(0) @binding(0) var<uniform> u: Scene;
 @group(0) @binding(1) var world_tex: texture_2d<u32>;
@@ -154,7 +162,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let kind = key & 0xFFu;
-    let base = u.palette[8u + kind].rgb;
+    let base = u.palette[CELL_PALETTE_BASE + kind].rgb;
 
     // 明暗按**到格心的距离**算，不是按到身体边界的距离。
     //
