@@ -51,6 +51,8 @@ struct Args {
     ascii: bool,
     quiet: bool,
     report_every: u64,
+    /// 关掉海底的藻席。用来做 A/B：想知道藻席改变了什么，就得能跑没有它的世界。
+    no_algae: bool,
 }
 
 impl Default for Args {
@@ -66,6 +68,7 @@ impl Default for Args {
             ascii: false,
             quiet: false,
             report_every: 0,
+            no_algae: false,
         }
     }
 }
@@ -87,6 +90,7 @@ Vivarium headless 模拟器
     --fish <N>           在水面附近投放 N 条手工设计的鱼  [默认 0 = 没有生物]
     --threads <N>        材质层的并行工人数  [默认 0 = 自动：按本机核数与当 tick 活量收敛]
     --report-every <N>   每 N 个 tick 打印一次进度     [默认 0 = 只在结束时打印]
+    --no-algae           关掉海底的藻席（对照实验用）
     --ascii              结束时打印 ASCII 视图
     --quiet              只输出最终报告
     -h, --help           显示本帮助"
@@ -107,6 +111,7 @@ fn parse_args() -> Result<Parsed, String> {
             "-h" | "--help" => return Ok(Parsed::Help),
             "--ascii" => args.ascii = true,
             "--quiet" => args.quiet = true,
+            "--no-algae" => args.no_algae = true,
             "--width" => args.width = take_usize(&mut it, "--width")?,
             "--height" => args.height = take_usize(&mut it, "--height")?,
             "--ticks" => args.ticks = take_u64(&mut it, "--ticks")?,
@@ -333,6 +338,7 @@ fn main() -> ExitCode {
     // 反过来（先材质后生物）会让"鱼游过去"和"水合拢"差一拍，
     // 视觉上像是鱼在水里拖了一条尾迹。
     let mut life = LifeSim::new(&mut world);
+    life.set_food_growth(!args.no_algae);
     if args.fish > 0 {
         let ids = stock_surface(&mut world, &mut life, args.fish, 300);
         if !args.quiet {
@@ -414,8 +420,12 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个",
-        l.organisms, l.cells, l.energy, l.stranded
+        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个 · 藻席 {} 格",
+        l.organisms,
+        l.cells,
+        l.energy,
+        l.stranded,
+        life.food_cells(&world)
     );
     println!(
         "谱系    最大代数 {} · 平均代数 {:.1} · 与初代基因距离 {:.3}",

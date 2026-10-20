@@ -30,10 +30,11 @@
 
 use crate::body::{BodyPlan, PLANS};
 use crate::life::{
-    remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
-    IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
-    IN_FACING_Y, IN_FOOD_AHEAD, IN_KIN_AHEAD, IN_LIGHT, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN,
-    OUT_EAT, OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
+    remains_of, Cell, CellType, Genome, Organism, OrganismId, FOOD_SMELL_RADIUS, INPUTS, IN_AGE,
+    IN_ALIEN_AHEAD, IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY,
+    IN_FACING_X, IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
+    IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT, OUT_REPRODUCE, OUT_RIGHT, OUT_UP,
+    REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
 use crate::rng::Rng;
@@ -123,6 +124,39 @@ pub const CROWD_RADIUS: i32 = 4;
 
 /// 半径内有多少个同类时不再繁殖。
 pub const CROWD_LIMIT: usize = 6;
+
+// ---------------------------------------------------------------------------
+// 藻席：海底的可再生食物
+// ---------------------------------------------------------------------------
+
+/// 藻席尝试生长的间隔（tick）。
+///
+/// 和残骸分解一样走**周期性全局清扫**：海底是世界最先静下来的地方，
+/// 塞进分块访问里就永远不会执行（见 `REMAINS_DECAY_INTERVAL`）。
+pub const FOOD_GROWTH_INTERVAL: u64 = 25;
+
+/// 每次清扫时，一格符合条件的海底水格长出藻的概率（百分比）。
+pub const FOOD_GROWTH_PERCENT: u32 = 8;
+
+/// 藻席生长用的位置派生随机盐。
+///
+/// 必须和材质层的盐（`sim::salt`）不同：同一个 `(x, y, tick)` 配同一个盐
+/// 会得到同一个随机数，于是"这一格该不该长藻"和"这一格该不该烂"
+/// 就成了同一个事件——它们会在同一批格子上同时发生。
+const SALT_FOOD_GROWTH: u32 = 0xF00D;
+
+/// 一格藻蕴含的生物可用能量。
+///
+/// 这个数字必须**压过"待在水面晒光"的净收益**，否则觅食就是个坏主意：
+/// 鱼会闻着味道下潜、花掉一截移动成本、吃到一点点，然后发现还不如待在上面。
+///
+/// 三格鱼的账：水面净收益约 +26/tick；一口藻吃一格，所以藻的能量
+/// 必须明显高于"维持成本 37 + 那 26"。取 120 时，坐在藻席上吃是
+/// **+83/tick**——值得专门跑一趟，而且吃几口就饱（能量上限会挡住）。
+///
+/// 第一版取 40 的实测结果是**负收益**：种群从 52 掉到 37，
+/// 细胞数从 688 掉到 442。不是藻没长出来，是长得再多也不值得去。
+pub const FOOD_ENERGY: u32 = 120;
 
 /// 环境容纳量：全世界生产者细胞数的软上限。
 ///
@@ -227,6 +261,8 @@ pub struct LifeStats {
     pub starved: u32,
     /// 本 tick 吃掉的残骸格数。
     pub eaten: u32,
+    /// 本 tick 新长出的藻席格数。
+    pub food_grown: u32,
     /// 当前种群的最大代数。
     pub max_generation: u32,
     /// 当前种群的平均代数。
@@ -261,6 +297,8 @@ pub struct LifeSim {
     /// 初代基因组，用来度量"种群漂了多远"。取第一次投放的那一条。
     founder: Option<Genome>,
     stats: LifeStats,
+    /// 海底要不要长藻。默认开，见 [`LifeSim::set_food_growth`]。
+    food_growth: bool,
 }
 
 impl Default for LifeSim {
@@ -276,6 +314,7 @@ impl Default for LifeSim {
             rng: Rng::new(LIFE_SEED),
             founder: None,
             stats: LifeStats::default(),
+            food_growth: true,
         }
     }
 }
@@ -312,7 +351,17 @@ impl LifeSim {
             rng: Rng::new(LIFE_SEED),
             founder: None,
             stats: LifeStats::default(),
+            food_growth: true,
         }
+    }
+
+    /// 打开/关闭藻席生长。
+    ///
+    /// 关掉它是为了**对照实验**：想知道藻席到底改变了什么，就得能跑一个
+    /// 没有它的世界。顺带也让那些"精确数残骸格数"的单元测试不被海底长出来的
+    /// 藻干扰——但那些测试关它是因为**测的是别的东西**，不是因为藻是噪声。
+    pub fn set_food_growth(&mut self, on: bool) {
+        self.food_growth = on;
     }
 
     /// 当前的统计。
@@ -500,6 +549,9 @@ impl LifeSim {
         // 1) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
         self.inject_sunlight(world);
 
+        // 1b) 藻席。第二条能量注入通道，见 `FOOD_GROWTH_INTERVAL`。
+        self.grow_algae(world);
+
         // 2) 行为。
         self.act(world);
 
@@ -655,6 +707,95 @@ impl LifeSim {
         self.ledger.injected += injected;
     }
 
+    /// 海底长藻：第二条能量注入通道。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 光只从上往下射，生产者只能待在浅水——于是"待在哪儿"这个问题
+    /// 有一个平凡的最优解：**待在最浅的地方**。行为网络没有需要权衡的东西，
+    /// 选择压力只能筛出"别沉下去"，筛不出任何策略。
+    ///
+    /// 把食物放到海底，问题就变成真的了：**浅处晒得到太阳，深处才有吃的。**
+    /// 一条鱼必须决定什么时候下潜、下潜多深、什么时候浮上来续命。
+    ///
+    /// ## 藻席是被"借"出去的水
+    ///
+    /// 一格水变成一格藻，水就欠在那儿；藻被吃掉（`eat_remains`）时变回水。
+    /// 和身体借水是同一本账，所以水位不会因为长藻而漂移。
+    ///
+    /// ## 为什么不需要"总量上限"
+    ///
+    /// 第一版按"全世界含能量的残骸格数"封顶 1500 格，结果 512² 里
+    /// 天然碎屑本身就有 2791 格——上限一开始就满了，**一格藻都长不出来**。
+    /// 按总数封顶的判据从根上就是错的：它把"天然碎屑"和"新长出来的藻"
+    /// 混成了一件事。
+    ///
+    /// 现在的上限是**结构自限**：藻只长在"水 / 矿物"界面上，而一格水变成藻
+    /// 之后，它上面那格水的下方就是藻（不是矿物）——不再符合条件。
+    /// 所以**每一列最多一格藻**，总量天然被世界宽度卡住（512² 里约 280 格）。
+    /// 吃掉一格就变回水，界面上又空出一个位置，可以再长。
+    ///
+    /// 这不是"能长的藻被限制了"，而是"藻席本来就是贴着海底的一层薄膜"。
+    /// 一层薄膜既够一群鱼吃，又远不够喂饱整个海洋——这正是想要的稀缺度。
+    ///
+    /// ## 能量要记账
+    ///
+    /// 藻的能量是**新进入生物可用池的能量**（光 → 藻 → 鱼），
+    /// 所以必须记进 `injected`。忘了记，守恒断言会报"多了 N 点"；
+    /// 记成耗散，会报"少了 N 点"。
+    fn grow_algae(&mut self, world: &mut World) {
+        if !self.food_growth {
+            return;
+        }
+        if world.tick() % FOOD_GROWTH_INTERVAL != 0 {
+            return;
+        }
+        let (w, h) = (world.width(), world.height());
+        let mut grown = 0u64;
+        let tick = world.tick();
+        for y in 0..h {
+            for x in 0..w {
+                let (xs, ys) = (x as isize, y as isize);
+                if world.get(xs, ys) != MaterialKind::Water || world.is_occupied(xs, ys) {
+                    continue;
+                }
+                // 只长在**贴着矿物**的那一层水上——也就是海底与浅滩。
+                // 刻意不接受"下面也是残骸"：那样藻会一层层往上叠，
+                // 重新变成需要封顶的东西。
+                let below = world.get(xs, ys + 1);
+                if !matches!(below, MaterialKind::Stone | MaterialKind::Sand) {
+                    continue;
+                }
+                if !Rng::at_percent(x, y, tick, SALT_FOOD_GROWTH, FOOD_GROWTH_PERCENT) {
+                    continue;
+                }
+                world.set(xs, ys, MaterialKind::Remains);
+                world.set_flags(xs, ys, FOOD_ENERGY as u8);
+                grown += 1;
+            }
+        }
+        self.ledger.injected += grown * FOOD_ENERGY as u64;
+        self.stats.food_grown = grown as u32;
+    }
+
+    /// 世界里有多少格含能量的食物（藻席 + 有能量的残骸）。
+    ///
+    /// 这是"有多少吃的"，不是"有多少藻"——天然碎屑与带能量的尸体也算。
+    /// 全网格扫描，所以只在报告里调，不要每 tick 调。
+    pub fn food_cells(&self, world: &World) -> usize {
+        let (w, h) = (world.width(), world.height());
+        let mut n = 0;
+        for y in 0..h {
+            for x in 0..w {
+                let (xs, ys) = (x as isize, y as isize);
+                if world.get(xs, ys) == MaterialKind::Remains && world.flags(xs, ys) > 0 {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
     // -----------------------------------------------------------------------
     // 行为
     // -----------------------------------------------------------------------
@@ -758,6 +899,38 @@ impl LifeSim {
         // 鱼要学会的是"往浅处游"，不是精确估计自己拿到多少能量。
         let height = world.height().max(1) as f32;
         inp[IN_LIGHT] = (1.0 - (ay.max(0) as f32 / height)).clamp(0.0, 1.0);
+
+        // 嗅觉：四向射线。撞到固体就断（墙后面闻不到），找到含能量的食物
+        // 就按 1/距离 累加一个方向分量。
+        //
+        // 用射线而不是"扫一个半径 12 的方框"：方框是 625 格/生物/tick，
+        // 射线是 48 格。而且射线天然表达遮挡——一条鱼闻到隔壁岩架后面的藻
+        // 是没有道理的，它得绕过去。
+        let (mut smell_x, mut smell_y) = (0.0f32, 0.0f32);
+        for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+            for d in 1..=FOOD_SMELL_RADIUS {
+                let sx = org.wrap_x(org.anchor.0 + dx * d);
+                let sy = org.anchor.1 + dy * d;
+                let (sxs, sys) = (sx as isize, sy as isize);
+                if !world.in_bounds(sxs, sys) {
+                    break;
+                }
+                if world.get(sxs, sys) == MaterialKind::Remains && world.flags(sxs, sys) > 0 {
+                    smell_x += dx as f32 / d as f32;
+                    smell_y += dy as f32 / d as f32;
+                    break;
+                }
+                // 水、气、空位都能"闻过去"；石头、沙、火挡住。
+                if !matches!(
+                    world.get(sxs, sys),
+                    MaterialKind::Water | MaterialKind::Gas | MaterialKind::Empty
+                ) {
+                    break;
+                }
+            }
+        }
+        inp[IN_FOOD_DIR_X] = smell_x.clamp(-1.0, 1.0);
+        inp[IN_FOOD_DIR_Y] = smell_y.clamp(-1.0, 1.0);
         inp
     }
 
@@ -1246,6 +1419,42 @@ pub fn handcrafted_fish_genome() -> Genome {
     // 分左右两路之后，它才会真的走完整个水池再折返。
     g.connect(IN_BLOCKED_RIGHT, OUT_LEFT, 10.0);
     g.connect(IN_BLOCKED_LEFT, OUT_RIGHT, 10.0);
+
+    // --- 觅食：闻着藻席的味道走 -------------------------------------------
+    //
+    // 这一层是 M3 的"食物分布不均匀"落地的**唯一行为改动**：
+    // 藻席长在海底，而光只从上往下射，所以"哪儿有吃的"和"哪儿晒得到"
+    // 是两个不同的地方。鱼必须自己决定什么时候下潜、什么时候上来。
+    //
+    // 权重只给 1.5，和"往前游"的偏置（1.0）同一量级——**刻意不给大**。
+    //
+    // 第一版给 8.0（远距离也能压过巡航偏置），实测是**负收益**：
+    // 鱼闻着味道去追，花掉的移动成本比吃到的高，种群从 52 掉到 37、
+    // 细胞数从 688 掉到 442。
+    //
+    // 想清楚之后发现那根本不是权重的问题：**手工基因组不该被硬塞一个觅食策略。**
+    // 它的职责是"会游、会吃、会生"这条基线，不是"最优觅食"。正确的分层是
+    // 把"闻到食物"这个**能力**接进去，让突变去决定要不要用、用多强——
+    // 那才是选择该做的事，而不是我在常数里替它决定。
+    g.connect(IN_FOOD_DIR_X, OUT_RIGHT, 1.5);
+    g.connect(IN_FOOD_DIR_X, OUT_LEFT, -1.5);
+    g.connect(IN_FOOD_DIR_Y, OUT_DOWN, 1.5);
+    g.connect(IN_FOOD_DIR_Y, OUT_UP, -1.5);
+
+    // --- 续命：暗了就往上 ------------------------------------------------
+    //
+    // 光随深度线性衰减，海底几乎是 0。只往下追食物会饿死在下面，
+    // 所以要有一条"这儿太暗了，上去"的回路。
+    //
+    // 写法是**负向抑制**而不是正向驱动：默认有一点想往上（偏置 1.2），
+    // 光越强越不往上（−3）。正面驱动会让鱼贴着水面抖——
+    // 上去一格变亮，又想上去，最后卡在水面那一行。
+    //
+    // 拐点落在光 ≈ 0.4：比这暗就开始往上。第一版写 −6（拐点在 0.08）
+    // 等于"只有快贴到海底才想起来上浮"，于是下潜觅食的鱼有去无回——
+    // 实测种群从 52 掉到 37，细胞数从 688 掉到 442。
+    g.weights[Genome::b_o(OUT_UP)] = 1.2;
+    g.connect(IN_LIGHT, OUT_UP, -3.0);
     g
 }
 
@@ -1402,6 +1611,9 @@ mod tests {
     fn energy_is_conserved_through_life_and_death() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 这条测的是能量账，不是藻席。海底长出来的藻会把"残骸格数"搅乱，
+        // 所以关掉它——不是因为它不可信，是因为它属于另一个测试。
+        sim.set_food_growth(false);
         sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 45), Genome::blank(), 120))
             .unwrap();
 
@@ -1436,6 +1648,7 @@ mod tests {
     fn an_old_organism_leaves_energy_in_its_remains() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let id = sim
             .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 300))
             .unwrap();
@@ -1825,6 +2038,7 @@ mod tests {
         // 再往前一格是石头，于是鱼吃完就停在那儿，不会游过头。
         w.set(17, 40, MaterialKind::Stone);
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         sim.spawn_injected(&mut w, swimmer((10, 40), 400)).unwrap();
 
         for _ in 0..20 {
@@ -1965,6 +2179,152 @@ mod tests {
         }
         let moved = sim.organism(id).unwrap().anchor.0;
         assert!(moved > 25, "朝右的手工鱼应当往右游，实际只走到 {moved}");
+    }
+
+    // -----------------------------------------------------------------------
+    // 藻席与嗅觉
+    // -----------------------------------------------------------------------
+
+    /// 海底会长出藻，而且是**有能量的**（鱼才愿意吃）。
+    #[test]
+    fn algae_grow_on_the_seabed_and_carry_energy() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let before = sim.audit(&w).injected;
+
+        // 两层都要推进：`grow_algae` 按 `world.tick()` 取模决定扫不扫，
+        // 只跑生命层的话 tick 永远是 0，只会扫一次。
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..600 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let food = sim.food_cells(&w);
+        assert!(food > 10, "海底应当长出成片的藻，实际 {food} 格");
+        // 每一格藻都是新注入的能量，账上必须看得到。
+        assert!(
+            sim.audit(&w).injected > before,
+            "藻的能量必须记进注入，否则守恒断言会报'多了 N 点'"
+        );
+        assert!(sim.audit(&w).is_balanced(), "长藻不能破坏能量账");
+    }
+
+    /// 藻只长在**贴着矿物**的水上，不会悬在水中间，也不会一层层往上叠。
+    #[test]
+    fn algae_only_grow_where_they_have_something_to_hold_on_to() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..600 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let (ww, h) = (w.width(), w.height());
+        let mut found = 0;
+        for y in 0..h {
+            for x in 0..ww {
+                let (xs, ys) = (x as isize, y as isize);
+                if w.get(xs, ys) != MaterialKind::Remains || w.flags(xs, ys) == 0 {
+                    continue;
+                }
+                found += 1;
+                assert!(
+                    matches!(
+                        w.get(xs, ys + 1),
+                        MaterialKind::Stone | MaterialKind::Sand | MaterialKind::Remains
+                    ),
+                    "({x}, {y}) 的藻悬在半空里，下面没有东西托着"
+                );
+            }
+        }
+        assert!(found > 0);
+    }
+
+    /// 嗅觉：闻得到水后面的食物，闻不到石头后面的。
+    #[test]
+    fn smell_goes_through_water_but_not_through_stone() {
+        let mut w = pool();
+        w.set(20, 45, MaterialKind::Remains);
+        w.set_flags(20, 45, FOOD_ENERGY as u8);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim.spawn_injected(&mut w, swimmer((20, 40), 400)).unwrap();
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+
+        let inp = sim.sense(&w, i);
+        assert!(inp[IN_FOOD_DIR_Y] > 0.1, "下方有食物，垂直分量应当为正");
+        assert!(
+            inp[IN_FOOD_DIR_X].abs() < 1e-6,
+            "食物在正下方，不该有水平分量"
+        );
+
+        // 中间隔一层石头，味道就断了。
+        w.set(20, 42, MaterialKind::Stone);
+        let inp = sim.sense(&w, i);
+        assert!(
+            inp[IN_FOOD_DIR_Y].abs() < 1e-6,
+            "石头应当挡住味道，实际垂直分量 {}",
+            inp[IN_FOOD_DIR_Y]
+        );
+    }
+
+    /// 嗅觉通道**接上了**：闻到下方有食物时，"往下"的输出确实更强。
+    ///
+    /// 这条刻意**不**断言"鱼会下潜"。第一版断言过，而且为了让它在 5 格外
+    /// 成立，把权重调到了 8.0——结果是负收益（种群 52 → 37）。
+    ///
+    /// 想清楚之后发现那是在错的层解决问题：手工基因组的职责是"会游、会吃、会生"
+    /// 这条基线，不是替进化决定"该不该觅食"。所以现在只保证通道存在且方向正确，
+    /// 权重压到和巡航偏置同一量级——**要不要用它，交给突变。**
+    #[test]
+    fn the_smell_channel_is_wired_in_the_right_direction() {
+        let mut g = handcrafted_fish_genome();
+        g.weights[Genome::b_o(OUT_REPRODUCE)] = 0.0;
+
+        let mut inputs = [0.0f32; INPUTS];
+        let quiet = g.think(&inputs);
+
+        inputs[IN_FOOD_DIR_Y] = 1.0; // 食物在下方
+        let below = g.think(&inputs);
+        assert!(
+            below[OUT_DOWN] > quiet[OUT_DOWN] + 0.05,
+            "闻到下方有食物时应当更想往下：{} vs {}",
+            below[OUT_DOWN],
+            quiet[OUT_DOWN]
+        );
+        assert!(below[OUT_UP] < quiet[OUT_UP] - 0.05, "同时应当更不想往上");
+
+        // 反方向也要对：食物在上方就反过来。
+        inputs[IN_FOOD_DIR_Y] = -1.0;
+        let above = g.think(&inputs);
+        assert!(above[OUT_UP] > quiet[OUT_UP] + 0.05, "食物在上方时想往上");
+    }
+
+    /// 在**真实地貌**里藻席也得长得出来。
+    ///
+    /// 单元测试里用 `pool()` 是平底，真实地貌有沙层、有起伏的海床、
+    /// 还有岛坡。条件写得太紧（比如只认石头）时，平底能过长、真地貌不长。
+    #[test]
+    fn algae_grow_on_the_generated_seabed() {
+        let mut w = World::new(128, 128).unwrap();
+        crate::worldgen::sea_and_islands(&mut w, &mut Rng::new(7));
+        let mut sim = LifeSim::new(&mut w);
+        let mut material = crate::sim::MaterialSim::new();
+        let before = sim.food_cells(&w);
+
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let after = sim.food_cells(&w);
+        assert!(
+            after > before + 20,
+            "真实海床上应当长出成片的藻：{before} → {after}"
+        );
+        assert!(sim.audit(&w).is_balanced());
     }
 
     // -----------------------------------------------------------------------
