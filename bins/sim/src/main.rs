@@ -198,6 +198,12 @@ struct RunStats {
     visited_sum: u64,
     moved_sum: u64,
     reacted_sum: u64,
+    /// 累计被分解掉的残骸格数。
+    ///
+    /// 这个数字必须能看见：残骸是唯一一种"生物制造、材质层消化"的材质，
+    /// 消化速度跟不上制造速度时世界会被尸体填满，而那种崩坏从
+    /// "生物数"和"能量账"上完全看不出来——两者都会是健康的。
+    decayed_sum: u64,
     workers_max: usize,
     ticks: u64,
 }
@@ -209,6 +215,7 @@ impl RunStats {
         self.visited_sum += s.visited as u64;
         self.moved_sum += s.moved as u64;
         self.reacted_sum += s.reacted as u64;
+        self.decayed_sum += s.decayed as u64;
         // 峰值而不是末值：跑到最后世界已经快静了，只剩一两块在动，
         // 那时的工人数反映不了这次运行实际用到的并行度。
         self.workers_max = self.workers_max.max(sim.workers());
@@ -345,7 +352,7 @@ fn main() -> ExitCode {
             let s = sim.stats();
             let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  飘 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -354,6 +361,7 @@ fn main() -> ExitCode {
                 s.moved,
                 s.reacted,
                 l.organisms,
+                l.stranded,
                 l.energy,
                 l.max_generation,
                 l.avg_generation,
@@ -376,8 +384,8 @@ fn main() -> ExitCode {
             stats.workers_max
         );
         println!(
-            "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次",
-            stats.visited_sum, stats.moved_sum, stats.reacted_sum
+            "  累计      访问 {} 格 · 移动 {} 次 · 反应 {} 次 · 分解残骸 {} 格",
+            stats.visited_sum, stats.moved_sum, stats.reacted_sum, stats.decayed_sum
         );
     }
     println!();
@@ -385,9 +393,29 @@ fn main() -> ExitCode {
 
     let l = life.stats();
     println!();
+    if l.stranded > 0 {
+        for o in life.organisms() {
+            let wet = o.footprint().any(|(x, y)| {
+                [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
+                    .iter()
+                    .any(|(dx, dy)| {
+                        world.get((x + dx) as isize, (y + dy) as isize) == MaterialKind::Water
+                    })
+            });
+            if !wet {
+                println!(
+                    "  [飘] id {} 锚点 {:?} 细胞 {} 能量 {}",
+                    o.id,
+                    o.anchor,
+                    o.cell_count(),
+                    o.energy
+                );
+            }
+        }
+    }
     println!(
-        "生命层  生物 {} · 细胞 {} · 能量 {} · 出生时挤没的流体 {} 格",
-        l.organisms, l.cells, l.energy, l.fluid_lost
+        "生命层  生物 {} · 细胞 {} · 能量 {} · 飘在天上的 {} 个",
+        l.organisms, l.cells, l.energy, l.stranded
     );
     println!(
         "谱系    最大代数 {} · 平均代数 {:.1} · 与初代基因距离 {:.3}",

@@ -22,7 +22,9 @@
 //! 由 [`worldgen::sea_and_islands`] 生成。这条决定见 SPEC 第 2.0 节——
 //! 它管着材质规则、并行扫描顺序和生物的运动方式。
 
+pub mod body;
 pub mod life;
+pub use body::{BodyPlan, PLANS};
 pub use life::CellType;
 pub mod life_sim;
 pub mod material;

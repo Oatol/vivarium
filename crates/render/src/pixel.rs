@@ -1387,11 +1387,29 @@ mod tests {
 
     // --- GPU（没有适配器时自动跳过） --------------------------------------
 
+    /// 把 GPU 测试串起来的全局锁。
+    ///
+    /// `cargo test` 默认多线程跑测试，于是好几个 `wgpu::Instance::new` +
+    /// `request_device` 会**同时**发生。在 DX12 的软件适配器（WARP）上这不是
+    /// 线程安全的：进程直接 `STATUS_ACCESS_VIOLATION` 退出，而且只崩整个测试
+    /// 二进制、不告诉你崩在哪个测试里——现象是"跑三遍崩两遍，单线程跑全绿"。
+    ///
+    /// 所以每个碰 wgpu 的测试第一行先 `let _gpu = gpu_lock();`，
+    /// 拿到它才能往下走。锁在测试结束时自动释放。
+    fn gpu_lock() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        // 某个 GPU 测试 panic 之后锁会中毒，但我们要的只是互斥，
+        // 不关心上一次有没有炸——所以直接取回内部值。
+        LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     /// 建一个离屏 device。返回 `None` 表示这台机器上跑不了 wgpu。
     ///
     /// 这里用 `force_fallback_adapter: true`——测试要的是"管线对不对"，
     /// 不是"显卡快不快"，软件光栅化（WARP / lavapipe）完全够用，
     /// 而且在没有独显的 CI 上也能跑。
+    ///
+    /// **调用方必须先拿 [`gpu_lock`]。** 见那个函数的注释。
     fn headless_device() -> Option<(wgpu::Device, wgpu::Queue)> {
         let instance = wgpu::Instance::default();
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
@@ -1413,6 +1431,7 @@ mod tests {
 
     #[test]
     fn gpu_pipeline_compiles_and_draws() {
+        let _gpu = gpu_lock();
         let Some((device, queue)) = headless_device() else {
             eprintln!("跳过：本机没有可用的 wgpu 适配器");
             return;
@@ -1463,6 +1482,7 @@ mod tests {
 
     #[test]
     fn gpu_blit_produces_the_palette_color() {
+        let _gpu = gpu_lock();
         let Some((device, queue)) = headless_device() else {
             eprintln!("跳过：本机没有可用的 wgpu 适配器");
             return;
@@ -1664,6 +1684,7 @@ mod tests {
 
     #[test]
     fn cells_of_one_body_fuse_instead_of_leaving_a_seam() {
+        let _gpu = gpu_lock();
         let Some((device, queue)) = headless_device() else {
             eprintln!("跳过：本机没有可用的 wgpu 适配器");
             return;
@@ -1848,6 +1869,7 @@ mod tests {
     #[test]
     #[ignore = "会写 PNG，按需手动跑"]
     fn render_preview_cells() {
+        let _gpu = gpu_lock();
         let Some((device, queue)) = headless_device() else {
             eprintln!("跳过：本机没有可用的 wgpu 适配器");
             return;
@@ -1918,6 +1940,7 @@ mod tests {
     #[test]
     #[ignore = "会写文件；需要人眼看时手动跑"]
     fn render_preview_png() {
+        let _gpu = gpu_lock();
         let Some((device, queue)) = headless_device() else {
             eprintln!("跳过：本机没有可用的 wgpu 适配器");
             return;

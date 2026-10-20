@@ -37,8 +37,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Barrier, Mutex, RwLock};
 
 use crate::material::{
-    ignite_chance, react, MaterialKind, MoveRule, FIRE_LIFETIME, REMAINS_DECAY_INTERVAL,
-    REMAINS_DECAY_PERCENT,
+    ignite_chance, react, MaterialKind, MoveRule, DRY_REMAINS_DECAY_PERCENT, FIRE_LIFETIME,
+    REMAINS_DECAY_INTERVAL, REMAINS_DECAY_PERCENT,
 };
 use crate::rng::Rng;
 use crate::world::{MaterialCell, World, CHUNK_SIZE};
@@ -766,13 +766,38 @@ impl MaterialSim {
                 // "泡在水里"不能只看四邻：残骸会堆成堆，堆内部的格子四周全是残骸，
                 // 但它们是泡在水下的，照样会烂。所以沿这一列向上找，
                 // 跳过其他残骸，遇到水就算在水下，遇到空气或固体就不算。
-                if !underwater(world, x, y) {
+                //
+                // 露在空气里的也烂，只是慢 7 倍——见 `DRY_REMAINS_DECAY_PERCENT`。
+                // 给"干的"留一个 0 概率会形成一个只进不出的吸收态。
+                let submerged = underwater(world, x, y);
+                let percent = if submerged {
+                    REMAINS_DECAY_PERCENT
+                } else {
+                    DRY_REMAINS_DECAY_PERCENT
+                };
+                if !Rng::at_percent(x, y, tick, salt::REMAINS_DECAY, percent) {
                     continue;
                 }
-                if !Rng::at_percent(x, y, tick, salt::REMAINS_DECAY, REMAINS_DECAY_PERCENT) {
-                    continue;
-                }
-                world.set(x as isize, y as isize, MaterialKind::Empty);
+                // 泡在水里的残骸烂掉之后**变回水**，不是变成空。
+                //
+                // 这一条是被一次真实的崩坏逼出来的：生物出生时会把身上的水
+                // 挤到这一列的上方（水面上升一格，见 `push_fluid_out`），
+                // 而尸体腐烂之后原来那几格变成**空**——水没有回来。
+                // 于是海底攒出一堆空气腔、水面被一路顶高：实测 512² 跑 8000 tick
+                // 水面从 y=153 涨到 y=107，四十多条鱼骑在水面上，
+                // 既不能动也不能繁殖，整个种群冻死在那里。
+                //
+                // 体积是守恒的：一格有机物烂掉，水就该回来占住这一格。
+                // 露在空气里的残骸烂掉则变成空——那里本来就没有水可还。
+                world.set(
+                    x as isize,
+                    y as isize,
+                    if submerged {
+                        MaterialKind::Water
+                    } else {
+                        MaterialKind::Empty
+                    },
+                );
                 self.stats.decayed += 1;
             }
         }
@@ -1615,21 +1640,61 @@ mod tests {
         assert_eq!(w.count_of(MaterialKind::Sand), 0, "不该变成沙");
     }
 
-    /// 干着的残骸不会烂——腐烂是水解过程。
+    /// 露在空气里的残骸也会烂，但慢得多——**不能是"永远不烂"**。
+    ///
+    /// 最初这里断言的是"干着的残骸不会烂"，理由是"腐烂是水解过程"。
+    /// 加大体型之后这条断言变成了 bug：鱼会游到水面之上的天空里
+    /// （光照越往上越亮，而空气对生物是放行的），死在那儿留下一层
+    /// 永远不烂的尸体——实测 8000 tick 堆了 4.3 万格，空位从 7 万掉到 2.7 万。
+    ///
+    /// 概率给 0 就是一个**吸收态**。慢可以，零不行。
     #[test]
-    fn dry_remains_do_not_rot() {
+    fn dry_remains_rot_much_slower_than_submerged_ones() {
         let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        w.set(30, 40, MaterialKind::Remains); // 四周是空气
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone); // 海底
+        w.fill_rect(0, 30, 64, 30, MaterialKind::Water); // 水体
+        w.fill_rect(4, 20, 24, 1, MaterialKind::Stone); // 水面之上的石台
+        w.fill_rect(4, 19, 24, 1, MaterialKind::Remains); // 24 格干残骸
+        w.fill_rect(36, 40, 24, 1, MaterialKind::Remains); // 24 格湿残骸
 
         let mut sim = MaterialSim::new();
-        for _ in 0..2000 {
+        for _ in 0..600 {
             sim.step(&mut w);
         }
 
-        // 会掉到石头上，但不会变成沙。
-        assert_eq!(w.count_of(MaterialKind::Remains), 1);
-        assert_eq!(w.count_of(MaterialKind::Sand), 0);
+        let dry = (4..28)
+            .filter(|&x| w.get(x as isize, 19) == MaterialKind::Remains)
+            .count();
+        let wet = w.count_of(MaterialKind::Remains) - dry;
+        assert!(wet <= 6, "泡在水里的残骸应当烂掉大半，还剩 {wet} 格");
+        assert!(dry >= 12, "露在空气里的残骸应当还在，只剩 {dry} 格");
+        assert_eq!(w.count_of(MaterialKind::Sand), 0, "溶解不该产生沙");
+    }
+
+    /// 一堆堆到水面之上的残骸也必须能烂掉。
+    ///
+    /// 这一条是加大体型之后才暴露出来的：三格鱼的尸体堆不到水面，
+    /// 而十四格鱼的尸体数量是它的四倍多，实测 16000 tick 后残骸占掉世界
+    /// **28.7%**，并且把空位吃光、开始挤死水。
+    ///
+    /// 猜想是"堆顶露出空气就永远不烂"，于是形成一个吸收态：
+    /// 堆越高 → 越多格子露在空气里 → 越不烂 → 堆越高。
+    #[test]
+    fn a_pile_that_reaches_above_the_waterline_still_rots() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 20, 64, 40, MaterialKind::Water);
+        // 一整列 40 格残骸，比水深（40）还高——堆完必然露出水面。
+        w.fill_rect(30, 0, 1, 60, MaterialKind::Remains);
+        assert_eq!(w.count_of(MaterialKind::Remains), 60);
+
+        let mut sim = MaterialSim::new();
+        for _ in 0..6000 {
+            sim.step(&mut w);
+        }
+
+        let left = w.count_of(MaterialKind::Remains);
+        assert!(left < 5, "堆到水面之上的残骸也必须分解，实际还剩 {left} 格");
     }
 
     #[test]

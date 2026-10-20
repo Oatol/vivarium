@@ -38,6 +38,21 @@ pub type OrganismId = u32;
 /// 能量账的**唯一汇率**，所以只在这里定义一次。
 pub const REMAINS_ENERGY: u32 = 25;
 
+/// 每格细胞的能量上限。
+///
+/// 原来是固定 1000（等于三格鱼的额度）。换手工体型之后必须按格数给，
+/// 否则大身体永远攒不到繁殖门槛——身体越大造子代越贵，而天花板钉死在
+/// 一个三格鱼的数上。
+///
+/// 350 让三格鱼的上限落在 1050，与旧的 1000 只差 5%：
+/// 老的生态测试与调参结论因此仍然可比。
+pub const MAX_ENERGY_PER_CELL: u32 = 350;
+
+/// 每格细胞在繁殖时的"造价"。
+///
+/// 67 让三格鱼算出来是 201，对上旧的 `BIRTH_ENERGY = 200`。
+pub const BIRTH_ENERGY_PER_CELL: u32 = 67;
+
 /// 细胞类型（SPEC §3.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u8)]
@@ -508,10 +523,102 @@ impl Organism {
     /// 某个细胞的绝对坐标。x 已折回世界内。
     #[inline]
     pub fn cell_at(&self, cell: &Cell) -> (i32, i32) {
+        self.cell_at_offset(self.anchor, cell.offset)
+    }
+
+    /// 偏移在某个锚点上的绝对落点。x 已折回世界内。
+    ///
+    /// 单独拆出来是因为 [`crate::life_sim::LifeSim::try_move`] 需要在**移动之前**
+    /// 用"移动之后的锚点 + 移动之后的朝向"算一遍落点：先验完再动手，
+    /// 半步移动会留下撕裂的身体。
+    #[inline]
+    pub fn cell_at_offset(&self, anchor: (i32, i32), offset: (i16, i16)) -> (i32, i32) {
         (
-            self.wrap_x(self.anchor.0 + cell.offset.0 as i32),
-            self.anchor.1 + cell.offset.1 as i32,
+            self.wrap_x(anchor.0 + self.offset_x(offset)),
+            anchor.1 + offset.1 as i32,
         )
+    }
+
+    /// 偏移的 x 分量，按当前朝向镜像。
+    ///
+    /// 体型只在 [`crate::body`] 里按"朝右"画一遍，朝左时整个身体沿 x 翻过来。
+    /// 不翻的话，一条朝左游的鱼会把嘴留在尾巴那一侧——三格身体时看不出来，
+    /// 十几格时一眼就是错的。
+    ///
+    /// 镜像**不单独存一个字段**，而是从 `facing.x` 现算：存一份就必然有
+    /// 一处忘了同步，而"身体位置和朝向不一致"这种 bug 从画面上看像是穿模。
+    #[inline]
+    pub fn offset_x(&self, offset: (i16, i16)) -> i32 {
+        Self::offset_x_for(self.facing, offset)
+    }
+
+    /// [`Self::offset_x`] 的静态版本，给"算一个**未来**朝向下的落点"用。
+    ///
+    /// 掉头时必须在动手之前就把新朝向的落点全验一遍，而那时候有机体本身
+    /// 的朝向还是旧的。克隆一份有机体来改朝向是能算，但一次移动克隆一整个
+    /// 基因组实在没必要。
+    #[inline]
+    pub const fn offset_x_for(facing: Facing, offset: (i16, i16)) -> i32 {
+        if facing.x < 0 {
+            -(offset.0 as i32)
+        } else {
+            offset.0 as i32
+        }
+    }
+
+    /// 身体在某个方向上最远的那一格，再往外一格。
+    ///
+    /// 这是"感知探针"该有的样子。用 `anchor ± 1` 是错的：三格鱼的身体
+    /// 本来就占住锚点右侧，于是"右边被挡"恒为真——手工鱼因此一直在往左游，
+    /// 只是因为它同时也在撞左墙，才看起来像在正常游动。
+    ///
+    /// 十几格的身体更不可能靠锚点判断：墙可能离锚点四五格远，
+    /// 探针不贴到身体表面就永远看不见它。
+    pub fn probe(&self, dx: i32, dy: i32) -> (i32, i32) {
+        let mut best = self.anchor;
+        let mut best_proj = i32::MIN;
+        for cell in &self.cells {
+            // 投影用相对偏移算，不用绝对坐标：水平环绕会让左右边界的两格
+            // 在绝对坐标上贴在一起，比大小就没有意义了。
+            let proj = self.offset_x(cell.offset) * dx + cell.offset.1 as i32 * dy;
+            if proj > best_proj {
+                best_proj = proj;
+                best = self.cell_at(cell);
+            }
+        }
+        (self.wrap_x(best.0 + dx), best.1 + dy)
+    }
+
+    /// 朝向前方那一格（贴着身体，不是贴着锚点）。x 已折回世界内。
+    #[inline]
+    pub fn front(&self) -> (i32, i32) {
+        self.probe(self.facing.x as i32, self.facing.y as i32)
+    }
+
+    /// 能量上限：按细胞数算。
+    ///
+    /// 固定 1000 会让"大身体"没法繁殖——身体越大，造一个子代越贵，
+    /// 而固定上限把攒钱的天花板钉死了。按格数给额度之后，
+    /// **大身体必须真的活得更久才生得起**，这才是体型该有的代价。
+    #[inline]
+    pub fn max_energy(&self) -> u32 {
+        MAX_ENERGY_PER_CELL * self.cells.len().max(1) as u32
+    }
+
+    /// 造一个子代要多少能量（子代出生时携带的部分）。
+    #[inline]
+    pub fn birth_energy(&self) -> u32 {
+        BIRTH_ENERGY_PER_CELL * self.cells.len().max(1) as u32
+    }
+
+    /// 繁殖门槛：攒到这个数才分裂。
+    ///
+    /// 是子代造价的 **两倍**，也就是"生完还剩一半"。这个比例是从三格鱼的
+    /// 旧常数（400 / 200）原样继承的——它已经被几千 tick 的生态测试调过，
+    /// 没有理由在换体型的时候顺手改掉。
+    #[inline]
+    pub fn reproduction_energy(&self) -> u32 {
+        self.birth_energy() * 2
     }
 
     /// 全身的绝对坐标。
@@ -529,15 +636,6 @@ impl Organism {
     #[inline]
     pub fn count(&self, kind: CellType) -> usize {
         self.cells.iter().filter(|c| c.kind == kind).count()
-    }
-
-    /// 朝向前方那一格的绝对坐标。x 已折回世界内。
-    #[inline]
-    pub fn front(&self) -> (i32, i32) {
-        (
-            self.wrap_x(self.anchor.0 + self.facing.x as i32),
-            self.anchor.1 + self.facing.y as i32,
-        )
     }
 
     /// 把身体写进占格表。调用方保证这些格子当前无主。
@@ -691,6 +789,73 @@ mod tests {
         );
         let spots: Vec<_> = org.footprint().collect();
         assert_eq!(spots, vec![(10, 20), (11, 20), (9, 19)]);
-        assert_eq!(org.front(), (11, 20), "朝右时前方是锚点右侧一格");
+        // 前方是**贴着身体**再往外一格，不是锚点右侧一格。
+        //
+        // 老实现返回 (11, 20)，而那正是嘴自己的格子——于是 `passable` 判它被占，
+        // "前方被挡"恒为真。三格鱼因此一直在往左游，只是因为撞到左墙会反向，
+        // 看起来像在正常游动，没人发现。
+        assert_eq!(org.front(), (12, 20), "前方是嘴再往外一格");
+    }
+
+    #[test]
+    fn the_body_mirrors_when_the_organism_turns_around() {
+        // 体型只按"朝右"画一遍，朝左时整个身体沿 x 翻过来。
+        // 不翻的话，一条朝左游的鱼会把嘴留在尾巴那一侧。
+        let mut org = Organism::new(
+            1,
+            (10, 20),
+            vec![
+                Cell::new(CellType::Mover, (-1, 0)),
+                Cell::new(CellType::Mouth, (2, 0)),
+            ],
+            Genome::blank(),
+        );
+        assert_eq!(org.footprint().collect::<Vec<_>>(), vec![(9, 20), (12, 20)]);
+        assert_eq!(org.front(), (13, 20));
+
+        org.facing = Facing { x: -1, y: 0 };
+        assert_eq!(
+            org.footprint().collect::<Vec<_>>(),
+            vec![(11, 20), (8, 20)],
+            "朝左时身体必须沿 x 镜像"
+        );
+        assert_eq!(org.front(), (7, 20), "嘴翻到左边，前方也要跟着翻");
+    }
+
+    #[test]
+    fn energy_budget_scales_with_the_body() {
+        // 固定上限会让大身体永远攒不到繁殖门槛——体型变大在规则层面被禁止。
+        let small = Organism::new(
+            1,
+            (0, 0),
+            vec![Cell::new(CellType::Mover, (0, 0))],
+            Genome::blank(),
+        );
+        let big = Organism::new(
+            2,
+            (0, 0),
+            vec![
+                Cell::new(CellType::Mover, (0, 0)),
+                Cell::new(CellType::Producer, (0, -1)),
+                Cell::new(CellType::Producer, (0, 1)),
+            ],
+            Genome::blank(),
+        );
+        assert_eq!(big.max_energy(), small.max_energy() * 3);
+        assert_eq!(big.reproduction_energy(), big.birth_energy() * 2);
+        // 三格鱼应当落在旧的 1000 / 400 / 200 附近，老调参结论才仍然可比。
+        let fish = Organism::new(
+            3,
+            (0, 0),
+            vec![
+                Cell::new(CellType::Mover, (0, 0)),
+                Cell::new(CellType::Mouth, (1, 0)),
+                Cell::new(CellType::Producer, (0, -1)),
+            ],
+            Genome::blank(),
+        );
+        assert!((fish.max_energy() as i32 - 1000).abs() <= 50);
+        assert!((fish.reproduction_energy() as i32 - 400).abs() <= 10);
+        assert!((fish.birth_energy() as i32 - 200).abs() <= 10);
     }
 }
