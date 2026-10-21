@@ -23,6 +23,8 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
+use vivarium_core::{palette, CellType};
+
 use crate::theme;
 
 /// 按钮的三种视觉状态。分开成一个枚举，是因为"按下"和"选中"长得不一样：
@@ -524,4 +526,268 @@ pub fn vline(ui: &mut Ui) {
         [rect.center_top(), rect.center_bottom()],
         Stroke::new(1.0, theme::LINE),
     );
+}
+
+// ---------------------------------------------------------------------------
+// 检查器专用：缩略图、条形、权重矩阵
+// ---------------------------------------------------------------------------
+
+/// 身体缩略图：把 `(dx, dy, 细胞类型)` 画成一片小方块。
+///
+/// ## 为什么不用纹理
+///
+/// 世界里的鱼是着色器画的（圆角、膜、按格心打光）。缩略图**故意不复制那套**：
+/// 这里要回答的是"它的形状是什么"，不是"它长什么样"。方块阵列在小尺寸下
+/// 更清楚——一颗 3px 的圆看不出是圆的，一个 3px 的方块一眼就是个格子。
+///
+/// 坐标系与世界一致：`+x` 向右、`+y` 向下，锚点用一圈亮框标出来
+/// （锚点不是装饰：感知深度、拥挤判定都用它）。
+pub fn thumbnail(ui: &mut Ui, height: f32, shape: &[(i16, i16, u8)]) -> Response {
+    let (rect, resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
+    p.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, theme::LINE),
+        StrokeKind::Inside,
+    );
+
+    if shape.is_empty() {
+        return resp;
+    }
+
+    // 包围盒。
+    let (mut min_x, mut max_x, mut min_y, mut max_y) = (i16::MAX, i16::MIN, i16::MAX, i16::MIN);
+    for &(x, y, _) in shape {
+        min_x = min_x.min(x);
+        max_x = max_x.max(x);
+        min_y = min_y.min(y);
+        max_y = max_y.max(y);
+    }
+    let (bw, bh) = ((max_x - min_x + 1) as f32, (max_y - min_y + 1) as f32);
+
+    // 每格边长：留 6px 边距，且不超过 14px——再大就变成"一张图"而不是"一个图标"。
+    let cell = ((rect.height() - 12.0) / bh)
+        .min((rect.width() - 12.0) / bw)
+        .clamp(1.0, 14.0);
+    let grid = Vec2::new(bw * cell, bh * cell);
+    let origin = rect.center() - grid * 0.5;
+
+    for &(x, y, kind) in shape {
+        // `x` 已经由主循环按朝向镜像过，这里不再翻——镜像只有一份实现。
+        let px = origin.x + (x - min_x) as f32 * cell;
+        let py = origin.y + (y - min_y) as f32 * cell;
+        let c = CellType::from_u8(kind);
+        let [r, g, b] = palette::cell_rgb(c);
+        let body = Rect::from_min_size(egui::pos2(px, py), Vec2::splat((cell - 1.0).max(1.0)));
+        p.rect_filled(body, CornerRadius::ZERO, Color32::from_rgb(r, g, b));
+        // 锚点：(0,0) 那一格描一圈白边。
+        if x == 0 && y == 0 {
+            p.rect_stroke(
+                body,
+                CornerRadius::ZERO,
+                Stroke::new(1.0, Color32::WHITE),
+                StrokeKind::Outside,
+            );
+        }
+    }
+
+    resp
+}
+
+/// 一行 "标签 · 条形 · 数值"。
+///
+/// 输入 / 输出那两栏用它。条形的**零点在中间**（`signed`），因为神经网络的
+/// 输入有正有负（方向分量 −1..+1），而从左边长的条看不出负号。
+pub fn bar_row(ui: &mut Ui, label: &str, value: f32, signed: bool, ink: Color32) {
+    let h = 13.0;
+    let (rect, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
+    let p = ui.painter();
+
+    let label_w = 52.0;
+    let value_w = 34.0;
+    p.text(
+        egui::pos2(rect.left(), rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(10.0, egui::FontFamily::Proportional),
+        theme::TEXT_DIM,
+    );
+
+    let track = Rect::from_min_max(
+        egui::pos2(rect.left() + label_w, rect.center().y - 2.0),
+        egui::pos2(rect.right() - value_w, rect.center().y + 2.0),
+    );
+    p.rect_filled(track, CornerRadius::ZERO, theme::SUNKEN);
+
+    let v = value.clamp(-1.0, 1.0);
+    if signed {
+        // 从中间往两边长。
+        let mid = track.center().x;
+        let half = track.width() * 0.5;
+        let bar = Rect::from_min_max(
+            egui::pos2(mid.min(mid + v * half), track.top()),
+            egui::pos2(mid.max(mid + v * half), track.bottom()),
+        );
+        p.rect_filled(bar, CornerRadius::ZERO, ink);
+        p.line_segment(
+            [
+                egui::pos2(mid, track.top()),
+                egui::pos2(mid, track.bottom()),
+            ],
+            Stroke::new(1.0, theme::LINE),
+        );
+    } else {
+        let bar = Rect::from_min_max(
+            track.min,
+            egui::pos2(track.left() + track.width() * v.max(0.0), track.bottom()),
+        );
+        p.rect_filled(bar, CornerRadius::ZERO, ink);
+    }
+
+    p.text(
+        egui::pos2(rect.right(), rect.center().y),
+        Align2::RIGHT_CENTER,
+        format!("{value:+.2}"),
+        FontId::new(10.0, egui::FontFamily::Monospace),
+        if v.abs() < 0.02 {
+            theme::TEXT_FAINT
+        } else {
+            ink
+        },
+    );
+}
+
+/// 一路输入的竖直条带：17 路并排，零点在中间。
+///
+/// ## 为什么是竖条，不是 17 行横条
+///
+/// 横条每行要占 13px，17 行就是 221px——检查器一屏只有六百多像素，
+/// 光输入就吃掉三分之一。而"感知"这个信息的关键是**哪几路在动**，
+/// 那是一个整体形状，不是 17 个独立读数。
+///
+/// 竖着排之后它变成一张 46px 高的"频谱"：一眼扫过去就知道
+/// 这个身体此刻被哪几路输入占满了。要看具体数值就悬停。
+///
+/// 每根条自己带 tooltip，所以"第 13 根是什么"不需要另找图例。
+pub fn input_strip(ui: &mut Ui, values: &[f32], names: &[&str]) -> Response {
+    let h = 46.0;
+    let (rect, resp) = ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::hover());
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
+
+    let n = values.len().max(1);
+    let slot = rect.width() / n as f32;
+    let bar_w = (slot - 2.0).max(1.0);
+    let mid = rect.center().y;
+    let half = rect.height() * 0.5 - 2.0;
+
+    for (i, &v) in values.iter().enumerate() {
+        let v = v.clamp(-1.0, 1.0);
+        let x = rect.left() + i as f32 * slot + 1.0;
+        let top = if v >= 0.0 { mid - v * half } else { mid };
+        let bot = if v >= 0.0 { mid } else { mid - v * half };
+        let color = if v >= 0.0 { theme::INFO } else { theme::DANGER };
+        let bar = Rect::from_min_max(
+            egui::pos2(x, top),
+            egui::pos2(x + bar_w, bot.max(top + 0.5)),
+        );
+        // 零值的条只画一条 1px 的底线，免得 17 根全黑看不出"这里有 17 路"。
+        if v.abs() < 0.02 {
+            p.rect_filled(
+                Rect::from_min_max(egui::pos2(x, mid - 0.5), egui::pos2(x + bar_w, mid + 0.5)),
+                CornerRadius::ZERO,
+                theme::LINE,
+            );
+        } else {
+            p.rect_filled(bar, CornerRadius::ZERO, color);
+        }
+    }
+
+    // 中线：正负的分界。
+    p.line_segment(
+        [egui::pos2(rect.left(), mid), egui::pos2(rect.right(), mid)],
+        Stroke::new(1.0, theme::LINE),
+    );
+    p.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, theme::LINE),
+        StrokeKind::Inside,
+    );
+
+    // 逐段悬停提示。分开分配 17 个 `Sense::hover()` 的小矩形，
+    // 因为 egui 的 tooltip 是挂在具体矩形上的——整块一个 tooltip
+    // 只能显示"这是输入"，那等于没有。
+    let mut hovered: Option<usize> = None;
+    for (i, _) in values.iter().enumerate() {
+        let x = rect.left() + i as f32 * slot;
+        let r = Rect::from_min_size(egui::pos2(x, rect.top()), Vec2::new(slot, rect.height()));
+        if ui.rect_contains_pointer(r) {
+            hovered = Some(i);
+        }
+    }
+    let resp = match hovered {
+        Some(i) if i < names.len() => resp.on_hover_text(format!(
+            "{}：{:+.2}",
+            names[i],
+            values.get(i).copied().unwrap_or(0.0)
+        )),
+        _ => resp,
+    };
+    resp
+}
+
+/// 权重矩阵热力图：行是输入、列是输出。
+///
+/// 为什么是矩阵而不是"画一张网络图"：17×6 的连线画出来是一团毛线，
+/// 而且连线长度、弯曲、交叉全都在骗人。矩阵把每个权重放在**固定位置**，
+/// 扫一眼就能看出"哪一行全亮"（这一路输入接了好几个输出）。
+///
+/// 颜色只用两种：正权重绿、负权重红，亮度按 `|w| / 8`（权重上限是 ±8）。
+/// 不用彩虹色是因为"正负"才是权重的语义，大小只是程度。
+pub fn weight_matrix(ui: &mut Ui, rows: usize, cols: usize, weights: &[f32]) -> Response {
+    let cell = 7.0;
+    let gap = 1.0;
+    let size = Vec2::new(
+        cols as f32 * (cell + gap) - gap,
+        rows as f32 * (cell + gap) - gap,
+    );
+    let (rect, resp) = ui.allocate_exact_size(
+        Vec2::new(ui.available_width(), size.y + 2.0),
+        Sense::hover(),
+    );
+    let p = ui.painter();
+    let origin = egui::pos2(rect.left(), rect.top() + 1.0);
+
+    for r in 0..rows {
+        for c in 0..cols {
+            let w = weights.get(r * cols + c).copied().unwrap_or(0.0);
+            let t = (w.abs() / 8.0).clamp(0.0, 1.0);
+            let color = if w >= 0.0 {
+                // 正权重：从底色渐亮到强调绿。
+                lerp_color(theme::SUNKEN, theme::ACCENT, t)
+            } else {
+                lerp_color(theme::SUNKEN, theme::DANGER, t)
+            };
+            let q = Rect::from_min_size(
+                egui::pos2(
+                    origin.x + c as f32 * (cell + gap),
+                    origin.y + r as f32 * (cell + gap),
+                ),
+                Vec2::splat(cell),
+            );
+            p.rect_filled(q, CornerRadius::ZERO, color);
+        }
+    }
+    resp
+}
+
+/// 两个颜色之间线性插值。`t = 0` 取 `a`，`t = 1` 取 `b`。
+fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
+    let t = t.clamp(0.0, 1.0);
+    let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
 }

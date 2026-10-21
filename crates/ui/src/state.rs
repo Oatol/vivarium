@@ -23,26 +23,23 @@ use vivarium_core::{CellType, MaterialKind, OrganismId, TimeScale};
 
 /// 左栏的工具。
 ///
-/// 这一组是照着 TPT 的工具栏定的——它用二十年证明了这几个工具就够
-/// 玩一个元胞世界：画、擦、框、线、填、吸、看。
+/// 这一组照着 TPT 的工具栏定：画、擦、填、吸、看。
 ///
-/// 现在只有"选中"这件事是真的，落到世界上的笔刷还没接
-/// （见 README「界面骨架」）。**先把形状钉死**，是因为工具的集合
-/// 决定了主循环要暴露哪些输入，反过来做会一直改主循环。
+/// ## 为什么没有矩形和直线
+///
+/// 它们需要"按下 → 拖动 → 松开"三段式，而**拖拽现在是平移视野**。
+/// 两个功能抢同一个手势，结果一定是一方误触。等有了修饰键
+/// （Shift + 拖）再回来加，那时它们才有地方放。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Tool {
-    /// 画。
+    /// 画：把当前材质涂成一片圆。
     #[default]
     Brush,
-    /// 擦。
+    /// 擦：把格子清成空。
     Eraser,
-    /// 矩形框。
-    Rect,
-    /// 直线。
-    Line,
-    /// 油漆桶。
+    /// 油漆桶：把连成一片的同种材质换掉。
     Fill,
-    /// 取样：点哪儿就选中那种材质 / 细胞。
+    /// 取样：点哪儿就把那格的材质设为当前材质。
     Pick,
     /// 检查器：点生物看它的内部。
     Inspect,
@@ -50,11 +47,9 @@ pub enum Tool {
 
 impl Tool {
     /// 全部工具，按左栏从上到下的顺序。
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 5] = [
         Self::Brush,
         Self::Eraser,
-        Self::Rect,
-        Self::Line,
         Self::Fill,
         Self::Pick,
         Self::Inspect,
@@ -65,8 +60,6 @@ impl Tool {
         match self {
             Self::Brush => "画笔",
             Self::Eraser => "橡皮",
-            Self::Rect => "矩形",
-            Self::Line => "直线",
             Self::Fill => "填充",
             Self::Pick => "取样",
             Self::Inspect => "检查",
@@ -78,12 +71,18 @@ impl Tool {
         match self {
             Self::Brush => 'B',
             Self::Eraser => 'E',
-            Self::Rect => 'R',
-            Self::Line => 'L',
             Self::Fill => 'F',
             Self::Pick => 'I',
             Self::Inspect => 'Q',
         }
+    }
+
+    /// 这个工具会不会往世界里落笔。
+    ///
+    /// 检查与取样只读。主循环用它决定"按住左键拖动时要不要连续落笔"——
+    /// 检查工具如果也落笔，用户想点开一条鱼看看，会顺手把它周围的水涂掉。
+    pub const fn paints(self) -> bool {
+        matches!(self, Self::Brush | Self::Eraser | Self::Fill)
     }
 }
 
@@ -255,16 +254,44 @@ pub struct SelectedOrganism {
     pub anchor: (i32, i32),
     /// 能量。
     pub energy: u32,
+    /// 能量上限。
+    pub max_energy: u32,
     /// 年龄 / 寿数。
     pub age: (u32, u32),
     /// 速度（每 tick 走几格）。
     pub speed: i32,
     /// 嗅觉半径。
     pub smell: i32,
+    /// 每 tick 的维持成本。
+    pub upkeep: u32,
+    /// 每走一格的能量成本。
+    pub move_cost: u32,
+    /// 身体质量。
+    pub mass: u32,
     /// 细胞构成：每种类型几格。
     pub cells: [usize; CellType::COUNT],
     /// 世系深度。
     pub generation: u32,
+    /// 亲代编号。`None` = 投放进来的初代。
+    pub parent: Option<OrganismId>,
+    /// 身体形状：`(dx, dy, 细胞类型)`，**已经按朝向镜像过**。
+    ///
+    /// 镜像放在主循环做，不放在界面：界面要是自己按 `facing` 翻一遍，
+    /// 就和渲染层各写了一份镜像规则——两份规则迟早会不一致，
+    /// 而"缩略图和世界里的鱼左右相反"这种 bug 看半天也想不到。
+    pub shape: Vec<(i16, i16, u8)>,
+    /// 能量走势（0..1，右端是当前）。
+    pub energy_trace: Vec<f32>,
+    /// 上一次决策：17 路输入。
+    pub inputs: [f32; 17],
+    /// 上一次决策：6 路输出。
+    pub outputs: [f32; 6],
+    /// 行为网络的**直连**权重矩阵（`17 × 6`，行优先）。
+    ///
+    /// 只带直连这一层，不带隐藏层：直连是"看到什么就做什么"那一层，
+    /// 手工基因组里真正在干活的就是它。隐藏层有 17×8 + 8×6 个数，
+    /// 画出来是一团噪声，而噪声不构成信息。
+    pub direct: Vec<f32>,
 }
 
 // ---------------------------------------------------------------------------

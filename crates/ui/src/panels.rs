@@ -63,7 +63,43 @@ pub fn draw(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) -> egui::Rect {
     if state.show_inspector {
         inspector(ui, state, snap);
     }
-    ui.available_rect_before_wrap()
+    let central = ui.available_rect_before_wrap();
+    brush_cursor(ui, state, snap, central);
+    central
+}
+
+/// 画笔预览：在指针位置画一个圈，半径就是笔刷半径。
+///
+/// 没有它，落笔之前你不知道自己会画多大一片——而"多涂了三格水"
+/// 和"少涂了三格"在画面上都不明显，只有能量账知道。
+///
+/// 圈画在**中央矩形之内**才显示：指针在面板上时，它下面根本没有世界。
+fn brush_cursor(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::Rect) {
+    if !state.tool.paints() {
+        return;
+    }
+    let Some(pos) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    if !central.contains(pos) {
+        return;
+    }
+    let r = state.brush as f32 * snap.pixels_per_cell.max(0.5);
+    let p = ui.painter();
+    // 两层：外圈用亮色（在任何材质上都看得见），内圈用暗色衬底，
+    // 免得落在浅色的沙子上时整个圈消失。
+    p.circle_stroke(pos, r, Stroke::new(1.0, Color32::from_black_alpha(160)));
+    p.circle_stroke(pos, r.max(1.0), Stroke::new(1.0, Color32::WHITE));
+    // 中心一个小十字，标出"真正落笔的那一格"。
+    let c = 3.0;
+    p.line_segment(
+        [egui::pos2(pos.x - c, pos.y), egui::pos2(pos.x + c, pos.y)],
+        Stroke::new(1.0, Color32::WHITE),
+    );
+    p.line_segment(
+        [egui::pos2(pos.x, pos.y - c), egui::pos2(pos.x, pos.y + c)],
+        Stroke::new(1.0, Color32::WHITE),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -289,8 +325,6 @@ fn tool_strip(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                 let icon = match tool {
                     Tool::Brush => Icon::Brush,
                     Tool::Eraser => Icon::Eraser,
-                    Tool::Rect => Icon::Rect,
-                    Tool::Line => Icon::Line,
                     Tool::Fill => Icon::Fill,
                     Tool::Pick => Icon::Pick,
                     Tool::Inspect => Icon::Inspect,
@@ -401,22 +435,27 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                 vsep(ui);
                 ui.add_space(6.0);
 
-                // --- 细胞 ---
+                // --- 细胞：只读图例 ---
+                //
+                // 这一排**点不动**，是图例不是按钮。细胞的颜色是一套语言
+                // （世界里哪一格是什么颜色就是什么细胞），界面必须把它写出来，
+                // 否则"右边那个橙红色的是什么"永远没人知道。
+                //
+                // 但"往世界里放细胞"不该做成画笔：细胞属于某个有机体，
+                // 单独丢一格进去是一个没有身体的怪东西。投放请用「放鱼」。
                 caption(ui, "细胞");
                 for kind in CellType::ALL {
                     let [r, g, b] = palette::cell_rgb(kind);
-                    if widgets::swatch(
+                    let resp = widgets::swatch(
                         ui,
                         Color32::from_rgb(r, g, b),
                         cell_label(kind),
                         Some(cell_hint(kind)),
-                        state.cell == kind,
-                    )
-                    .clicked()
-                    {
-                        state.cell = kind;
-                        state.emit(Command::SetCell(kind));
-                    }
+                        false,
+                    );
+                    // 悬停才提示，点击什么也不做——用 `on_hover_text` 已经给了提示，
+                    // 这里只要把它标成"非交互"就够了。
+                    let _ = resp;
                 }
 
                 // --- 右侧：笔刷 ---
@@ -524,6 +563,24 @@ fn inspector(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                 .show(ui, |ui| {
                     ui.spacing_mut().item_spacing.y = 1.0;
 
+                    // **选中排在最上面。** 它是最"交互"的那一块：点了鱼，
+                    // 眼睛就在那一处。放到最下面的话，点完得先滚一段才看得到，
+                    // 而"点了没反应"是所有界面里最劝退的一种。
+                    widgets::section(ui, "选中");
+                    match &snap.selected {
+                        Some(sel) => selected_body(ui, state, sel),
+                        None => {
+                            ui.add_space(2.0);
+                            ui.label(
+                                egui::RichText::new("用「检查」工具点世界里的生物")
+                                    .size(10.0)
+                                    .color(theme::TEXT_FAINT),
+                            );
+                            ui.add_space(2.0);
+                        }
+                    }
+
+                    ui.add_space(6.0);
                     widgets::section(ui, "生态");
                     widgets::stat_row(ui, "生物", &snap.organisms.to_string(), theme::TEXT);
                     widgets::stat_row(ui, "细胞", &snap.cells.to_string(), theme::TEXT);
@@ -591,21 +648,6 @@ fn inspector(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                         }
                         census_row(ui, kind, snap.census[kind.as_u8() as usize]);
                     }
-
-                    ui.add_space(8.0);
-                    widgets::section(ui, "选中");
-                    match &snap.selected {
-                        Some(sel) => selected_body(ui, state, sel),
-                        None => {
-                            ui.add_space(2.0);
-                            ui.label(
-                                egui::RichText::new("用「检查」工具点世界里的生物")
-                                    .size(10.0)
-                                    .color(theme::TEXT_FAINT),
-                            );
-                            ui.add_space(2.0);
-                        }
-                    }
                 });
         });
     let r = ui.max_rect();
@@ -663,7 +705,15 @@ fn census_row(ui: &mut Ui, kind: MaterialKind, count: usize) {
     );
 }
 
-/// 选中个体的详情。
+/// 选中个体的详情：形态、收支、感知、决策、权重。
+///
+/// 五段是照着"看一个个体"的顺序排的：
+///
+/// 1. **它是什么**（编号、坐标、缩略图）——先认出来是谁；
+/// 2. **它过得怎么样**（能量、年龄、收支、走势）——再看状态；
+/// 3. **它长什么样**（细胞构成）——形状决定能力；
+/// 4. **它此刻在想什么**（17 路输入、6 路输出）——这一帧的决策；
+/// 5. **它为什么这么想**（权重矩阵）——把"想"落到数字上。
 fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
     ui.add_space(2.0);
     ui.horizontal(|ui| {
@@ -687,36 +737,74 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
         });
     });
 
-    widgets::stat_row(ui, "能量", &sel.energy.to_string(), theme::ACCENT);
+    // --- 形态 -------------------------------------------------------------
+    //
+    // 缩略图放在最上面，因为它回答的是"这是谁"。一行数字回答不了这个问题：
+    // 10 格的银鱼和 10 格的掠食者，从数字上看只差"嘴 2 / 杀手 2"。
+    widgets::thumbnail(ui, 62.0, &sel.shape);
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(format!(
+            "{} 格 · 质量 {} · 第 {} 代{}",
+            sel.shape.len(),
+            sel.mass,
+            sel.generation,
+            match sel.parent {
+                Some(p) => format!(" · 亲代 #{p}"),
+                None => " · 初代".to_owned(),
+            }
+        ))
+        .size(9.5)
+        .color(theme::TEXT_FAINT),
+    );
+
+    // --- 收支 -------------------------------------------------------------
+    ui.add_space(4.0);
+    widgets::section(ui, "收支");
+    let energy_frac = sel.energy as f32 / sel.max_energy.max(1) as f32;
+    widgets::stat_row(
+        ui,
+        "能量",
+        &format!("{} / {}", sel.energy, sel.max_energy),
+        if energy_frac < 0.25 {
+            theme::WARN
+        } else {
+            theme::ACCENT
+        },
+    );
     widgets::stat_row(
         ui,
         "年龄",
         &format!("{}/{}", sel.age.0, sel.age.1),
         theme::TEXT,
     );
-    widgets::stat_row(ui, "速度", &format!("{} 格/tick", sel.speed), theme::TEXT);
-    widgets::stat_row(ui, "嗅觉", &format!("{} 格", sel.smell), theme::TEXT);
+    widgets::stat_row(ui, "维持", &format!("{}/tick", sel.upkeep), theme::TEXT_DIM);
     widgets::stat_row(
         ui,
-        "世系",
-        &format!("第 {} 代", sel.generation),
+        "移动",
+        &format!("{}/格 ×{}", sel.move_cost, sel.speed),
         theme::TEXT_DIM,
     );
+    widgets::stat_row(ui, "速度", &format!("{} 格/tick", sel.speed), theme::TEXT);
+    widgets::stat_row(ui, "嗅觉", &format!("{} 格", sel.smell), theme::TEXT);
 
-    ui.add_space(4.0);
+    // 能量走势：和"当前能量"是两件事——一个说现在多少，一个说在涨还是在跌。
+    ui.add_space(3.0);
+    widgets::sparkline(ui, 26.0, &sel.energy_trace, theme::ACCENT);
+    ui.add_space(1.0);
     ui.label(
-        egui::RichText::new("细胞构成")
+        egui::RichText::new("能量走势（右端为当前）")
             .size(9.0)
             .color(theme::TEXT_FAINT),
     );
-    // 一排色块，宽度按格数成比例。
-    //
-    // 用**条**而不是列表：身体构成的关键信息是"哪几类占大头"，
-    // 一眼扫过去就该知道，数格子是次要的。
+
+    // --- 细胞构成 ---------------------------------------------------------
+    ui.add_space(4.0);
+    widgets::section(ui, "细胞构成");
     let total: usize = sel.cells.iter().sum();
     if total > 0 {
         let (rect, _) =
-            ui.allocate_exact_size(egui::vec2(ui.available_width(), 12.0), egui::Sense::hover());
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
         let mut x = rect.left();
@@ -743,8 +831,7 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             egui::StrokeKind::Inside,
         );
     }
-
-    // 逐类列出格数，只列有的。
+    // 逐类列出格数，只列有的。一行一条，右边是数量。
     for kind in CellType::ALL {
         let n = sel.cells[kind.as_u8() as usize];
         if n == 0 {
@@ -755,7 +842,7 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
         let p = ui.painter();
         p.text(
-            egui::pos2(rect.left() + 6.0, rect.center().y),
+            egui::pos2(rect.left() + 4.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
             cell_label(kind),
             egui::FontId::new(theme::TEXT_SIZE, egui::FontFamily::Proportional),
@@ -768,6 +855,118 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             egui::FontId::new(theme::MONO_SIZE, egui::FontFamily::Monospace),
             theme::TEXT_DIM,
         );
+    }
+
+    // --- 感知 -------------------------------------------------------------
+    //
+    // 17 路画成一条竖带，不是 17 行横条：横条要吃掉 221px，
+    // 而这里真正要看的是"哪几路在动"——那是一个整体形状。
+    ui.add_space(4.0);
+    widgets::section(ui, "感知（17 路输入）");
+    widgets::input_strip(ui, &sel.inputs, &INPUT_NAMES);
+    // 把非零的那几路写成一行。竖带看得见"有没有"，这一行说得出"是什么"。
+    let mut active: Vec<&str> = Vec::new();
+    for (i, name) in INPUT_NAMES.iter().enumerate() {
+        if sel.inputs[i].abs() >= 0.05 {
+            active.push(name);
+        }
+    }
+    ui.label(
+        egui::RichText::new(if active.is_empty() {
+            "（一片安静）".to_owned()
+        } else {
+            active.join(" · ")
+        })
+        .size(9.5)
+        .color(theme::TEXT_FAINT),
+    );
+
+    // --- 决策 -------------------------------------------------------------
+    ui.add_space(4.0);
+    widgets::section(ui, "决策（输出）");
+    for (i, name) in OUTPUT_NAMES.iter().enumerate() {
+        let v = sel.outputs[i];
+        let ink = if i < 4 {
+            theme::ACCENT
+        } else if i == 4 {
+            theme::WARN
+        } else {
+            theme::INFO
+        };
+        widgets::bar_row(ui, name, v, true, ink);
+    }
+    ui.add_space(2.0);
+    ui.label(
+        egui::RichText::new(format!("本 tick：{}", action_of(&sel.outputs)))
+            .size(10.0)
+            .color(theme::TEXT),
+    );
+
+    // --- 权重 -------------------------------------------------------------
+    ui.add_space(4.0);
+    widgets::section(ui, "行为网络（直连权重）");
+    ui.label(
+        egui::RichText::new("行 = 输入，列 = 输出；绿正红负")
+            .size(9.0)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(2.0);
+    widgets::weight_matrix(ui, INPUT_NAMES.len(), OUTPUT_NAMES.len(), &sel.direct);
+}
+
+/// 17 路输入的中文名，顺序与 `life::IN_*` 一致。
+///
+/// 单独一张表而不是给每个常量加名字：这些名字是**给人看的**，
+/// 而且必须能在 52px 里放下——核心里那些常量名（`IN_FOOD_DIR_X`）
+/// 是给代码看的，两者用途不同。
+const INPUT_NAMES: [&str; 17] = [
+    "前有食物",
+    "前被挡",
+    "前有同类",
+    "前有异类",
+    "左被挡",
+    "右被挡",
+    "上被挡",
+    "下方支撑",
+    "能量",
+    "年龄",
+    "朝向 x",
+    "朝向 y",
+    "光照",
+    "食物 x",
+    "食物 y",
+    "生物 x",
+    "生物 y",
+];
+
+/// 6 路输出的中文名，顺序与 `life::OUT_*` 一致。
+const OUTPUT_NAMES: [&str; 6] = ["左", "右", "上", "下", "吃", "生"];
+
+/// 从输出里读出"这一 tick 它打算做什么"。
+///
+/// 判据必须和 `life_sim::pick_direction` 一致（阈值 0.15、取最大的那个），
+/// 否则检查器会显示"想吃"而它其实在往右游——那种不一致比不显示更糟。
+fn action_of(out: &[f32; 6]) -> &'static str {
+    const THRESHOLD: f32 = 0.15;
+    let mut dir = "不动";
+    let mut best = THRESHOLD;
+    for (i, name) in ["左", "右", "上", "下"].iter().enumerate() {
+        if out[i] > best {
+            best = out[i];
+            dir = name;
+        }
+    }
+    let eating = out[4] > THRESHOLD;
+    let breeding = out[5] > THRESHOLD;
+    match (dir, eating, breeding) {
+        ("不动", false, false) => "待着",
+        ("不动", true, false) => "吃",
+        ("不动", false, true) => "生",
+        ("不动", true, true) => "边吃边生",
+        (dir, false, false) => dir,
+        (_, true, false) => "边游边吃",
+        (_, false, true) => "边游边生",
+        (_, true, true) => "边游边吃边生",
     }
 }
 

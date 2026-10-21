@@ -935,7 +935,9 @@ impl Ctx<'_> {
         let dir: isize = match rule {
             MoveRule::Falls | MoveRule::Flows => 1,
             MoveRule::Rises => -1,
-            MoveRule::Static => return,
+            // 悬浮物不自己动，只被更重的东西挤开（见 `MaterialKind::displaceable_by`）。
+            // 这里到不了——`visit` 用 `is_mobile` 把它挡在外面——但写出来更清楚。
+            MoveRule::Static | MoveRule::Drifts => return,
         };
         let side_salt = match rule {
             MoveRule::Falls => salt::POWDER_SIDE,

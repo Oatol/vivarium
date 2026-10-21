@@ -121,11 +121,16 @@ pub const LEAFBACK: BodyPlan = BodyPlan {
 
 /// 蠕虫：细长、分节，靠身体两侧的生产者节段养活一长串移动细胞。
 ///
-/// 它是这四种里**最穷**的：6 个移动细胞要付 24 维持 + 12 质量，
-/// 4 个生产者只赚 76.8。净 +13.8/tick，不到银鱼的一半。
-/// 留着它是因为它证明了一件事：**长身体不是免费的**。
+/// 它是这些体型里**最穷**的，而且穷的原因很具体：6 个移动细胞让它跑 2 格/tick，
+/// 而"跑得快"是要付钱的（`Organism::move_cost`：速度 2 每 tick 烧 1.5 倍质量）。
 ///
-/// 账：4 生产者 + 6 移动 + 1 嘴 = 11 格，净 **+13.8/tick**。
+/// 第一版只有 4 个生产者，按旧的"速度免费"成本算勉强够活；接上速度成本之后
+/// 直接变成负数。所以补了一格生产者——**这就是"快"的代价第一次落在形状上**：
+/// 想要两倍速度，就得有两倍以上的产出。
+///
+/// 账：5 生产者 + 6 移动 + 1 嘴 = 12 格，
+/// 维持 51、质量 18、速度 2 → 移动 28/tick，
+/// 浅水收入 96 → **净 +17/tick**。
 pub const WORM: BodyPlan = BodyPlan {
     name: "蠕虫",
     cells: &[
@@ -140,6 +145,7 @@ pub const WORM: BodyPlan = BodyPlan {
         (CellType::Producer, 0, -1),
         (CellType::Producer, 2, -1),
         (CellType::Producer, -2, 1),
+        (CellType::Producer, 2, 1),
     ],
 };
 
@@ -148,8 +154,14 @@ pub const WORM: BodyPlan = BodyPlan {
 /// 它和鱼的区别不只是形状：**它不靠"前方"活着**。嘴在身体中心，
 /// 四面都能吃，所以撞墙对它的影响比鱼小得多。
 ///
-/// 账：4 生产者 + 4 移动 + 1 嘴 + 2 装甲 + 1 眼 = 12 格，
-/// 维持 41、质量 20、浅水收入 76.8 → **净 +15.8/tick**。
+/// 和蠕虫一样，它也得为"速度 2"付钱：4 个移动细胞买到 2 格/tick，
+/// 而移动成本按速度加成（1.5 倍质量）。原来的 4 生产者 + 1 眼撑不住，
+/// 所以把眼换成了一格生产者——**看得远是锦上添花，跑得动才是活着**。
+/// 它因此没有眼，嗅觉半径退回基础值 20。
+///
+/// 账：5 生产者 + 4 移动 + 1 嘴 + 2 装甲 = 12 格，
+/// 维持 45、质量 20、速度 2 → 移动 30/tick，
+/// 浅水收入 96 → **净 +21/tick**。
 pub const JELLY: BodyPlan = BodyPlan {
     name: "水母",
     cells: &[
@@ -164,7 +176,7 @@ pub const JELLY: BodyPlan = BodyPlan {
         (CellType::Producer, 1, 1),
         (CellType::Armor, -2, 0),
         (CellType::Armor, 2, 0),
-        (CellType::Eye, 0, -2),
+        (CellType::Producer, 0, -2),
     ],
 };
 
@@ -243,19 +255,33 @@ mod tests {
         }
     }
 
+    /// 每个体型在浅水里的**每 tick 收支**。
+    ///
+    /// 移动那一项必须用真的公式（`life::move_cost` × 速度），不能拿质量顶替：
+    /// 速度 2 的体型每 tick 烧 1.5 倍质量，用质量算会高估它们两成的收入——
+    /// 而那正是"蠕虫和水母悄悄饿死"的那种错，从测试上看不出来。
+    fn plan_budget(plan: &BodyPlan) -> (f32, u32, u32) {
+        use crate::life::{move_cost, Organism};
+        let org = Organism::new(0, (0, 0), plan.cells(), crate::life::Genome::blank());
+        let producers = plan.count(CellType::Producer);
+        // 生产者边际收益 ≈ PRODUCER_YIELD × 0.8 − 5（它的维持成本）。
+        let income = 24.0 * 0.8 * producers as f32;
+        let upkeep: u32 = plan.cells.iter().map(|c| c.0.upkeep()).sum();
+        // 每 tick 走满 `speed` 格的总成本。
+        let move_per_tick = org.move_cost() * org.speed() as u32;
+        let _ = move_cost;
+        (income, upkeep, move_per_tick)
+    }
+
     #[test]
     fn every_plan_pays_for_itself_in_shallow_water() {
         // 这一条是这些形状存在的理由。生产者太少 → 饿死；这条测试是它的护栏。
-        // 常数抄自 life_sim：生产者边际收益 ≈ PRODUCER_YIELD × 0.8 − upkeep。
         for plan in PLANS {
-            let producers = plan.count(CellType::Producer);
-            let income = 24.0 * 0.8 * producers as f32;
-            let upkeep: u32 = plan.cells.iter().map(|c| c.0.upkeep()).sum();
-            let mass: u32 = plan.cells.iter().map(|c| c.0.mass()).sum();
-            let net = income - upkeep as f32 - mass as f32;
+            let (income, upkeep, moving) = plan_budget(plan);
+            let net = income - upkeep as f32 - moving as f32;
             assert!(
                 net > 5.0,
-                "体型「{}」在浅水里每 tick 只净赚 {net:.1}，撑不住（收入 {income:.1} / 维持 {upkeep} / 移动 {mass}）",
+                "体型「{}」在浅水里每 tick 只净赚 {net:.1}，撑不住（收入 {income:.1} / 维持 {upkeep} / 移动 {moving}）",
                 plan.name
             );
         }
@@ -265,17 +291,37 @@ mod tests {
     fn no_plan_is_a_money_printer() {
         // 净收益太高会变成"繁殖快到瞬间铺满"——那样就没有生态可言了。
         for plan in PLANS {
-            let producers = plan.count(CellType::Producer);
-            let income = 24.0 * 0.8 * producers as f32;
-            let upkeep: u32 = plan.cells.iter().map(|c| c.0.upkeep()).sum();
-            let mass: u32 = plan.cells.iter().map(|c| c.0.mass()).sum();
-            let net = income - upkeep as f32 - mass as f32;
+            let (income, upkeep, moving) = plan_budget(plan);
+            let net = income - upkeep as f32 - moving as f32;
             assert!(
                 net < 60.0,
                 "体型「{}」每 tick 净赚 {net:.1}，太快了",
                 plan.name
             );
         }
+    }
+
+    /// **跑得快更烧钱**：质量相同时，速度每加一档，每 tick 的移动成本就往上跳。
+    ///
+    /// 这是"移动细胞越多速度越快"的另一半。只做前一半的话，速度是白拿的，
+    /// 体型会一路朝"堆移动细胞"跑，直到撞上维持成本的天花板——
+    /// 而那和"进化在权衡快慢"是两件完全不同的事。
+    #[test]
+    fn speed_costs_energy() {
+        use crate::life::move_cost;
+        let mass = 20;
+        let per_tick = |speed| move_cost(mass, speed) * speed as u32;
+        assert_eq!(per_tick(1), 20, "速度 1 走一格就是一份质量");
+        // 速度 2 是 25，每步向上取整（25/2 → 13 × 2 = 26）。
+        assert_eq!(per_tick(2), 26, "速度 2 每 tick 1.25 倍质量");
+        assert_eq!(per_tick(3), 30, "速度 3 每 tick 1.5 倍质量");
+        assert!(
+            per_tick(2) > per_tick(1) && per_tick(3) > per_tick(2),
+            "速度必须单调更贵"
+        );
+        // 但**每格**成本是降的：多长移动细胞买的是"同样的钱跑得更远"。
+        let per_cell = |speed| move_cost(mass, speed);
+        assert!(per_cell(2) < per_cell(1) && per_cell(3) < per_cell(2));
     }
 
     /// 形状必须**换得到东西**：移动细胞买速度，眼买嗅觉半径。

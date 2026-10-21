@@ -105,12 +105,21 @@ impl Viewport {
     }
 }
 
-/// letterbox 的结果：裁剪空间下的缩放与平移。
-#[repr(C)]
+/// letterbox 的结果。
+///
+/// 前两个字段是**给 shader 的**（裁剪空间缩放 / 平移），后三个是**给 CPU 的**
+/// （世界实际画在屏幕上的哪一块）。两者必须由同一次计算得出：
+/// 分开算就会漂移，而漂移的症状是"点哪都差一点"——那种 bug 靠眼睛几乎找不到。
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Letterbox {
+    /// 裁剪空间缩放。
     scale: [f32; 2],
+    /// 裁剪空间平移。
     offset: [f32; 2],
+    /// 世界左上角在屏幕上的像素坐标。
+    origin: [f32; 2],
+    /// 世界在屏幕上的像素尺寸。
+    drawn: [f32; 2],
 }
 
 /// blit 管线的 uniform。
@@ -134,15 +143,17 @@ struct SceneUniforms {
 }
 
 impl SceneUniforms {
-    fn new(world: (u32, u32), target: (u32, u32), viewport: Viewport, srgb_output: bool) -> Self {
-        let lb = letterbox(world, target);
+    fn new(
+        world: (u32, u32),
+        target: (u32, u32),
+        viewport: Viewport,
+        content: Option<[f32; 4]>,
+        srgb_output: bool,
+    ) -> Self {
+        let lb = letterbox(world, target, content);
         let vp = viewport.clamped(world);
         let (vw, vh) = vp.view_size(world);
-        let px_per_cell = if vw > 0.0 {
-            (target.0 as f32 * lb.scale[0]) / vw
-        } else {
-            1.0
-        };
+        let px_per_cell = if vw > 0.0 { lb.drawn[0] / vw } else { 1.0 };
         Self {
             scale: lb.scale,
             offset: lb.offset,
@@ -162,28 +173,41 @@ impl SceneUniforms {
 ///
 /// 任一维度为 0 时退化为不缩放。这不是防御性编程：窗口最小化时
 /// 交换链尺寸真的会是 0。
-fn letterbox(world: (u32, u32), target: (u32, u32)) -> Letterbox {
-    if world.0 == 0 || world.1 == 0 || target.0 == 0 || target.1 == 0 {
+fn letterbox(world: (u32, u32), target: (u32, u32), content: Option<[f32; 4]>) -> Letterbox {
+    let (tw, th) = (target.0 as f32, target.1 as f32);
+    if world.0 == 0 || world.1 == 0 || tw <= 0.0 || th <= 0.0 {
         return Letterbox {
             scale: [1.0, 1.0],
             offset: [0.0, 0.0],
+            origin: [0.0, 0.0],
+            drawn: [tw, th],
         };
     }
 
-    let world_aspect = world.0 as f32 / world.1 as f32;
-    let target_aspect = target.0 as f32 / target.1 as f32;
+    // 可用区域：界面把它算出来交给渲染器（中央那块）。
+    //
+    // 世界**只画在这一块里**，而不是整窗铺满再让面板盖上去——
+    // 那样一来面板底下藏着一半世界，二来"点哪儿是哪格"的换算
+    // 会和眼睛看到的位置差一大截。前者是观感问题，后者是可用性问题。
+    let [cx0, cy0, cx1, cy1] = content.unwrap_or([0.0, 0.0, tw, th]);
+    let cw = (cx1 - cx0).max(1.0);
+    let ch = (cy1 - cy0).max(1.0);
 
-    let scale = if world_aspect > target_aspect {
-        // 世界比窗口更宽 → 左右顶满，上下留边。
-        [1.0, target_aspect / world_aspect]
-    } else {
-        // 世界比窗口更高 → 上下顶满，左右留边。
-        [world_aspect / target_aspect, 1.0]
-    };
+    // 每格多少像素：取两个方向里更紧的那个，保证整张世界都放得下。
+    let s = (cw / world.0 as f32).min(ch / world.1 as f32);
+    let drawn = [world.0 as f32 * s, world.1 as f32 * s];
+    // 在可用区域里居中。
+    let origin = [cx0 + (cw - drawn[0]) * 0.5, cy0 + (ch - drawn[1]) * 0.5];
 
     Letterbox {
-        scale,
-        offset: [0.0, 0.0],
+        scale: [drawn[0] / tw, drawn[1] / th],
+        // 裁剪空间里 y 向上，屏幕坐标 y 向下，所以纵向要取反。
+        offset: [
+            (origin[0] + drawn[0] * 0.5) / tw * 2.0 - 1.0,
+            1.0 - (origin[1] + drawn[1] * 0.5) / th * 2.0,
+        ],
+        origin,
+        drawn,
     }
 }
 
@@ -456,6 +480,11 @@ struct Blitter {
     uploader: Option<PixelUploader>,
     world_size: (u32, u32),
     viewport: Viewport,
+    /// 世界该画在屏幕上的哪一块（物理像素 `x0,y0,x1,y1`）。`None` = 整窗。
+    ///
+    /// 界面层每帧把它算出来交进来（中央那块矩形）。渲染器不猜——
+    /// 猜出来的值一旦和面板尺寸对不上，"点哪儿是哪格"就会整体偏。
+    content: Option<[f32; 4]>,
     stats: PixelStats,
 }
 
@@ -571,6 +600,7 @@ impl Blitter {
             uploader: None,
             world_size: (0, 0),
             viewport: Viewport::default(),
+            content: None,
             stats: PixelStats::default(),
         }
     }
@@ -706,6 +736,7 @@ impl Blitter {
             self.world_size,
             target_size,
             self.viewport,
+            self.content,
             self.output_format.is_srgb(),
         );
         self.queue
@@ -930,6 +961,37 @@ impl PixelRenderer {
         self.blitter.viewport = vp.clamped(self.blitter.world_size);
     }
 
+    /// 设定世界该画在屏幕上的哪一块（**物理像素**，`x0,y0,x1,y1`）。
+    ///
+    /// 界面每帧算一次交给这里。传 `None` 恢复"铺满整窗"。
+    ///
+    /// 为什么要让界面来定：面板尺寸是界面说了算的，而"世界画在哪"
+    /// 必须和"中央可用区域"逐像素一致。渲染器自己算一遍的话，
+    /// 两个数一旦不同步，症状是"鼠标点偏了半个面板宽度"——
+    /// 而那看起来像是拾取算法写错了。
+    pub fn set_content_rect(&mut self, rect: Option<(f32, f32, f32, f32)>) {
+        self.blitter.content = rect.map(|(x0, y0, x1, y1)| [x0, y0, x1, y1]);
+    }
+
+    /// 以**屏幕上某一点**为锚点缩放。
+    ///
+    /// 和 `zoom_by` 的区别是锚点：`zoom_by` 绕视口中心缩，鼠标在哪儿都一样。
+    /// 画画的时候这很难用——你想放大看的那一格，会随缩放跑到画面外去。
+    ///
+    /// 做法是"缩之前记下指针下面是哪一格，缩之后把相机推回去"。
+    /// 这样指针下面**始终是同一格**，手感就是"把那一格拉近"。
+    pub fn zoom_at(&mut self, factor: f32, screen: (f32, f32), target: (u32, u32)) {
+        let Some(before) = self.cell_at(screen, target) else {
+            self.zoom_by(factor);
+            return;
+        };
+        self.zoom_by(factor);
+        let Some(after) = self.cell_at(screen, target) else {
+            return;
+        };
+        self.pan_cells(before.0 - after.0, before.1 - after.1);
+    }
+
     /// 把相机对准某一格。
     pub fn look_at(&mut self, x: f32, y: f32) {
         let mut vp = self.blitter.viewport;
@@ -940,10 +1002,10 @@ impl PixelRenderer {
     /// 一格在屏幕上占多少像素。标题栏用它显示"现在是几倍"。
     pub fn pixels_per_cell(&self, target: (u32, u32)) -> f32 {
         let world = self.blitter.world_size;
-        let lb = letterbox(world, target);
+        let lb = letterbox(world, target, self.blitter.content);
         let (vw, _) = self.blitter.viewport.view_size(world);
         if vw > 0.0 {
-            (target.0 as f32 * lb.scale[0]) / vw
+            lb.drawn[0] / vw
         } else {
             1.0
         }
@@ -964,16 +1026,12 @@ impl PixelRenderer {
             return None;
         }
         let world = self.blitter.world_size;
-        let lb = letterbox(world, target);
-        let drawn_w = target.0 as f32 * lb.scale[0];
-        let drawn_h = target.1 as f32 * lb.scale[1];
+        let lb = letterbox(world, target, self.blitter.content);
+        let (drawn_w, drawn_h) = (lb.drawn[0], lb.drawn[1]);
         if drawn_w <= 0.0 || drawn_h <= 0.0 {
             return None;
         }
-        let origin = (
-            (target.0 as f32 - drawn_w) * 0.5 + lb.offset[0],
-            (target.1 as f32 - drawn_h) * 0.5 + lb.offset[1],
-        );
+        let origin = (lb.origin[0], lb.origin[1]);
 
         // 归一化到"画出来的那一块"里。落在黑边上就是 `None`——
         // 那是世界之外，点它不该有任何效果。
@@ -1149,7 +1207,7 @@ mod tests {
     fn letterbox_keeps_square_world_square() {
         // 正方形世界放进宽屏窗口：上下顶满，左右留黑边。
         // 写反了很容易——"世界比窗口窄"对应的是**横向**缩小，不是纵向。
-        let u = letterbox((512, 512), (1920, 1080));
+        let u = letterbox((512, 512), (1920, 1080), None);
         assert_eq!(u.scale[1], 1.0, "上下应当顶满");
         assert!(
             (u.scale[0] - 1080.0 / 1920.0).abs() < 1e-6,
@@ -1163,7 +1221,7 @@ mod tests {
     #[test]
     fn letterbox_keeps_wide_world_wide() {
         // 4:1 的世界放进 1:1 的窗口：左右顶满，上下留黑边。
-        let u = letterbox((2048, 512), (1000, 1000));
+        let u = letterbox((2048, 512), (1000, 1000), None);
         assert_eq!(u.scale[0], 1.0, "左右应当顶满");
         assert!((u.scale[1] - 0.25).abs() < 1e-6, "纵向应当缩到 0.25");
         // 像素层面依然是 4:1。
@@ -1183,7 +1241,7 @@ mod tests {
                 (1080, 1920),
                 (1000, 1000),
             ] {
-                let u = letterbox(world, target);
+                let u = letterbox(world, target, None);
                 let on_screen_w = u.scale[0] * target.0 as f32;
                 let on_screen_h = u.scale[1] * target.1 as f32;
                 let world_aspect = world.0 as f32 / world.1 as f32;
@@ -1201,7 +1259,7 @@ mod tests {
         // 两个方向都不能超过 1.0，否则世界会被裁掉。
         for world in [(512, 512), (1024, 256), (256, 1024)] {
             for target in [(800, 600), (600, 800), (1920, 1080)] {
-                let u = letterbox(world, target);
+                let u = letterbox(world, target, None);
                 assert!(u.scale[0] <= 1.0 + 1e-6, "{world:?} -> {target:?}");
                 assert!(u.scale[1] <= 1.0 + 1e-6, "{world:?} -> {target:?}");
                 // 至少一个方向要顶满，否则画面会凭空缩小。
@@ -1214,9 +1272,27 @@ mod tests {
     }
 
     #[test]
+    fn letterbox_into_a_content_rect_centers_the_world() {
+        // 800×600 的窗口，中央那块是 (100,50)-(500,350)，也就是 400×300。
+        // 世界 512² 要整个放进去：每格 min(400/512, 300/512) = 0.586 像素，
+        // 于是画出来是 300×300，在内容区里水平居中、垂直顶满。
+        let u = letterbox((512, 512), (800, 600), Some([100.0, 50.0, 500.0, 350.0]));
+        assert!((u.drawn[0] - 300.0).abs() < 0.01, "{}", u.drawn[0]);
+        assert!((u.drawn[1] - 300.0).abs() < 0.01, "{}", u.drawn[1]);
+        assert!((u.origin[0] - 150.0).abs() < 0.01, "{}", u.origin[0]);
+        assert!((u.origin[1] - 50.0).abs() < 0.01, "{}", u.origin[1]);
+        // 屏幕上的宽高比必须还是 1:1。
+        assert!((u.drawn[0] - u.drawn[1]).abs() < 1e-3);
+
+        // 内容区外（左侧面板那块）不该落进世界坐标里。
+        let px = u.origin[0];
+        assert!(px > 100.0, "世界应当被推进内容区里，而不是贴着窗口左边");
+    }
+
+    #[test]
     fn letterbox_survives_zero_sized_target() {
         // 窗口最小化时交换链尺寸真的是 0。这里不能出现 NaN 或除零。
-        let u = letterbox((512, 512), (0, 0));
+        let u = letterbox((512, 512), (0, 0), None);
         assert_eq!(u.scale, [1.0, 1.0]);
         assert!(u.scale.iter().all(|v| v.is_finite()));
     }

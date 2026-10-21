@@ -15,11 +15,16 @@
 //!
 //! ## 操作
 //!
-//! | 键 | 作用 |
+//! | 键 / 鼠标 | 作用 |
 //! |---|---|
 //! | 空格 | 暂停 / 继续 |
 //! | 1 / 2 / 3 / 4 | 速度 1× / 5× / 50× / 最大 |
-//! | F | 在最高的岛顶点一把火 |
+//! | 左键 | 落笔（工具决定画 / 擦 / 填 / 吸 / 看） |
+//! | 右键 / 中键拖拽 | 平移视野 |
+//! | 滚轮 | 以指针为中心缩放 |
+//! | B / E / F / I / Q | 画笔 / 橡皮 / 填充 / 取样 / 检查 |
+//! | G | 在最高的岛顶点一把火 |
+//! | L | 放一批鱼 |
 //! | R | 重新铺一遍地形（用来验证增量上传确实在工作） |
 //! | Esc | 退出 |
 //!
@@ -34,6 +39,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
+use vivarium_core::life::{Genome, INPUTS, OUTPUTS};
 use vivarium_core::life_sim::{stock_surface, LifeSim, MAX_AGE};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_ui::state::{SelectedOrganism, Snapshot};
@@ -248,13 +254,26 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: winit::event::MouseButton::Left,
-                ..
-            } => {
-                if !consumed {
-                    game.on_click();
+            WindowEvent::MouseInput { state, button, .. } => {
+                use winit::event::MouseButton;
+                match (state, button) {
+                    // 左键：落笔（或者检查 / 取样，取决于工具）。
+                    (ElementState::Pressed, MouseButton::Left) => {
+                        if !consumed && !game.ui.pointer_over_ui {
+                            game.on_press();
+                        }
+                    }
+                    (ElementState::Released, MouseButton::Left) => game.on_release(),
+                    // 右键 / 中键：拖拽平移。**不给左键**，因为左键要画画。
+                    (ElementState::Pressed, MouseButton::Right | MouseButton::Middle) => {
+                        if !consumed && !game.ui.pointer_over_ui {
+                            game.pan_anchor = game.cursor;
+                        }
+                    }
+                    (ElementState::Released, MouseButton::Right | MouseButton::Middle) => {
+                        game.pan_anchor = None;
+                    }
+                    _ => {}
                 }
             }
 
@@ -271,12 +290,24 @@ impl ApplicationHandler for App {
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32 / 40.0,
                 };
                 if lines != 0.0 {
-                    game.renderer.zoom_by(1.15f32.powf(lines));
+                    // 以指针为锚点缩放：想放大看的那一格会一直待在指针下面。
+                    // 绕视口中心缩的话，放大三次目标就跑到画面外去了。
+                    let target = game.renderer.surface_size();
+                    match game.cursor {
+                        Some(pos) => game.renderer.zoom_at(
+                            1.15f32.powf(lines),
+                            (pos.0 as f32, pos.1 as f32),
+                            target,
+                        ),
+                        None => game.renderer.zoom_by(1.15f32.powf(lines)),
+                    }
                 }
             }
 
             WindowEvent::CursorMoved { position, .. } => {
+                let prev = game.cursor;
                 game.cursor = Some((position.x, position.y));
+                game.on_cursor_moved(prev);
             }
 
             WindowEvent::RedrawRequested => game.frame(event_loop),
@@ -322,6 +353,13 @@ struct Game {
     history_tick: u64,
     /// 光标在窗口里的位置（物理像素）。点击时用它换算成世界格。
     cursor: Option<(f64, f64)>,
+    /// 左键按着，而且当前工具会落笔。
+    painting: bool,
+    /// 上一次落笔的格子。用来把"这一帧的鼠标位置"和"上一帧的"连成一条线——
+    /// 鼠标快的时候两帧之间能跨十几格，只在当前位置盖一个圆会画出虚线。
+    last_paint: Option<(i32, i32)>,
+    /// 右键 / 中键拖拽的锚点（上一个光标位置）。`None` = 没在拖。
+    pan_anchor: Option<(f64, f64)>,
 
     scale: TimeScale,
     budget: FrameBudget,
@@ -381,6 +419,9 @@ impl Game {
             history: Vec::with_capacity(160),
             history_tick: 0,
             cursor: None,
+            painting: false,
+            last_paint: None,
+            pan_anchor: None,
             scale: TimeScale::X1,
             budget: FrameBudget::default(),
             last_tick_cost: Duration::ZERO,
@@ -407,9 +448,10 @@ impl Game {
   生物      : {} 条 · {} 个细胞 · 能量 {}
   界面      : egui · 中文字体 {}
 
-  空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · L 放鱼 · R 重铺地形 · Esc 退出
+  空格 暂停/继续 · 1/2/3/4 速度 · L 放鱼 · G 点火 · R 重铺地形 · Esc 退出
 
-  滚轮 缩放 · 方向键 平移 · 0 回到全景 · B/E/R/L/F/I/Q 换工具",
+  左键 落笔 · 右键/中键拖拽 平移 · 滚轮 缩放（以指针为中心）· 方向键 平移 · 0 回到全景
+  B 画笔 · E 橡皮 · F 填充 · I 取样 · Q 检查",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -455,7 +497,14 @@ impl Game {
                 "2" => self.scale = TimeScale::X5,
                 "3" => self.scale = TimeScale::X50,
                 "4" => self.scale = TimeScale::Max,
-                "f" | "F" => self.ignite_peak(),
+                // 工具：和 `Tool::hotkey` 一一对应。走界面那条命令，
+                // 免得"快捷键改了工具、左栏却没高亮"——那种不一致很难注意到。
+                "b" | "B" => self.pick_tool(vivarium_ui::state::Tool::Brush),
+                "e" | "E" => self.pick_tool(vivarium_ui::state::Tool::Eraser),
+                "f" | "F" => self.pick_tool(vivarium_ui::state::Tool::Fill),
+                "i" | "I" => self.pick_tool(vivarium_ui::state::Tool::Pick),
+                "q" | "Q" => self.pick_tool(vivarium_ui::state::Tool::Inspect),
+                "g" | "G" => self.ignite_peak(),
                 "l" | "L" => self.release_fish(),
                 "r" | "R" => self.reseed(),
                 // 缩放：`+` 和 `=` 都收，因为大多数键盘上 `+` 要按 shift。
@@ -477,47 +526,172 @@ impl Game {
     /// 画笔落笔还没接（那是下一步），但"能选中、能在右边看到它的内部"
     /// 已经让这个界面有用了——它把"看"和"改"分开了，
     /// 而"看"是不需要写世界的，风险最低。
-    fn on_click(&mut self) {
+    /// 切工具。快捷键和左栏按钮走同一条路。
+    fn pick_tool(&mut self, tool: vivarium_ui::state::Tool) {
+        self.ui.state.tool = tool;
+        self.ui.state.emit(vivarium_ui::Command::SetTool(tool));
+        let tick = self.world.tick();
+        self.ui.log(
+            tick,
+            vivarium_ui::Level::Info,
+            format!("工具：{}", tool.label()),
+        );
+    }
+
+    /// 左键按下。
+    ///
+    /// 分三种：会落笔的工具开始画；检查工具选中生物；取样工具吸一口材质。
+    fn on_press(&mut self) {
         use vivarium_ui::state::Tool;
 
-        // 鼠标在面板上就别动了。
-        //
-        // 光靠 `consumed` 不够：egui 只在"某个控件要独占这个事件"时
-        // 才报 consumed，点在面板的**空白处**它不报。而人点空白处
-        // 也绝对不是在点世界——那会顺手在画布上落一笔。
-        if self.ui.pointer_over_ui {
+        let tool = self.ui.state.tool;
+        match tool {
+            Tool::Brush | Tool::Eraser => {
+                self.painting = true;
+                self.last_paint = None;
+                self.stroke_to_cursor();
+            }
+            Tool::Fill => {
+                if let Some((x, y)) = self.cell_under_cursor() {
+                    self.flood_fill(x, y);
+                }
+            }
+            Tool::Pick => {
+                if let Some((x, y)) = self.cell_under_cursor() {
+                    let kind = self.world.get(x as isize, y as isize);
+                    self.ui.state.material = kind;
+                    let tick = self.world.tick();
+                    self.ui.log(
+                        tick,
+                        vivarium_ui::Level::Info,
+                        format!("取样：({x}, {y}) = {}", kind.name()),
+                    );
+                }
+            }
+            Tool::Inspect => self.inspect_at_cursor(),
+        }
+    }
+
+    /// 左键松开：结束连续落笔。
+    fn on_release(&mut self) {
+        self.painting = false;
+        self.last_paint = None;
+    }
+
+    /// 光标移动：拖拽平移，或者连续落笔。
+    ///
+    /// `prev` 是移动之前的位置。落笔要用它来"补线"——鼠标一帧能跨十几格，
+    /// 只在当前位置盖一个圆会画成一串断点。
+    fn on_cursor_moved(&mut self, prev: Option<(f64, f64)>) {
+        if let Some(anchor) = self.pan_anchor {
+            // 拖拽平移：把像素位移换算成格。**取负**——往右拖，
+            // 看到的东西应该跟着往右走，也就是相机往左移。
+            let (Some(a), Some(b)) = (prev, self.cursor) else {
+                self.pan_anchor = self.cursor;
+                return;
+            };
+            let ppc = self
+                .renderer
+                .pixels_per_cell(self.renderer.surface_size())
+                .max(0.01);
+            self.renderer
+                .pan_cells(-((b.0 - a.0) as f32) / ppc, -((b.1 - a.1) as f32) / ppc);
+            self.pan_anchor = self.cursor;
+            let _ = anchor;
             return;
         }
+        if self.painting {
+            self.stroke_to_cursor();
+        }
+    }
 
-        let Some(pos) = self.cursor else { return };
+    /// 光标下面是哪一格（整数格坐标）。落在世界外就是 `None`。
+    fn cell_under_cursor(&self) -> Option<(i32, i32)> {
+        let pos = self.cursor?;
         let size = self.renderer.surface_size();
-        let Some((cx, cy)) = self.renderer.cell_at((pos.0 as f32, pos.1 as f32), size) else {
+        let (cx, cy) = self.renderer.cell_at((pos.0 as f32, pos.1 as f32), size)?;
+        let (x, y) = (cx.floor() as i32, cy.floor() as i32);
+        self.world
+            .in_bounds(x as isize, y as isize)
+            .then_some((x, y))
+    }
+
+    /// 从上一笔连到光标当前位置，一路盖章。
+    fn stroke_to_cursor(&mut self) {
+        let Some((x, y)) = self.cell_under_cursor() else {
             return;
         };
-        let (x, y) = (cx.floor() as isize, cy.floor() as isize);
-        if !self.world.in_bounds(x, y) {
-            return;
-        }
+        let from = self.last_paint.unwrap_or((x, y));
+        let erase = self.ui.state.tool == vivarium_ui::state::Tool::Eraser;
+        let kind = if erase {
+            MaterialKind::Empty
+        } else {
+            self.ui.state.material
+        };
 
-        if self.ui.state.tool == Tool::Inspect {
-            let owner = self.world.owner(x, y);
-            let picked = if owner.organism != 0 {
-                Some(owner.organism)
-            } else {
-                None
-            };
-            self.ui.state.selected = picked;
-            let tick = self.world.tick();
-            match picked {
-                Some(id) => self
-                    .ui
-                    .log(tick, vivarium_ui::Level::Info, format!("选中 #{id}")),
-                None => self.ui.log(
-                    tick,
-                    vivarium_ui::Level::Info,
-                    format!("({x}, {y}) 没有生物"),
-                ),
-            }
+        // 两点之间按格插值。步长取 1 格，保证不会漏格——
+        // 笔刷半径大于 1 时其实可以稀疏些，但"可能漏格"是那种
+        // 只在快速拖动时才出现的 bug，不值得为省几个循环去换。
+        let steps = (x - from.0).abs().max((y - from.1).abs()).max(1);
+        for i in 0..=steps {
+            let t = i as f32 / steps as f32;
+            let px = from.0 as f32 + (x - from.0) as f32 * t;
+            let py = from.1 as f32 + (y - from.1) as f32 * t;
+            self.stamp(px.round() as i32, py.round() as i32, kind);
+        }
+        self.last_paint = Some((x, y));
+    }
+
+    /// 在 `(x, y)` 盖一个圆形的笔刷。
+    fn stamp(&mut self, x: i32, y: i32, kind: MaterialKind) {
+        let r = self.ui.state.brush as i32;
+        stamp_circle(&mut self.world, x, y, r, kind);
+    }
+
+    /// 油漆桶：把和 `(x, y)` 连成一片的同种材质换成当前材质。
+    fn flood_fill(&mut self, x: i32, y: i32) {
+        let kind = match self.ui.state.tool {
+            vivarium_ui::state::Tool::Eraser => MaterialKind::Empty,
+            _ => self.ui.state.material,
+        };
+        let (filled, capped) = flood_fill_region(&mut self.world, x, y, kind, FILL_CAP);
+        let tick = self.world.tick();
+        if capped {
+            self.ui.log(
+                tick,
+                vivarium_ui::Level::Warn,
+                format!("填充达到上限 {FILL_CAP} 格，剩下的没涂"),
+            );
+        }
+        self.ui.log(
+            tick,
+            vivarium_ui::Level::Info,
+            format!("填充 {filled} 格 → {}", kind.name()),
+        );
+    }
+
+    /// 检查工具：点生物看它的内部。
+    fn inspect_at_cursor(&mut self) {
+        let Some((x, y)) = self.cell_under_cursor() else {
+            return;
+        };
+        let owner = self.world.owner(x as isize, y as isize);
+        let picked = if owner.organism != 0 {
+            Some(owner.organism)
+        } else {
+            None
+        };
+        self.ui.state.selected = picked;
+        let tick = self.world.tick();
+        match picked {
+            Some(id) => self
+                .ui
+                .log(tick, vivarium_ui::Level::Info, format!("选中 #{id}")),
+            None => self.ui.log(
+                tick,
+                vivarium_ui::Level::Info,
+                format!("({x}, {y}) 没有生物"),
+            ),
         }
     }
 
@@ -610,6 +784,19 @@ impl Game {
         // 而人眼对"点下去没反应"极其敏感，一帧也看得出来。
         let snap = self.snapshot();
         let mut frame = self.ui.run_frame(&self.window, &snap);
+
+        // 世界只画在界面留出来的那块中央区域里。
+        //
+        // 界面给的是**逻辑像素**，交换链要的是**物理像素**，所以乘缩放比。
+        // 漏了这一步在高 DPI 屏上会整体偏一半——而"点偏了"看起来像拾取写错了。
+        let ppp = self.window.scale_factor() as f32;
+        let c = self.ui.central();
+        self.renderer.set_content_rect(Some((
+            c.left() * ppp,
+            c.top() * ppp,
+            c.right() * ppp,
+            c.bottom() * ppp,
+        )));
         // 把命令**取出来**而不是移出去：`frame` 后面还要交给 `paint`，
         // 只移走一个字段会让它变成部分移动，借不出去。
         for cmd in std::mem::take(&mut frame.commands) {
@@ -696,15 +883,45 @@ impl Game {
         for cell in &org.cells {
             cells[cell.kind.as_u8() as usize] += 1;
         }
+        // 形状按朝向镜像之后再交出去。**镜像只有一份实现**（`offset_x`），
+        // 界面拿到的就是世界里那个朝向——缩略图不会和画面左右相反。
+        let shape = org
+            .cells
+            .iter()
+            .map(|c| (org.offset_x(c.offset) as i16, c.offset.1, c.kind.as_u8()))
+            .collect();
+        // 直连权重（17×6）。只取这一层，见 `SelectedOrganism::direct`。
+        let mut direct = Vec::with_capacity(INPUTS * OUTPUTS);
+        for i in 0..INPUTS {
+            for o in 0..OUTPUTS {
+                direct.push(org.genome.weights[Genome::w_io(i, o)]);
+            }
+        }
+        let max_energy = org.max_energy().max(1) as f32;
+        let energy_trace = org
+            .energy_trace()
+            .map(|e| (e as f32 / max_energy).clamp(0.0, 1.0))
+            .collect();
+
         Some(SelectedOrganism {
             id: org.id,
             anchor: org.anchor,
             energy: org.energy,
+            max_energy: org.max_energy(),
             age: (org.age, MAX_AGE),
             speed: org.speed(),
             smell: org.smell_radius(),
+            upkeep: org.upkeep(),
+            move_cost: org.move_cost(),
+            mass: org.mass(),
             cells,
             generation: org.generation,
+            parent: org.parent,
+            shape,
+            energy_trace,
+            inputs: org.last_inputs,
+            outputs: org.last_out,
+            direct,
         })
     }
 
@@ -812,6 +1029,90 @@ fn scale_label(scale: TimeScale) -> &'static str {
 }
 
 // ---------------------------------------------------------------------------
+// 笔刷
+// ---------------------------------------------------------------------------
+//
+// 这两个函数是**自由函数**而不是 `Game` 的方法，只为了让它们能在没有窗口、
+// 没有 GPU 的情况下被测。画笔逻辑（哪些格该涂、哪些不能涂）是纯数据操作，
+// 和窗口没有半点关系——把它挂在 `Game` 上，就意味着它只能靠"人点一下试试"来验证。
+
+/// 油漆桶一次最多涂多少格。
+///
+/// 一片水在 512² 里有三万多格，涂完要几十毫秒——可以接受。但"把整个世界
+/// 填满"是点一下卡一秒，所以封顶，并在日志里说清楚没涂完。
+const FILL_CAP: usize = 60_000;
+
+/// 在 `(x, y)` 盖一个半径 `r` 的圆。
+///
+/// 返回改了几格（测试用它判断"到底有没有落笔"）。
+fn stamp_circle(world: &mut World, x: i32, y: i32, r: i32, kind: MaterialKind) -> usize {
+    let mut n = 0;
+    for dy in -r..=r {
+        for dx in -r..=r {
+            if dx * dx + dy * dy > r * r {
+                continue;
+            }
+            let (xs, ys) = ((x + dx) as isize, (y + dy) as isize);
+            if !world.in_bounds(xs, ys) {
+                continue;
+            }
+            // **不覆盖生物。** 一格要么是材质要么是细胞，画笔只能改材质那一半；
+            // 硬涂上去会让占格表和材质打架（那条鱼还占着这格，而格子已经变成石头）。
+            if world.is_occupied(xs, ys) {
+                continue;
+            }
+            if world.get(xs, ys) == kind {
+                continue;
+            }
+            world.set(xs, ys, kind);
+            n += 1;
+        }
+    }
+    n
+}
+
+/// 油漆桶：把和 `(x, y)` 连成一片的同种材质换成 `kind`。
+///
+/// 返回 `(涂了几格, 有没有撞上限)`。
+///
+/// 用显式栈而不是递归：512² 里一片水有三万多格，递归会直接把栈打爆。
+fn flood_fill_region(
+    world: &mut World,
+    x: i32,
+    y: i32,
+    kind: MaterialKind,
+    cap: usize,
+) -> (usize, bool) {
+    let target = world.get(x as isize, y as isize);
+    if target == kind {
+        return (0, false);
+    }
+    let mut stack = vec![(x, y)];
+    let mut seen = std::collections::HashSet::new();
+    let mut filled = 0usize;
+    while let Some((cx, cy)) = stack.pop() {
+        if filled >= cap {
+            return (filled, true);
+        }
+        let (xs, ys) = (cx as isize, cy as isize);
+        if !world.in_bounds(xs, ys) || !seen.insert((cx, cy)) {
+            continue;
+        }
+        // 生物占着的格子既不算"同种材质"，也不该被改——直接当成墙。
+        if world.is_occupied(xs, ys) || world.get(xs, ys) != target {
+            continue;
+        }
+        world.set(xs, ys, kind);
+        filled += 1;
+        stack.push((cx + 1, cy));
+        stack.push((cx - 1, cy));
+        stack.push((cx, cy + 1));
+        stack.push((cx, cy - 1));
+    }
+    (filled, false)
+}
+
+// ---------------------------------------------------------------------------
 // 地形
 // ---------------------------------------------------------------------------
 //
@@ -886,4 +1187,100 @@ fn run_ascii(opts: &Options) -> ExitCode {
     println!("{}", renderer.frame());
 
     ExitCode::SUCCESS
+}
+
+// ---------------------------------------------------------------------------
+// 测试：画笔
+// ---------------------------------------------------------------------------
+//
+// 这两条测的是**纯数据操作**，不需要窗口也不需要 GPU。落笔逻辑挂在这里
+// 而不是 `Game` 上，就是为了让它们能跑。
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 一片水，中间一条石墙，用来测"填充会不会越界"。
+    fn pool_with_wall() -> World {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 0, 64, 64, MaterialKind::Water);
+        // 竖墙把水池切成左右两半。
+        w.fill_rect(32, 0, 1, 64, MaterialKind::Stone);
+        w
+    }
+
+    #[test]
+    fn a_round_brush_paints_a_disc_not_a_square() {
+        let mut w = pool_with_wall();
+        let n = stamp_circle(&mut w, 10, 10, 3, MaterialKind::Stone);
+        assert!(n > 20, "半径 3 的圆至少二十几格，实际 {n}");
+
+        // 圆内。
+        assert_eq!(w.get(10, 10), MaterialKind::Stone, "圆心必须涂到");
+        assert_eq!(w.get(13, 10), MaterialKind::Stone, "半径上的点必须涂到");
+        // 圆外：正方形的角。
+        assert_eq!(
+            w.get(13, 13),
+            MaterialKind::Water,
+            "正方形的角不该被涂到——那不是圆"
+        );
+    }
+
+    #[test]
+    fn the_brush_never_paints_over_a_body() {
+        let mut w = pool_with_wall();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((10, 10), Genome::blank(), 500))
+            .unwrap();
+        let spots: Vec<(isize, isize)> = sim
+            .organism(id)
+            .unwrap()
+            .footprint()
+            .map(|(x, y)| (x as isize, y as isize))
+            .collect();
+        assert!(!spots.is_empty());
+
+        // 把整条鱼连周围一起涂成石头。
+        stamp_circle(&mut w, 10, 10, 6, MaterialKind::Stone);
+
+        for (x, y) in spots {
+            assert!(
+                w.get(x, y) != MaterialKind::Stone,
+                "({x}, {y}) 是身体格，画笔不能把它涂成石头"
+            );
+            assert!(w.is_occupied(x, y), "身体格必须还归那条鱼");
+        }
+    }
+
+    #[test]
+    fn flood_fill_stops_at_a_wall() {
+        let mut w = pool_with_wall();
+        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, FILL_CAP);
+        assert!(!capped);
+        assert_eq!(n, 32 * 64, "左半边是 32×64 格水");
+
+        // 左边全变沙，右边一格没动，墙也没动。
+        assert_eq!(w.get(0, 0), MaterialKind::Sand);
+        assert_eq!(w.get(31, 63), MaterialKind::Sand);
+        assert_eq!(w.get(33, 0), MaterialKind::Water, "填充越过了墙");
+        assert_eq!(w.get(32, 0), MaterialKind::Stone, "墙本身不该被涂");
+    }
+
+    #[test]
+    fn flood_fill_gives_up_at_the_cap() {
+        // 上限存在的理由：一次点击不该让整个程序停一秒。
+        let mut w = pool_with_wall();
+        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, 100);
+        assert!(capped, "超过上限时必须报出来");
+        assert_eq!(n, 100);
+        assert_eq!(w.get(5, 5), MaterialKind::Sand, "涂过的那些要真的涂上");
+    }
+
+    #[test]
+    fn flood_fill_into_the_same_material_does_nothing() {
+        let mut w = pool_with_wall();
+        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Water, FILL_CAP);
+        assert_eq!(n, 0);
+        assert!(!capped);
+    }
 }

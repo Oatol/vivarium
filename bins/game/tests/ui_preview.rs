@@ -72,16 +72,79 @@ fn demo_snapshot() -> Snapshot {
                 (0.35 + 0.25 * t.sin() + 0.12 * (t * 2.7).sin()).clamp(0.0, 1.0)
             })
             .collect(),
-        selected: Some(SelectedOrganism {
-            id: 42,
-            anchor: (218, 341),
-            energy: 312,
-            age: (1_204, 20_000),
-            speed: 2,
-            smell: 24,
-            cells,
-            generation: 17,
-        }),
+        selected: Some(demo_selected(cells)),
+    }
+}
+
+/// 一个"看起来像真的"的选中个体。
+///
+/// 形状、权重、走势都手写成一条银鱼的近似值——预览图要能验证
+/// **缩略图画得像不像一条鱼**、**权重矩阵里那几行是不是亮的**，
+/// 全零的占位数据在这两件事上什么都证明不了。
+fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrganism {
+    use vivarium_core::CellType;
+    // 银鱼：尾三格移动、前端两个嘴、背上两个生产者、腹下两个生产者、一只眼。
+    let shape: Vec<(i16, i16, u8)> = [
+        (CellType::Mover, -2, 0),
+        (CellType::Mover, -1, 0),
+        (CellType::Mover, 0, 0),
+        (CellType::Mouth, 1, 0),
+        (CellType::Mouth, 2, 0),
+        (CellType::Producer, 1, -1),
+        (CellType::Producer, 2, -1),
+        (CellType::Producer, 0, 1),
+        (CellType::Producer, 1, 1),
+        (CellType::Eye, 2, 1),
+    ]
+    .iter()
+    .map(|&(k, x, y)| (x, y, k.as_u8()))
+    .collect();
+
+    // 权重：只让"撞墙掉头"和"往前游"亮起来，其余留 0——
+    // 这样矩阵里能看出"某几行是亮的"，而不是一片均匀的底色。
+    let mut direct = vec![0.0f32; 17 * 6];
+    direct[5 * 6] = 10.0; // 右被挡 → 左
+    direct[4 * 6 + 1] = 10.0; // 左被挡 → 右
+    direct[13 * 6 + 1] = 1.5; // 食物 x → 右
+    direct[14 * 6 + 3] = 1.5; // 食物 y → 下
+    direct[12 * 6 + 2] = -3.0; // 光照 → 上（负向抑制）
+    direct[8 * 6 + 4] = 2.0; // 能量 → 吃
+
+    let mut inputs = [0.0f32; 17];
+    inputs[0] = 1.0; // 前方有食物
+    inputs[8] = 0.62; // 能量
+    inputs[9] = 0.06; // 年龄
+    inputs[10] = 1.0; // 朝向 x
+    inputs[12] = 0.70; // 光照
+    inputs[13] = 0.35; // 食物在右前方
+    inputs[14] = 0.55; // 偏下
+
+    let outputs = [0.05f32, 0.71, -0.24, 0.42, 0.86, 0.12];
+
+    SelectedOrganism {
+        id: 42,
+        anchor: (218, 341),
+        energy: 312,
+        max_energy: 3_500,
+        age: (1_204, 20_000),
+        speed: 1,
+        smell: 24,
+        upkeep: 37,
+        move_cost: 13,
+        mass: 13,
+        cells,
+        generation: 17,
+        parent: Some(23),
+        shape,
+        energy_trace: (0..32)
+            .map(|i| {
+                let t = i as f32 / 8.0;
+                (0.42 + 0.22 * t.sin() + 0.08 * (t * 3.1).cos()).clamp(0.0, 1.0)
+            })
+            .collect(),
+        inputs,
+        outputs,
+        direct,
     }
 }
 
@@ -434,6 +497,84 @@ fn ui_preview_png() {
         }
     }
     assert!(ink > 400, "检查器里几乎没有文字：只有 {ink} 个亮像素");
+
+    // 4b. 缩略图里必须**真的有细胞色块**。
+    //
+    //     缩略图是本轮新增的东西里最容易"静默不画"的一个：它的数据来自
+    //     `SelectedOrganism::shape`，主循环忘了填就是空 `Vec`，而空 `Vec`
+    //     画出来只是"一个空的凹槽"——看起来像"这条鱼没有身体"，
+    //     而不是"代码坏了"。
+    //
+    //     判据：检查器顶部那片区域里，至少能扫到 6 个**精确等于**某两种
+    //     细胞配色的像素（银鱼有 3 格移动 + 4 格生产者，两种颜色各占一片）。
+    let mut thumb = [0usize; vivarium_core::CellType::COUNT];
+    for y in top..(top + 120) {
+        for x in (W - insp + 8)..(W - 8) {
+            let c = px(x, y);
+            for k in vivarium_core::CellType::ALL {
+                if c == vivarium_core::palette::cell_rgb(k) {
+                    thumb[k.as_u8() as usize] += 1;
+                }
+            }
+        }
+    }
+    assert!(
+        thumb[vivarium_core::CellType::Mover.as_u8() as usize] > 4,
+        "缩略图里没有移动细胞：{thumb:?}"
+    );
+    assert!(
+        thumb[vivarium_core::CellType::Producer.as_u8() as usize] > 4,
+        "缩略图里没有生产者细胞：{thumb:?}"
+    );
+
+    // 4c. 输入 / 输出那两栏必须画出了**彩色的条**。
+    //
+    //     条形用的是 `theme::INFO`（蓝）和 `theme::ACCENT`（绿）。
+    //     这两种颜色在别处也会出现（强调色到处都是），所以判据放在
+    //     "检查器这一列里 INFO 蓝的像素数"上：输入有 17 行，
+    //     每行至少十几个像素宽，加起来不该只有个位数。
+    let info = [
+        vivarium_ui::theme::INFO.r(),
+        vivarium_ui::theme::INFO.g(),
+        vivarium_ui::theme::INFO.b(),
+    ];
+    let mut info_px = 0usize;
+    for y in top..(H - con - pal) {
+        for x in (W - insp + 8)..(W - 8) {
+            let c = px(x, y);
+            if (0..3).all(|i| c[i].abs_diff(info[i]) <= 2) {
+                info_px += 1;
+            }
+        }
+    }
+    assert!(
+        info_px > 120,
+        "检查器里几乎没有输入条（INFO 蓝只有 {info_px} 个像素）"
+    );
+
+    // 4d. 权重矩阵必须**在可见区域里**画出来。
+    //
+    //     判据是红色像素：矩阵里正权重用强调绿、负权重用错误红，
+    //     而界面里别处没有红色的大色块（只有错误日志的文字是红的，
+    //     而那在控制台，不在检查器这一列）。示例基因组里恰好有一个负权重
+    //     （光照 → 上，−3.0），它会画成一格红。
+    //
+    //     这一条同时钉住了**布局**：矩阵要是被挤到可视区外，
+    //     像素就扫不到——而那正是"功能做了但看不见"的典型症状。
+    let mut red = 0usize;
+    for y in top..(H - con - pal) {
+        for x in (W - insp + 8)..(W - 8) {
+            let c = px(x, y);
+            let (r, g, b) = (c[0] as i32, c[1] as i32, c[2] as i32);
+            if r > 90 && r > g + 30 && r > b + 30 {
+                red += 1;
+            }
+        }
+    }
+    assert!(
+        red > 20,
+        "检查器里找不到权重矩阵（红色像素只有 {red} 个）——它多半被挤到可视区外了"
+    );
 
     // 5. 中文字体必须装上，否则界面上全是方块。
     //

@@ -43,16 +43,22 @@ pub enum MaterialKind {
     /// 实测残骸占比从 1.7% 涨到 3.3%。而且它分不清"该不该还水"，
     /// 吃掉天然碎屑时也把水还了回去，水位因此漂了二十格。
     Corpse = 7,
-    /// 藻——长在海底与浅滩上的食物。
+    /// 藻——悬浮在透光层水里的食物。
     ///
-    /// 和尸体 / 碎屑分开的三条理由，每一条都对应一次真实的故障：
+    /// 和尸体 / 碎屑分开的理由，每一条都对应一次真实的故障：
     ///
-    /// 1. **它是静止的。** 藻如果是粉末，就会从"水 / 矿物"界面上掉下来，
-    ///    界面上空出一格又长出新的——"每列最多一格"的自限根本不成立，
-    ///    实测 32000 tick 藻堆到 4300 格，同时把水抽走了 4800 格。
+    /// 1. **它是悬浮物，不是地形。** 藻要是当成粉末，就会从"水 / 矿物"界面上
+    ///    掉下来，界面上空出一格又长出新的——自限根本不成立，实测 32000 tick
+    ///    藻堆到 4300 格，同时把水抽走了 4800 格。
     /// 2. **它不烂。** 藻是资源，不是垃圾；烂掉就等于"长出来又自己消失"。
     /// 3. **它需要被数出来。** 之前复用 `Remains`，想给藻封顶只能数
     ///    "全世界含能量的残骸"，而那里面还有天然碎屑——上限一开始就满了。
+    /// 4. **它不挡路。** 藻泡在水里，鱼要能游进去吃（见 [`Self::is_solid`]）。
+    ///
+    /// 它的移动规则是 [`MoveRule::Drifts`]：**自己不游，被流动的水推着走**。
+    /// 这一条同时解决了两个老问题——放在海底鱼够不着（一趟下潜的移动成本
+    /// 比整片藻席的能量还高），悬在水里又会把水流切成碎块（藻是静态固体时
+    /// 3000 格就让整个世界静止）。悬浮 + 可穿过 + 被水挤开，三者缺一不可。
     Algae = 8,
 }
 
@@ -108,8 +114,13 @@ impl MaterialKind {
             Self::Sand => 6,
             // 尸体和天然碎屑一样沉，互相顶不开——它们都是"已经落定的东西"。
             Self::Remains | Self::Corpse => 7,
-            // 藻不动，密度只用于"谁能挤开谁"，而它谁也挤不开。
-            Self::Algae => 5,
+            // 藻**比水轻**：水往下走的时候会把它挤上去。
+            //
+            // 这个数字不是为了"物理正确"，是为了让藻能被水流带走——
+            // 它自己不游（见 `MoveRule::Drifts`），唯一的位移来源就是
+            // "更重的东西把它顶开"。密度比水大的话，水永远推不动它，
+            // 藻就成了悬在水里的一块石头。
+            Self::Algae => 3,
             Self::Stone => 8,
         }
     }
@@ -117,11 +128,16 @@ impl MaterialKind {
     /// 是否为固体：不可移动，阻挡生物移动与繁殖。
     ///
     /// 注意 [`MaterialKind::Sand`] 也是固体——它靠重力堆积，不靠流动。
+    ///
+    /// **藻不是固体。** 它是泡在水里的悬浮物，鱼要能游进去吃
+    /// （见 [`crate::life_sim::LifeSim`] 的 `passable`）。做成固体的后果
+    /// 不是"鱼被挡住"这么轻：悬在水里的 3000 格藻会把水流切成碎块，
+    /// 实测整个世界静止（`移动 0`）、全部鱼被顶进空气里。
     #[inline]
     pub const fn is_solid(self) -> bool {
         matches!(
             self,
-            Self::Stone | Self::Sand | Self::Remains | Self::Corpse | Self::Algae
+            Self::Stone | Self::Sand | Self::Remains | Self::Corpse
         )
     }
 
@@ -147,8 +163,13 @@ impl MaterialKind {
         match self {
             // 气体易燃：一旦点着就顺着气团迅速蔓延。
             Self::Gas => 90,
-            // 残骸、尸体、藻都是有机物，烧得起来但没那么猛。
-            Self::Remains | Self::Corpse | Self::Algae => 40,
+            // 残骸与尸体是有机物，烧得起来但没那么猛。
+            //
+            // **藻不在这一行。** 它泡在水里点不着，而且它身上带着 120 点
+            // 生物可用能量——材质层没有账本，烧掉一格藻等于凭空销毁能量，
+            // 守恒断言会报"少了 N 点"，而那个报错指向生命层，查起来毫无头绪。
+            // 和"腐烂规则搬到生命层"是同一条理由（见 `life_sim::tick_organics`）。
+            Self::Remains | Self::Corpse => 40,
             _ => 0,
         }
     }
@@ -179,21 +200,29 @@ impl MaterialKind {
             Self::Stone | Self::Empty => MoveRule::Static,
             // 沙、残骸、尸体都是粉末：往下掉，按休止角堆积。
             Self::Sand | Self::Remains | Self::Corpse => MoveRule::Falls,
-            // 藻长在哪儿就在哪儿——**它必须是静止的**，否则自限不成立。
-            Self::Algae => MoveRule::Static,
+            // 藻是悬浮物：自己不游，但会被流动的水推开。
+            Self::Algae => MoveRule::Drifts,
             Self::Water => MoveRule::Flows,
             // 火和气体一样向上走；火的额外行为（寿命、点燃）在模拟层。
             Self::Fire | Self::Gas => MoveRule::Rises,
         }
     }
 
-    /// 是否会自己移动。空与石不会。
+    /// 是否会自己移动。
     ///
     /// 注意这和 [`MaterialKind::is_solid`] 问的是两件事：
     /// 残骸在移动意义上会沉降，在阻挡意义上仍然拦生物。
+    ///
+    /// [`MoveRule::Drifts`] **不算**自己会动：藻不主动挪，它只是**不抵抗**
+    /// 被水流推开（见 [`Self::displaceable_by`]）。这个区分是有后果的——
+    /// 让藻自己试着动，就得给"往上浮还是往下沉"一个方向，而那个方向
+    /// 一旦和水自己的运动方向相反，两格会永远互相换位，世界静不下来。
     #[inline]
     pub const fn is_mobile(self) -> bool {
-        !matches!(self.move_rule(), MoveRule::Static)
+        matches!(
+            self.move_rule(),
+            MoveRule::Falls | MoveRule::Flows | MoveRule::Rises
+        )
     }
 
     /// 是否为粉末——靠重力下落、按休止角堆积，**不会横向找平**。
@@ -202,21 +231,39 @@ impl MaterialKind {
         matches!(self.move_rule(), MoveRule::Falls)
     }
 
+    /// 这一格会不会被更重的东西挤开（不管挤开的是谁）。
+    ///
+    /// 只有空位、流体和悬浮物会让路。固体与粉末靠堆积互相支撑——
+    /// 这条保证了沙丘能立住、石头能当地基。
+    #[inline]
+    pub const fn yields_to_displacement(self) -> bool {
+        matches!(self, Self::Empty) || self.is_fluid() || matches!(self, Self::Algae)
+    }
+
     /// `other` 能否挤开 `self` 占据这一格。
     ///
     /// 这是材质层唯一的"谁给谁让路"判定，粉末下坠、液体下沉、气体上浮全都走它，
     /// 避免每个移动分支各写一套比较。规则有两条：
     ///
-    /// 1. 让路方只能是**空**或**流体**——固体与粉末靠堆积互相支撑，不让路。
-    ///    这条保证了沙丘能立住、石头能当地基。
+    /// 1. 让路方只能是**空**、**流体**或**悬浮物**（见 [`Self::yields_to_displacement`]）。
     /// 2. 挤开方必须比让路方**更重**。这条保证了沙沉进水里、水沉进气里、
     ///    而气体永远顶不开水。
+    ///
+    /// ## 藻只被水挤开
+    ///
+    /// 这一条比"密度更大就行"更严，是刻意的：藻必须**留在水里**。
+    /// 沙子从上面落下来时如果也能和藻换位，藻就会被换到沙子上方那一格——
+    /// 而那一格可能是空气，于是藻飘到天上去了，谁也弄不回来。
+    /// 现实里藻是悬浮在水里的，沙落下来只会盖住它，不会把它顶出水面。
     #[inline]
     pub const fn displaceable_by(self, other: Self) -> bool {
         if !other.is_mobile() {
             return false;
         }
-        if !matches!(self, Self::Empty) && !self.is_fluid() {
+        if !self.yields_to_displacement() {
+            return false;
+        }
+        if matches!(self, Self::Algae) && !matches!(other, Self::Water) {
             return false;
         }
         other.density() > self.density()
@@ -281,6 +328,13 @@ pub enum MoveRule {
     Flows,
     /// 气体 / 火：向上浮；上方被挡时尝试左上 / 右上；再不行就向两侧扩散。
     Rises,
+    /// 悬浮物：**不主动移动**，但会被更重的流体挤开（藻）。
+    ///
+    /// 为什么不给它一个"上浮"的规则：那需要藻主动和上面的水换位，
+    /// 而水自己也在往下换位——两格会永远互相换回来，分块脏标记永远清不空，
+    /// 跳块优化直接失效（同一个陷阱见 `sim::try_spread` 的注释）。
+    /// 被动让路没有这个问题：藻只在"别人要过去"时挪，没人动它就静止。
+    Drifts,
 }
 
 // ---------------------------------------------------------------------------
@@ -468,7 +522,7 @@ mod tests {
                 MaterialKind::Sand | MaterialKind::Remains | MaterialKind::Corpse => {
                     MoveRule::Falls
                 }
-                MaterialKind::Algae => MoveRule::Static,
+                MaterialKind::Algae => MoveRule::Drifts,
                 MaterialKind::Water => MoveRule::Flows,
                 MaterialKind::Fire | MaterialKind::Gas => MoveRule::Rises,
             };
@@ -482,6 +536,30 @@ mod tests {
         assert!(!MaterialKind::Stone.is_mobile());
         assert!(MaterialKind::Sand.is_mobile());
         assert!(MaterialKind::Water.is_mobile());
+    }
+
+    /// 藻是**悬浮物**：不挡路、不自己动、但会被水挤开。
+    ///
+    /// 这三条各对应一次真实的故障：挡路时鱼游不进去（也吃不到）；
+    /// 自己动时会和水互相换位、永远静不下来；不让路时会把水流切碎。
+    #[test]
+    fn algae_is_a_suspended_particle_not_a_wall() {
+        assert!(!MaterialKind::Algae.is_solid(), "藻不能挡路，鱼要游进去吃");
+        assert!(!MaterialKind::Algae.is_mobile(), "藻不自己动，只被水挤开");
+        assert_eq!(MaterialKind::Algae.move_rule(), super::MoveRule::Drifts);
+
+        // 水比藻重 ⇒ 水下沉时把藻顶上去，这就是"随水漂"的全部物理。
+        assert!(
+            MaterialKind::Algae.displaceable_by(MaterialKind::Water),
+            "水应当能挤开藻"
+        );
+        // 但只有水能。沙落下来只会盖住它，不能把它顶出水面。
+        assert!(
+            !MaterialKind::Algae.displaceable_by(MaterialKind::Sand),
+            "沙不能挤开藻——否则藻会被顶到空气里，再也下不来"
+        );
+        // 藻自己挤不开任何东西。
+        assert!(!MaterialKind::Water.displaceable_by(MaterialKind::Algae));
     }
 
     #[test]

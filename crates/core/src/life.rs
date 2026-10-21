@@ -105,6 +105,23 @@ impl CellType {
         self as u8
     }
 
+    /// 从字节还原。越界时回退到 [`CellType::Mouth`]。
+    ///
+    /// 和 [`MaterialKind::from_u8`] 成对：两处都需要"把界面传来的
+    /// 一个 `u8` 变回枚举"，而 `as_u8` 有逆运算才谈得上可逆。
+    #[inline]
+    pub const fn from_u8(v: u8) -> Self {
+        match v {
+            1 => Self::Producer,
+            2 => Self::Mover,
+            3 => Self::Eye,
+            4 => Self::Killer,
+            5 => Self::Armor,
+            6 => Self::Builder,
+            _ => Self::Mouth,
+        }
+    }
+
     /// 每 tick 的维持成本。
     ///
     /// 活着必须很贵——这是"长更多嘴还是长更多腿"能成为真问题的前提
@@ -300,12 +317,50 @@ pub const MAX_SMELL_RADIUS: i32 = 32;
 /// 每多几个移动细胞，每 tick 多走一格。
 ///
 /// 取 4：银鱼（3 移动）走 1 格、水母（4）走 2 格、蠕虫（6）走 2 格。
-/// 移动成本按 `质量 / 速度` 摊到每一步，所以**总成本不随速度上涨**——
-/// 多长几格移动细胞买的是"同样的钱跑得更远"，代价是维持成本和重量。
 pub const MOVERS_PER_EXTRA_STEP: usize = 4;
 
 /// 每 tick 最多走几格。
 pub const MAX_STEPS: i32 = 3;
+
+/// 移动的基础能量成本（再按质量加成）。
+pub const MOVE_COST: u32 = 1;
+
+/// 走一格要付多少能量：`质量 × (速度 + 1) / 2 / 速度`。
+///
+/// 也就是**走满 `速度` 格的总成本 = 质量 × (速度 + 1) / 2**：
+///
+/// | 速度 | 每 tick 总成本 | 每格成本 |
+/// |---|---|---|
+/// | 1 | `1.0 × 质量` | `1.00 × 质量` |
+/// | 2 | `1.5 × 质量` | `0.75 × 质量` |
+/// | 3 | `2.0 × 质量` | `0.67 × 质量` |
+///
+/// ## 为什么不是"每格成本恒定"
+///
+/// 每格恒定（总成本 = 质量 × 速度）听起来更物理——"跑得远就烧得多"。
+/// 但它是**2 倍**的跳变：水母有 4 个移动细胞、速度 2，实测在真实水面
+/// （光 0.70）下的净收益只有 +6.2/tick，翻倍之后直接变成负数，整批饿死。
+///
+/// 折中成 `(速度+1)/2` 之后，"跑得快更烧钱"这件事在**每 tick** 上成立
+/// （这才是 tick 制模拟里真正要权衡的东西），而每格成本反而略降——
+/// 多长移动细胞买的是"同样一份钱跑得更远"，代价是维持成本和重量。
+/// 于是速度和体型之间第一次有了真正的取舍：**要么快而贵，要么慢而省**。
+#[inline]
+pub const fn move_cost(mass: u32, speed: i32) -> u32 {
+    let speed = if speed < 1 { 1 } else { speed as u32 };
+    let mass = if mass < 1 { 1 } else { mass };
+    let per_tick = MOVE_COST * mass * (speed + 3) / 4;
+    per_tick.div_ceil(speed)
+}
+
+/// 能量走势采样的间隔（tick）。
+///
+/// 检查器要画一条"这个身体最近过得怎么样"的曲线。32 格 × 16 tick = 512 tick
+/// 的历史，1× 速度下约 8 秒——够看出"它是在攒钱还是在挨饿"。
+pub const ENERGY_HIST_INTERVAL: u64 = 16;
+
+/// 能量走势保留多少个采样点。
+pub const ENERGY_HIST: usize = 32;
 
 /// 基因组：行为网络权重 + 形态发生网络。
 #[derive(Debug, Clone, PartialEq)]
@@ -519,6 +574,22 @@ pub struct Organism {
     /// 生命层是单线程顺序执行的，这一位主要防"繁殖出来的子代在同一个 tick
     /// 里又行动一次"——那种情况会让一代的繁殖速度凭空翻倍。
     pub acted: bool,
+    /// 上一次感知到的输入。
+    ///
+    /// 存下来**只为了给检查器看**：界面要能回答"这个身体此刻闻到了什么、
+    /// 饿不饿、前面有没有墙"。不存的话，那些数字在 `act_one` 结束时就没了，
+    /// 而重新算一遍需要一份 `&World`——界面层拿不到，也不该拿到。
+    pub last_inputs: [f32; INPUTS],
+    /// 上一次决策的输出。
+    pub last_out: [f32; OUTPUTS],
+    /// 能量走势（环形缓冲，每 [`ENERGY_HIST_INTERVAL`] tick 采一格）。
+    ///
+    /// 用 `u16` 存原值而不是归一化后的 `f32`：上限会随体型变，
+    /// 归一化要在**读的时候**按当时的 `max_energy` 算，否则长身体之后
+    /// 整条曲线会突然缩水一半。
+    pub energy_hist: [u16; ENERGY_HIST],
+    /// 环形缓冲的写入位置。
+    pub hist_head: u8,
 }
 
 impl Organism {
@@ -539,7 +610,27 @@ impl Organism {
             parent: None,
             generation: 0,
             acted: false,
+            last_inputs: [0.0; INPUTS],
+            last_out: [0.0; OUTPUTS],
+            energy_hist: [0; ENERGY_HIST],
+            hist_head: 0,
         }
+    }
+
+    /// 采一格能量走势。调用方按 [`ENERGY_HIST_INTERVAL`] 控制频率。
+    #[inline]
+    pub fn sample_energy(&mut self) {
+        let e = self.energy.min(u16::MAX as u32) as u16;
+        self.energy_hist[self.hist_head as usize] = e;
+        self.hist_head = ((self.hist_head as usize + 1) % ENERGY_HIST) as u8;
+    }
+
+    /// 能量走势，从旧到新。`max` 用来归一化，0 表示"不知道上限"。
+    pub fn energy_trace(&self) -> impl Iterator<Item = u16> + '_ {
+        (0..ENERGY_HIST).map(move |i| {
+            let idx = (self.hist_head as usize + i) % ENERGY_HIST;
+            self.energy_hist[idx]
+        })
     }
 
     /// 把 x 折回 `0..width`。`width == 0` 时原样返回。
@@ -664,11 +755,21 @@ impl Organism {
     /// **这是"形状有用"的第一条**。在此之前移动细胞只影响维持成本和重量，
     /// 一个 6 移动细胞的蠕虫和一个 3 移动细胞的银鱼跑得一样快——
     /// 于是"多长几格移动细胞"永远是个坏买卖，体型不可能朝这个方向进化。
+    ///
+    /// 代价由 [`move_cost`] 收：速度每加一档，**每 tick** 的移动成本就往上跳
+    /// 一跳（1.0 → 1.5 → 2.0 倍质量）。所以"快"不是白拿的，
+    /// 什么时候值得快，由生态自己筛。
     #[inline]
     pub fn speed(&self) -> i32 {
         let movers = self.count(CellType::Mover);
         let extra = movers / MOVERS_PER_EXTRA_STEP;
         (1 + extra as i32).min(MAX_STEPS)
+    }
+
+    /// 走一格要付多少能量。见 [`move_cost`]。
+    #[inline]
+    pub fn move_cost(&self) -> u32 {
+        move_cost(self.mass(), self.speed())
     }
 
     /// 嗅觉射线有多长。

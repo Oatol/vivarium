@@ -88,6 +88,14 @@ impl Egui {
         }
     }
 
+    /// 上一帧算出来的中央矩形（**逻辑像素**）。世界该画在这里。
+    ///
+    /// 主循环每帧拿它做两件事：告诉渲染器"世界画在哪一块"，
+    /// 以及判断"鼠标是不是在世界里"。
+    pub fn central(&self) -> egui::Rect {
+        self.central
+    }
+
     /// 中文字体装上了没有。横幅里要说出来——装不上时界面会满屏方块。
     pub fn font(&self) -> Option<&str> {
         self.ui.font.as_deref()
