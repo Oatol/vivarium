@@ -34,8 +34,11 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
-use vivarium_core::life_sim::{stock_surface, LifeSim};
+use vivarium_core::life_sim::{stock_surface, LifeSim, MAX_AGE};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
+use vivarium_ui::state::{SelectedOrganism, Snapshot};
+mod ui_glue;
+
 use vivarium_render::ascii::{AsciiRenderer, Camera};
 use vivarium_render::pixel::PixelRenderer;
 use vivarium_render::pixel::Viewport;
@@ -220,6 +223,14 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // **界面先收事件。** 鼠标在面板上时，世界不该同时收到这次点击——
+        // 否则点一次"暂停"会顺手在画布上画一笔。
+        //
+        // 顺序不能反过来：egui 的命中测试依赖"这一帧之前"的布局，
+        // 而布局是上一帧算好的，所以事件必须先经过它。
+        let window = game.window.clone();
+        let consumed = game.ui.on_window_event(&window, &event);
+
         match event {
             WindowEvent::CloseRequested => event_loop.exit(),
 
@@ -230,12 +241,27 @@ impl ApplicationHandler for App {
 
             WindowEvent::KeyboardInput { event, .. } => {
                 // 忽略松键与自动重复，否则按住 R 会以每秒 30 次的速度重铺地形。
-                if event.state == ElementState::Pressed && !event.repeat {
+                // `consumed` 为真说明焦点在界面的输入框里（将来会有），
+                // 那时不该再触发世界快捷键。
+                if !consumed && event.state == ElementState::Pressed && !event.repeat {
                     game.on_key(&event.logical_key, event_loop);
                 }
             }
 
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: winit::event::MouseButton::Left,
+                ..
+            } => {
+                if !consumed {
+                    game.on_click();
+                }
+            }
+
             WindowEvent::MouseWheel { delta, .. } => {
+                if consumed {
+                    return;
+                }
                 // 每格滚轮的放大倍率。1.15 是试出来的：再小要滚很久才看得见变化，
                 // 再大一次误触就从全景跳到细胞内部，找不到自己在哪。
                 let lines = match delta {
@@ -249,7 +275,11 @@ impl ApplicationHandler for App {
                 }
             }
 
-            WindowEvent::RedrawRequested => game.frame(),
+            WindowEvent::CursorMoved { position, .. } => {
+                game.cursor = Some((position.x, position.y));
+            }
+
+            WindowEvent::RedrawRequested => game.frame(event_loop),
 
             _ => {}
         }
@@ -280,6 +310,18 @@ struct Game {
     seed: u64,
     /// 放鱼时用形态发生还是手工体型表。跟着命令行开关走，中途不变。
     morph: bool,
+
+    /// 界面。它的 GPU 资源在 `create` 里建，因为它要拿到渲染器的 device。
+    ui: ui_glue::Egui,
+    /// 种群曲线的历史（归一化到 0..1）。每 8 帧采一次点。
+    ///
+    /// 采样频率而不是每帧：曲线只有几百个像素宽，每帧一个点会把
+    /// 窗口压缩到"只有最近一秒"，看不出趋势。
+    history: Vec<f32>,
+    /// 上次采样时的 tick。用来做"每 N tick 采一点"。
+    history_tick: u64,
+    /// 光标在窗口里的位置（物理像素）。点击时用它换算成世界格。
+    cursor: Option<(f64, f64)>,
 
     scale: TimeScale,
     budget: FrameBudget,
@@ -322,6 +364,8 @@ impl Game {
             println!("启动时投放 {} 条鱼", ids.len());
         }
 
+        let ui = ui_glue::Egui::new(renderer.device(), renderer.surface_format(), &window);
+
         Ok(Self {
             window,
             instance,
@@ -333,6 +377,10 @@ impl Game {
             rng,
             seed: opts.seed,
             morph: opts.morph,
+            ui,
+            history: Vec::with_capacity(160),
+            history_tick: 0,
+            cursor: None,
             scale: TimeScale::X1,
             budget: FrameBudget::default(),
             last_tick_cost: Duration::ZERO,
@@ -357,10 +405,11 @@ impl Game {
   地貌      : 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列
   世界纹理  : {} KiB（脏块增量上传）
   生物      : {} 条 · {} 个细胞 · 能量 {}
+  界面      : egui · 中文字体 {}
 
   空格 暂停/继续 · 1/2/3/4 速度 · F 点火 · L 放鱼 · R 重铺地形 · Esc 退出
 
-  滚轮 缩放 · 方向键 平移 · 0 回到全景",
+  滚轮 缩放 · 方向键 平移 · 0 回到全景 · B/E/R/L/F/I/Q 换工具",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -378,6 +427,12 @@ impl Game {
                 .map(|o| o.cell_count())
                 .sum::<usize>(),
             self.life.stats().energy,
+            // 字体装不上时界面会满屏方块。这句话是唯一能让人立刻知道
+            // "为什么界面上全是口口口"的地方。
+            match self.ui.font() {
+                Some(path) => format!("已装载（{path}）"),
+                None => "**未找到**（中文会显示成方块）".to_owned(),
+            },
         )
     }
 
@@ -413,6 +468,56 @@ impl Game {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// 左键点在世界上。
+    ///
+    /// 现在只做一件事：**用检查工具选中点到的那个生物**。
+    /// 画笔落笔还没接（那是下一步），但"能选中、能在右边看到它的内部"
+    /// 已经让这个界面有用了——它把"看"和"改"分开了，
+    /// 而"看"是不需要写世界的，风险最低。
+    fn on_click(&mut self) {
+        use vivarium_ui::state::Tool;
+
+        // 鼠标在面板上就别动了。
+        //
+        // 光靠 `consumed` 不够：egui 只在"某个控件要独占这个事件"时
+        // 才报 consumed，点在面板的**空白处**它不报。而人点空白处
+        // 也绝对不是在点世界——那会顺手在画布上落一笔。
+        if self.ui.pointer_over_ui {
+            return;
+        }
+
+        let Some(pos) = self.cursor else { return };
+        let size = self.renderer.surface_size();
+        let Some((cx, cy)) = self.renderer.cell_at((pos.0 as f32, pos.1 as f32), size) else {
+            return;
+        };
+        let (x, y) = (cx.floor() as isize, cy.floor() as isize);
+        if !self.world.in_bounds(x, y) {
+            return;
+        }
+
+        if self.ui.state.tool == Tool::Inspect {
+            let owner = self.world.owner(x, y);
+            let picked = if owner.organism != 0 {
+                Some(owner.organism)
+            } else {
+                None
+            };
+            self.ui.state.selected = picked;
+            let tick = self.world.tick();
+            match picked {
+                Some(id) => self
+                    .ui
+                    .log(tick, vivarium_ui::Level::Info, format!("选中 #{id}")),
+                None => self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("({x}, {y}) 没有生物"),
+                ),
+            }
         }
     }
 
@@ -484,7 +589,7 @@ impl Game {
         self.life = LifeSim::new(&mut self.world);
     }
 
-    fn frame(&mut self) {
+    fn frame(&mut self, event_loop: &ActiveEventLoop) {
         let tick_start = Instant::now();
         let ticks = self.budget.plan_ticks(self.scale, self.last_tick_cost);
         for _ in 0..ticks {
@@ -496,13 +601,169 @@ impl Game {
             self.last_tick_cost = tick_start.elapsed() / ticks;
         }
 
-        if let Err(e) = self.renderer.render(&self.world) {
+        self.sample_history();
+
+        // --- 界面 ---------------------------------------------------------
+        //
+        // 顺序是：先跑界面逻辑（拿到命令），执行命令，再一次性渲染。
+        // 反过来（先渲染再处理命令）会让"点了暂停"慢一帧才生效——
+        // 而人眼对"点下去没反应"极其敏感，一帧也看得出来。
+        let snap = self.snapshot();
+        let mut frame = self.ui.run_frame(&self.window, &snap);
+        // 把命令**取出来**而不是移出去：`frame` 后面还要交给 `paint`，
+        // 只移走一个字段会让它变成部分移动，借不出去。
+        for cmd in std::mem::take(&mut frame.commands) {
+            self.handle_command(cmd, event_loop);
+        }
+
+        // --- 画 -----------------------------------------------------------
+        //
+        // device / queue 先克隆出来：`render_with` 要独占 `renderer`，
+        // 而闭包里又要用 device/queue。wgpu 的这两样都是引用计数的句柄，
+        // 克隆是廉价的。
+        let device = self.renderer.device().clone();
+        let queue = self.renderer.queue().clone();
+        let size = self.renderer.surface_size();
+        let Self {
+            renderer,
+            ui,
+            world,
+            ..
+        } = self;
+        if let Err(e) = renderer.render_with(world, |encoder, target| {
+            ui.paint(frame, &device, &queue, encoder, target, size);
+        }) {
             eprintln!("渲染失败：{e}");
         }
 
         self.refresh_title();
         // 一直重画：模拟速度与帧率是解耦的，暂停时也应当保持窗口响应。
         self.window.request_redraw();
+    }
+
+    /// 每 8 帧采一个种群点，压进 `history`。
+    fn sample_history(&mut self) {
+        if self.world.tick() == self.history_tick {
+            return;
+        }
+        self.history_tick = self.world.tick();
+        // 归一化的分母：能量上限的粗估。用"当前最大"归一化的话，
+        // 曲线会随种群涨落整体缩放，看不出真正的趋势。
+        let n = self.life.stats().organisms as f32;
+        self.history.push((n / 200.0).clamp(0.0, 1.0));
+        if self.history.len() > 200 {
+            self.history.remove(0);
+        }
+    }
+
+    /// 把当前状态打包成界面要的那份只读快照。
+    fn snapshot(&self) -> Snapshot {
+        let life = self.life.stats();
+        let sim = self.sim.stats();
+        let size = self.window.inner_size();
+        let px = self.renderer.pixels_per_cell((size.width, size.height));
+
+        Snapshot {
+            tick: self.world.tick(),
+            fps: self.fps,
+            ms_per_tick: self.last_tick_cost.as_secs_f64() as f32 * 1000.0,
+            scale: self.scale,
+            world_size: (self.world.width() as u32, self.world.height() as u32),
+            pixels_per_cell: px,
+            active_chunks: (sim.active_chunks, self.world.chunk_count()),
+            organisms: life.organisms,
+            cells: life.cells,
+            energy: life.energy,
+            killers: life.killers,
+            body_range: (life.min_cells, life.max_cells),
+            generation: life.max_generation,
+            stranded: life.stranded,
+            food: self.life.food_cells(&self.world),
+            census: self.world.census(),
+            history: self.history.clone(),
+            selected: self.selected_view(),
+        }
+    }
+
+    /// 把"界面里选中的那个 id"翻译成一个值快照。
+    ///
+    /// 生物可能已经死了——那时 `organism()` 返回 `None`，界面显示"已死亡"
+    /// 比显示一组冻结的数字诚实。
+    fn selected_view(&self) -> Option<SelectedOrganism> {
+        let id = self.ui.state.selected?;
+        let org = self.life.organism(id)?;
+        let mut cells = [0usize; vivarium_core::CellType::COUNT];
+        for cell in &org.cells {
+            cells[cell.kind.as_u8() as usize] += 1;
+        }
+        Some(SelectedOrganism {
+            id: org.id,
+            anchor: org.anchor,
+            energy: org.energy,
+            age: (org.age, MAX_AGE),
+            speed: org.speed(),
+            smell: org.smell_radius(),
+            cells,
+            generation: org.generation,
+        })
+    }
+
+    /// 执行界面发来的命令。
+    fn handle_command(&mut self, cmd: vivarium_ui::Command, event_loop: &ActiveEventLoop) {
+        use vivarium_ui::Command as C;
+        // 界面自己就能处理的（选中、工具、笔刷）先让它处理掉。
+        if self.ui.apply(cmd.clone()) {
+            return;
+        }
+        match cmd {
+            C::TogglePause => {
+                self.scale = if self.scale.is_paused() {
+                    TimeScale::X1
+                } else {
+                    TimeScale::Paused
+                };
+            }
+            C::Step => {
+                // 单步 = 暂停状态下跑一个 tick。不暂停时点它没有意义，
+                // 所以顺手把状态设成暂停——"按了单步，画面停住走一步"。
+                self.scale = TimeScale::Paused;
+                self.life.step(&mut self.world);
+                self.sim.step(&mut self.world);
+            }
+            C::SetScale(scale) => self.scale = scale,
+            C::Reseed => {
+                self.reseed();
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("重铺地形，种子 {}", self.seed),
+                );
+            }
+            C::Drop(n) => {
+                let ids = stock_surface(&mut self.world, &mut self.life, n, 300, self.morph);
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("投放 {} 条", ids.len()),
+                );
+            }
+            C::Ignite => {
+                self.ignite_peak();
+                let tick = self.world.tick();
+                self.ui.log(tick, vivarium_ui::Level::Warn, "岛顶点火");
+            }
+            C::CenterView => {
+                let size = (self.world.width() as u32, self.world.height() as u32);
+                self.renderer.set_viewport(Viewport::centered_on(size));
+            }
+            C::Zoom(factor) => self.renderer.zoom_by(factor),
+            C::RunFor(_) => {}
+            C::Quit => event_loop.exit(),
+            // 界面已经处理过的（Select / SetTool / SetBrush / SetMaterial / SetCell）。
+            _ => {}
+        }
     }
 
     fn refresh_title(&mut self) {

@@ -22,3 +22,14 @@ vivarium-app.workspace = true
 winit.workspace = true
 wgpu.workspace = true
 pollster.workspace = true
+
+# 界面的 GPU 侧接线。`vivarium-ui` 本身只有 egui，这两个是"把它搬到屏幕上"
+# 的那一段，和窗口一样属于应用层。
+egui.workspace = true
+egui-wgpu.workspace = true
+egui-winit.workspace = true
+
+[dev-dependencies]
+# 离屏截图：把一帧 UI 渲染成 PNG，让人眼确认布局与配色。
+# 像素类的问题（对不齐、颜色脏、字被裁掉）写不出好断言，只能看。
+png = "0.18"

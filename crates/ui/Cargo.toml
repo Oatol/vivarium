@@ -1,6 +1,6 @@
 [package]
 name = "vivarium-ui"
-description = "Vivarium 界面层：参数面板、生物检查器、统计图表"
+description = "Vivarium 界面层：主题、自绘控件、面板骨架"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -9,4 +9,10 @@ license.workspace = true
 [dependencies]
 vivarium-core.workspace = true
 
-# egui / egui-wgpu 将随 M0 第二步的 wgpu 一起接入。
+# **只有 egui，没有 wgpu / winit。**
+#
+# 这条约束和 `vivarium-render` 不依赖 winit 是同一条：界面"长什么样、
+# 点了什么"和"怎么把三角形提交给 GPU"是两件事。分开之后 `crates/ui`
+# 可以在没有显卡的机器上跑布局测试（egui 的 tessellate 是纯 CPU 的），
+# GPU 接线全部留在 `bins/game`。
+egui.workspace = true

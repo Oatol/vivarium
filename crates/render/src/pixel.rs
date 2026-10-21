@@ -890,6 +890,20 @@ impl PixelRenderer {
         (self.config.width, self.config.height)
     }
 
+    /// GPU 设备。界面层要用它建自己的管线。
+    ///
+    /// 暴露 device 是**刻意的**，不是封装泄漏：整个程序只有一个
+    /// `wgpu::Device`，谁想画东西都得用它。让应用层自己再建一个 device
+    /// 才是真的错——两个 device 之间的纹理不能共享，画面会变成黑的。
+    pub fn device(&self) -> &wgpu::Device {
+        &self.device
+    }
+
+    /// 提交队列。
+    pub fn queue(&self) -> &wgpu::Queue {
+        &self.blitter.queue
+    }
+
     /// 世界纹理占多少字节。
     /// 当前相机。
     pub fn viewport(&self) -> Viewport {
@@ -935,6 +949,47 @@ impl PixelRenderer {
         }
     }
 
+    /// 屏幕坐标（物理像素）→ 世界格坐标。
+    ///
+    /// 返回的是**连续坐标**（可以落在格子的任意位置），不是整数格号：
+    /// 取整是调用方的事——画笔要取整，镜头对准要保留小数。
+    ///
+    /// ## 为什么必须和 `pixels_per_cell` 用同一套算法
+    ///
+    /// 世界纹理是按 letterbox 缩放进交换链的：正方形世界放进宽屏窗口时
+    /// 左右留黑边。如果这里忘了算黑边，鼠标点击会整体偏一段，
+    /// 而且**只在非正方形窗口里偏**——这种 bug 在自己机器上很难撞见。
+    pub fn cell_at(&self, screen: (f32, f32), target: (u32, u32)) -> Option<(f32, f32)> {
+        if target.0 == 0 || target.1 == 0 {
+            return None;
+        }
+        let world = self.blitter.world_size;
+        let lb = letterbox(world, target);
+        let drawn_w = target.0 as f32 * lb.scale[0];
+        let drawn_h = target.1 as f32 * lb.scale[1];
+        if drawn_w <= 0.0 || drawn_h <= 0.0 {
+            return None;
+        }
+        let origin = (
+            (target.0 as f32 - drawn_w) * 0.5 + lb.offset[0],
+            (target.1 as f32 - drawn_h) * 0.5 + lb.offset[1],
+        );
+
+        // 归一化到"画出来的那一块"里。落在黑边上就是 `None`——
+        // 那是世界之外，点它不该有任何效果。
+        let u = (screen.0 - origin.0) / drawn_w;
+        let v = (screen.1 - origin.1) / drawn_h;
+        if !(0.0..=1.0).contains(&u) || !(0.0..=1.0).contains(&v) {
+            return None;
+        }
+
+        let vp = self.blitter.viewport;
+        let (vw, vh) = vp.view_size(world);
+        let left = vp.center.0 - vw * 0.5;
+        let top = vp.center.1 - vh * 0.5;
+        Some((left + u * vw, top + v * vh))
+    }
+
     pub fn world_texture_bytes(&self) -> u64 {
         self.blitter.world_texture_bytes()
     }
@@ -952,6 +1007,25 @@ impl PixelRenderer {
     /// 上一帧上传的块数。用来观察增量上传有没有生效。
     pub const fn uploaded_chunks(&self) -> usize {
         self.blitter.stats.last_uploaded_chunks
+    }
+
+    /// 渲染一帧，并在同一个 encoder 里让调用方画叠加层。
+    ///
+    /// ## 为什么要一个回调，而不是"先渲染、再让调用方提交"
+    ///
+    /// 交换链的帧必须由**拿到它的那个人**提交并 present。如果把这个职责
+    /// 拆出去，调用方就得同时管 frame、encoder、present 三件事，
+    /// 而它们全都只在 `render` 里有意义。回调让"画在世界之上"这件事
+    /// 变成一次函数调用，不多不少。
+    ///
+    /// 回调拿到的 `TextureView` 与 `render` 用的是同一个，所以叠加层
+    /// 天然在世界之上，不需要任何深度/混合的特殊处理——egui 的管线
+    /// 自己会做 alpha 混合。
+    pub fn render_with<F>(&mut self, world: &World, overlay: F) -> Result<(), RenderError>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
+        self.render_frame(world, overlay)
     }
 
     fn reconfigure(&mut self) {
@@ -977,6 +1051,20 @@ impl Renderer for PixelRenderer {
     }
 
     fn render(&mut self, world: &World) -> Result<(), RenderError> {
+        self.render_frame(world, |_, _| {})
+    }
+
+    fn name(&self) -> &'static str {
+        "pixel(wgpu)"
+    }
+}
+
+impl PixelRenderer {
+    /// 真正的渲染流程。`overlay` 在世界的 blit 之后、present 之前执行。
+    fn render_frame<F>(&mut self, world: &World, overlay: F) -> Result<(), RenderError>
+    where
+        F: FnOnce(&mut wgpu::CommandEncoder, &wgpu::TextureView),
+    {
         // 1. 把世界的新像素推上 GPU。静止的块在这里被完全跳过。
         self.blitter.upload(world)?;
 
@@ -1025,6 +1113,14 @@ impl Renderer for PixelRenderer {
             &target,
             (self.config.width, self.config.height),
         );
+
+        // 3b. 叠加层（界面）。**同一个 encoder、同一个 target**，
+        // 所以界面画在世界之上，且和世界一起提交、一起 present。
+        //
+        // 换成一个"渲染器返回纹理、应用层再画一次"的写法也能work，
+        // 但那要多一次全屏拷贝，而且要多管一张纹理的生命周期。
+        // 回调最省事：调用方拿到 encoder 和 view，画完就返回。
+        overlay(&mut encoder, &target);
         drop(target);
 
         // 4. 呈现。wgpu 30 把 present 挪到了 Queue 上。
@@ -1034,10 +1130,6 @@ impl Renderer for PixelRenderer {
         self.last_skip = None;
         self.blitter.stats.drawn_frames += 1;
         Ok(())
-    }
-
-    fn name(&self) -> &'static str {
-        "pixel(wgpu)"
     }
 }
 

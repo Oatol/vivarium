@@ -28,6 +28,14 @@ winit = "0.30"
 pollster = "1.0"
 bytemuck = { version = "1.25", features = ["derive"] }
 
+# 界面。三个 crate 必须锁在同一个 minor 上：egui-wgpu 0.37 依赖 wgpu 30，
+# egui-winit 0.37 依赖 winit 0.30.13——正好是本项目已经用的那两个大版本。
+# 错一个小版本就得在依赖图里塞两份 wgpu，而两份 wgpu 的 device 类型不通用，
+# egui 根本拿不到渲染器的 device。
+egui = "0.37"
+egui-wgpu = "0.37"
+egui-winit = "0.37"
+
 # 发布构建：模拟内核要跑得快，但调试信息保留到 line-tables-only，
 # 这样 release 下依然能拿到可读的 panic 栈。
 [profile.release]

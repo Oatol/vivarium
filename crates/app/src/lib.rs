@@ -9,42 +9,15 @@
 
 #![allow(dead_code)]
 
-/// 模拟速度档位。
-///
-/// SPEC 第 6 节 D 类工具（时间控制）。这类游戏的标配是"模拟速度与帧率解耦"——
-/// 允许每帧跑多个 tick，而不是被 60 FPS 锁死。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub enum TimeScale {
-    /// 暂停。
-    Paused,
-    /// 1 tick / 帧。
-    #[default]
-    X1,
-    /// 5 tick / 帧。
-    X5,
-    /// 50 tick / 帧。
-    X50,
-    /// 尽可能快，由 [`FrameBudget`] 裁剪。
-    Max,
-}
-
-impl TimeScale {
-    /// 本档位请求的 tick 数。`Max` 返回 `u32::MAX`，交由帧预算裁剪。
-    pub const fn requested_ticks(self) -> u32 {
-        match self {
-            Self::Paused => 0,
-            Self::X1 => 1,
-            Self::X5 => 5,
-            Self::X50 => 50,
-            Self::Max => u32::MAX,
-        }
-    }
-
-    /// 是否处于暂停。
-    pub const fn is_paused(self) -> bool {
-        matches!(self, Self::Paused)
-    }
-}
+// 速度档住在 `vivarium-core`，这里原样转发。
+//
+// 挪下去的理由是**依赖方向**：界面层要显示"现在几倍速"，而它只能依赖
+// core（不能依赖 app，app 依赖它）。`TimeScale` 又是纯数据、不含任何
+// 循环逻辑，所以放进 core 是最省事且不欠债的做法。
+//
+// `FrameBudget` 留在这一层：它算的是"一帧留多少时间给模拟"，
+// 那是应用层的事，和 core 无关。
+pub use vivarium_core::TimeScale;
 
 /// 每帧的 tick 预算。
 ///
