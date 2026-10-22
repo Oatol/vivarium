@@ -229,8 +229,6 @@ impl Egui {
             Command::Step => false,
             Command::SetScale(_) => false,
             Command::Reseed => false,
-            Command::Drop(_) => false,
-            Command::Ignite => false,
             Command::CenterView => false,
             Command::Zoom(_) => false,
             Command::Select(id) => {
@@ -262,6 +260,11 @@ impl Egui {
             Command::PlaceBody(_) => false,
             Command::SaveBody { .. } => false,
             Command::DeleteBody(_) => false,
+            // 「世界」窗口的四条同理：它们全都要碰磁盘。
+            Command::NewWorld { .. } => false,
+            Command::SaveWorld(_) => false,
+            Command::LoadWorld(_) => false,
+            Command::RefreshSaves => false,
             Command::Quit => false,
         }
     }

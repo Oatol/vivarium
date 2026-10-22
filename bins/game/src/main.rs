@@ -22,9 +22,10 @@
 //! | 左键 | 落笔（工具决定画 / 擦 / 填 / 吸 / 看） |
 //! | 右键 / 中键拖拽 | 平移视野 |
 //! | 滚轮 | 以指针为中心缩放 |
-//! | B / E / F / I / Q | 画笔 / 橡皮 / 填充 / 取样 / 检查 |
-//! | G | 在最高的岛顶点一把火 |
-//! | L | 放一批鱼 |
+//! | B / X / E / F / I / Q / P | 画笔 / 擦生物 / 擦物质 / 填充 / 取样 / 检查 / 光源 |
+//! | W | 生物工坊 |
+//! | G | 世界（新建 / 保存 / 读取） |
+//! | V | 换显示滤镜 |
 //! | R | 重新铺一遍地形（用来验证增量上传确实在工作） |
 //! | Esc | 退出 |
 //!
@@ -42,8 +43,9 @@ use vivarium_app::{FrameBudget, TimeScale};
 use vivarium_core::life::{Cell, CellType, Organism, BIRTH_ENERGY_PER_CELL};
 use vivarium_core::life::{Genome, INPUTS, OUTPUTS};
 use vivarium_core::life_sim::{handcrafted_fish_genome, stock_surface, LifeSim, Tactic, MAX_AGE};
-use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
+use vivarium_core::{save, worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_ui::state::{SelectedOrganism, Snapshot};
+mod clock;
 mod ui_glue;
 
 use vivarium_render::ascii::{AsciiRenderer, Camera};
@@ -425,7 +427,7 @@ impl Game {
         // 而且用户可能在外面手改了文件。
         ui.state.library = load_library();
 
-        Ok(Self {
+        let mut game = Self {
             window,
             instance,
             renderer,
@@ -452,7 +454,13 @@ impl Game {
             fps_window_start: Instant::now(),
             fps_frames: 0,
             fps: 0.0,
-        })
+        };
+        // 默认存档名带上今天的日期（**本地**日期，见 `clock`）：
+        // 一天存好几个档时，"world" 会一路覆盖成 world(1) world(2)，
+        // 而带日期至少能一眼看出这是哪天的世界。
+        game.ui.state.world.save_name = format!("world-{}", clock::today().compact());
+        game.refresh_saves();
+        Ok(game)
     }
 
     fn banner(&self) -> String {
@@ -547,11 +555,11 @@ impl Game {
                 "i" | "I" => self.pick_tool(vivarium_ui::state::Tool::Pick),
                 "q" | "Q" => self.pick_tool(vivarium_ui::state::Tool::Inspect),
                 "p" | "P" => self.pick_tool(vivarium_ui::state::Tool::Lamp),
-                // W = 生物工坊。G 已经被"点火"占了，而且 G 这个键在
-                // 玩家的肌肉记忆里是"grid/生成"，不是"工坊"。
+                // W = 生物工坊，G = 世界。两个都是"打开一块面板"，
+                // 所以挨在一起；G 在玩家的肌肉记忆里是"grid / 生成"，
+                // 而新建世界正好是这件事。
                 "w" | "W" => self.ui.state.workshop.open = !self.ui.state.workshop.open,
-                "g" | "G" => self.ignite_peak(),
-                "l" | "L" => self.release_fish(),
+                "g" | "G" => self.toggle_world_panel(),
                 "r" | "R" => self.reseed(),
                 // V = 换滤镜。Tab 会被 egui 拿去走焦点，F1..F4 在很多
                 // 键盘上是媒体键，V 是这里唯一没被占的顺手的键。
@@ -899,44 +907,15 @@ impl Game {
         self.renderer.pan_cells(dx * vw * 0.1, dy * vh * 0.1);
     }
 
-    /// 在最高的岛顶点一把火。
+    /// 打开 / 关掉「世界」窗口。
     ///
-    /// 这不是装饰——它是**肉眼验证反应表与寿命**的最快路径：
-    /// 火应当沿可燃物蔓延、被水浇灭、十几 tick 后自己烧完。
-    /// 如果它永远不灭，或者一烧就烧穿整张图，问题一眼可见。
-    fn ignite_peak(&mut self) {
-        let peak = self.layout.peak_x();
-        let mut lit = 0usize;
-        for i in 0..8isize {
-            let x = peak as isize + i - 4;
-            if !self.world.in_bounds(x, 0) {
-                continue;
-            }
-            let surface = self.layout.surface[x as usize];
-            if surface <= 0 {
-                continue;
-            }
-            let y = surface - 1;
-            if self.world.get(x, y) == MaterialKind::Empty {
-                self.world.set(x, y, MaterialKind::Fire);
-                lit += 1;
-            }
+    /// 打开时顺手要一份存档列表：那个目录可能刚被用户在外面改过，
+    /// 而"打开面板看到的是上一次的列表"会让人以为存档丢了。
+    fn toggle_world_panel(&mut self) {
+        self.ui.state.world.open = !self.ui.state.world.open;
+        if self.ui.state.world.open {
+            self.ui.state.emit(vivarium_ui::Command::RefreshSaves);
         }
-        println!("点火：岛峰 x={peak} 附近放了 {lit} 格火");
-        self.field_dirty |= lit > 0;
-    }
-
-    /// 在水面附近放一批鱼。
-    ///
-    /// 放下去之后**盯能量账**（横幅里那行"生物"）：如果鱼全部饿死，
-    /// 说明生产者拿到的光不够付维持成本；如果数量爆炸，说明负反馈没接上。
-    /// 这两件事在画面上都是"一堆小方块"，只有数字能分辨。
-    fn release_fish(&mut self) {
-        // 16 而不是 8：捕食者要活下来需要**猎物密度**。
-        // 512² 里 24 条起步时，掠食者在 8000 tick 内全灭（实测 `杀手 0 枚`）；
-        // 120 条起步时稳定在 14 枚杀手。按几次 L 就能跨过那道门槛。
-        let ids = stock_surface(&mut self.world, &mut self.life, 16, 300, self.morph);
-        println!("放鱼：水面附近 {} 条", ids.len());
     }
 
     /// 换一个种子重铺地形。
@@ -958,6 +937,174 @@ impl Game {
         // 地形换了，光场也得跟着重算——`LifeSim::new` 已经刷过一次，
         // 但那只覆盖了光；温度场是新初始化的，这里不用再动。
         self.renderer.set_view_mode(self.ui.state.view);
+    }
+
+    // -- 世界窗口的三件事：新建 / 保存 / 读取 ---------------------------------
+
+    /// 新建一个世界。
+    ///
+    /// 界面已经拦住了尺寸范围，这里仍然走 `World::new` 的校验——
+    /// **一个入口一道闸**比"上游保证过了"可靠，而且报错能进控制台。
+    fn new_world(&mut self, width: u32, height: u32, seed: Option<u64>, terrain: bool, life: bool) {
+        let seed = seed.unwrap_or_else(|| {
+            // "留空 = 随机"。
+            //
+            // 用系统时钟取种子，而不是模拟里的 `Rng`：这是**用户的一次操作**，
+            // 不是模拟的一步，所以它不受"固定种子"的约束。取完之后种子会
+            // 写进控制台，想复现同一个世界照着填就行。
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos() as u64)
+                .unwrap_or(0x5EED_1234)
+        });
+
+        let mut world = match World::new(width as usize, height as usize) {
+            Ok(w) => w,
+            Err(e) => {
+                let tick = self.world.tick();
+                self.ui
+                    .log(tick, vivarium_ui::Level::Error, format!("新建失败：{e}"));
+                return;
+            }
+        };
+
+        self.rng = Rng::new(seed);
+        self.seed = seed;
+        // 不生成地形时，布局只能从空网格里扫出来——`scan` 会给出
+        // "一滴水都没有"的退化解（水面线 = 最高地表），取景仍然成立。
+        self.layout = if terrain {
+            worldgen::sea_and_islands(&mut world, &mut self.rng)
+        } else {
+            worldgen::scan(&world)
+        };
+        let mut next_life = LifeSim::new(&mut world);
+        let spawned = if life {
+            stock_surface(&mut world, &mut next_life, 8, 300, self.morph).len()
+        } else {
+            0
+        };
+
+        self.world = world;
+        self.life = next_life;
+        // 掩码、历史曲线、选中、待落点的身体全都属于**上一个世界**。
+        // 不清的话，新世界里会有一段别人的种群曲线，和一条指向已死编号的选中。
+        self.sim = MaterialSim::new();
+        self.history.clear();
+        self.history_tick = 0;
+        self.ui.state.selected = None;
+        self.pending_body = None;
+        self.reset_view();
+
+        let tick = self.world.tick();
+        self.ui.log(
+            tick,
+            vivarium_ui::Level::Info,
+            format!(
+                "新建世界 {width}×{height} · 种子 {seed} · 地形 {} · 初始生命 {spawned} 只",
+                if terrain { "有" } else { "无" }
+            ),
+        );
+        self.ui.state.world.hint = Some(format!("已新建：{width}×{height}，种子 {seed}"));
+    }
+
+    /// 把当前世界存进 `saves/<name>.vivarium`。
+    fn save_world(&mut self, name: &str) {
+        let tick = self.world.tick();
+        let dir = save::saves_dir();
+        let path = dir.join(format!("{}.{}", safe_file_name(name), save::EXTENSION));
+        match save::save_to_file(&path, &self.world, &self.life) {
+            Ok(()) => {
+                let size = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+                let text = format!("已保存：{}（{}）", path.display(), human_size(size));
+                self.ui.log(tick, vivarium_ui::Level::Info, text.clone());
+                self.ui.state.world.hint = Some(text);
+                self.refresh_saves();
+            }
+            Err(e) => {
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Error,
+                    format!("保存失败：{e}"),
+                );
+                self.ui.state.world.hint = Some(format!("保存失败：{e}"));
+            }
+        }
+    }
+
+    /// 读一个存档。
+    ///
+    /// 失败时**什么都不改**：`load_from_file` 要么给出一个完整的世界，
+    /// 要么给一个错误。半个世界比没有世界更糟——它会让玩家以为存档
+    /// 只是"有点问题"，然后接着玩下去。
+    fn load_world(&mut self, path: &str) {
+        let tick = self.world.tick();
+        match save::load_from_file(std::path::Path::new(path)) {
+            Ok((world, next_life)) => {
+                self.world = world;
+                self.life = next_life;
+                self.sim = MaterialSim::new();
+                // 存档里没有"当初用的生成种子"，只能从材质反推地表形状。
+                self.layout = worldgen::scan(&self.world);
+                self.history.clear();
+                self.history_tick = 0;
+                self.ui.state.selected = None;
+                self.pending_body = None;
+                self.reset_view();
+
+                let t = self.world.tick();
+                let text = format!(
+                    "已读取：{} · {}×{} · tick {} · {} 只",
+                    path,
+                    self.world.width(),
+                    self.world.height(),
+                    t,
+                    self.life.organisms().len()
+                );
+                self.ui.log(t, vivarium_ui::Level::Info, text.clone());
+                self.ui.state.world.hint = Some(text);
+            }
+            Err(e) => {
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Error,
+                    format!("读取失败：{e}"),
+                );
+                self.ui.state.world.hint = Some(format!("读取失败：{e}"));
+            }
+        }
+    }
+
+    /// 重新扫一遍存档目录，把结果填进「世界」窗口。
+    fn refresh_saves(&mut self) {
+        let dir = save::saves_dir();
+        self.ui.state.world.saves_dir = dir.display().to_string();
+        self.ui.state.world.saves = save::scan_dir(&dir)
+            .into_iter()
+            .map(|info| vivarium_ui::SaveEntry {
+                name: info.name,
+                path: info.path.display().to_string(),
+                width: info.header.width as u32,
+                height: info.header.height as u32,
+                tick: info.header.tick,
+                size: human_size(info.bytes),
+                // 绝对时刻要时区，而"多久以前"不要——见 `clock` 的模块文档。
+                modified: info
+                    .modified
+                    .map(clock::ago)
+                    .unwrap_or_else(|| "?".to_owned()),
+            })
+            .collect();
+    }
+
+    /// 换了一个世界之后：视野回正、光场重算。
+    ///
+    /// 视野**必须**回正：新世界的大小可能完全不同，留着旧世界的视口
+    /// 会让相机停在一片界外——画面上是纯黑，而"黑屏"永远像崩溃。
+    fn reset_view(&mut self) {
+        let size = (self.world.width() as u32, self.world.height() as u32);
+        self.renderer.set_viewport(Viewport::centered_on(size));
+        self.life.refresh_field(&self.world);
+        self.field_dirty = false;
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
@@ -1070,6 +1217,7 @@ impl Game {
             organisms: life.organisms,
             cells: life.cells,
             energy: life.energy,
+            species: life.species,
             killers: life.killers,
             body_range: (life.min_cells, life.max_cells),
             generation: life.max_generation,
@@ -1226,20 +1374,16 @@ impl Game {
                     format!("重铺地形，种子 {}", self.seed),
                 );
             }
-            C::Drop(n) => {
-                let ids = stock_surface(&mut self.world, &mut self.life, n, 300, self.morph);
-                let tick = self.world.tick();
-                self.ui.log(
-                    tick,
-                    vivarium_ui::Level::Info,
-                    format!("投放 {} 条", ids.len()),
-                );
-            }
-            C::Ignite => {
-                self.ignite_peak();
-                let tick = self.world.tick();
-                self.ui.log(tick, vivarium_ui::Level::Warn, "岛顶点火");
-            }
+            C::NewWorld {
+                width,
+                height,
+                seed,
+                terrain,
+                life,
+            } => self.new_world(width, height, seed, terrain, life),
+            C::SaveWorld(name) => self.save_world(&name),
+            C::LoadWorld(path) => self.load_world(&path),
+            C::RefreshSaves => self.refresh_saves(),
             C::CenterView => {
                 let size = (self.world.width() as u32, self.world.height() as u32);
                 self.renderer.set_viewport(Viewport::centered_on(size));
@@ -1316,6 +1460,24 @@ impl Game {
             total,
             stats.total_uploaded_chunks,
         ));
+    }
+}
+
+/// 把字节数写成给人看的大小。
+///
+/// 用 1024 而不是 1000：存档列表要回答的是"这个档大不大"，
+/// 而"1.0 MB"和 Windows 资源管理器里看到的是同一个数——
+/// 两处不一致会让人以为自己找错了文件。
+fn human_size(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = KB * 1024.0;
+    let b = bytes as f64;
+    if b < KB {
+        format!("{bytes} B")
+    } else if b < MB {
+        format!("{:.0} KB", b / KB)
+    } else {
+        format!("{:.1} MB", b / MB)
     }
 }
 

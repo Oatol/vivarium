@@ -35,8 +35,11 @@ pub mod state;
 pub mod theme;
 pub mod widgets;
 pub mod workshop;
+pub mod world_window;
 
-pub use state::{Command, Console, Level, LibraryEntry, Snapshot, Tool, UiState, Workshop};
+pub use state::{
+    Command, Console, Level, LibraryEntry, SaveEntry, Snapshot, Tool, UiState, Workshop, WorldPanel,
+};
 pub use widgets::BtnState;
 
 /// 一帧的产出。
@@ -111,10 +114,17 @@ impl Ui {
         let mut modal = false;
         let full = self.ctx.run_ui(raw_input, |ui| {
             central = panels::draw(ui, state, snap);
-            // 工坊是**模态**：它画在所有面板之上，并且吃掉这一帧的鼠标。
-            // 放在 `panels::draw` 之后是因为它要盖住面板；用 `Area` 的
+            // 工坊和「世界」都是**模态**：画在所有面板之上，并且吃掉这一帧的鼠标。
+            // 放在 `panels::draw` 之后是因为它们要盖住面板；用 `Area` 的
             // `Foreground` 层，所以不受面板布局约束。
+            //
+            // 两者**不会同时打开**：「世界」优先。两个模态叠在一起时，
+            // 下面那个的遮罩会把上面那个压暗，而"哪个按钮能点"就没有答案了。
+            if state.world.open {
+                state.workshop.open = false;
+            }
             modal = workshop::draw(ui, state, snap);
+            modal |= world_window::draw(ui, state, snap);
         });
 
         let commands = state.take_commands();
@@ -151,6 +161,24 @@ mod tests {
             )),
             ..Default::default()
         }
+    }
+
+    /// 跑**两帧**，返回第二帧的输出与图元。
+    ///
+    /// `egui::Window` 的尺寸在第一帧还不知道：它按"上一帧量到的内容大小"
+    /// 决定自己多大，而第一帧量到的是 0。于是第一帧里整块内容落进一个
+    /// 0×0 的 `clip_rect`，被 `Painter` 整个丢掉——**`shapes` 里一条都没有，
+    /// 而且不报任何错**。
+    ///
+    /// 真实运行时每秒六十帧，第一帧的空白没人看得见；而只跑一帧的测试
+    /// 会得出"面板什么都没画"的错误结论。这个坑在截图预览里已经踩过一次
+    /// （`bins/game/tests/ui_preview.rs`），这里是第二次。
+    fn show_twice(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) -> (Output, Vec<egui::epaint::ClippedShape>) {
+        let mut warm = ui.show(state, snap, screen()).1;
+        warm.textures_delta.clear();
+        let (out, mut full) = ui.show(state, snap, screen());
+        full.textures_delta.clear();
+        (out, full.shapes)
     }
 
     /// 一帧界面能在**没有显卡**的情况下跑完。
@@ -257,8 +285,143 @@ mod tests {
         );
     }
 
-    /// 面板不能把整个窗口盖满——中间必须留给世界。
+    /// 打开「世界」窗口会多画一堆东西，而且必须报 `modal`。
     ///
+    /// 数 `shapes` 的条数而不是顶点数（`Context` 会按 shape 哈希缓存三角化，
+    /// 顶点数不可靠）；同时断言 `clip_rect` 宽度不为负——那是"布局把面板
+    /// 推到屏幕外"的典型症状，而那种情况下画了等于没画。
+    ///
+    /// 列表里塞两条假存档，让"读取"那半张表也真的画出来。
+    #[test]
+    fn opening_the_world_window_draws_the_form_and_the_save_list() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot {
+            world_size: (512, 512),
+            tick: 12345,
+            organisms: 1552,
+            species: 87,
+            ..Default::default()
+        };
+
+        let (_, mut full) = ui.show(&mut state, &snap, screen());
+        let before = full.shapes.len();
+        full.textures_delta.clear();
+
+        state.world.open = true;
+        state.world.saves_dir = "C:\\game\\saves".into();
+        state.world.saves = vec![
+            crate::state::SaveEntry {
+                name: "world-20261022".into(),
+                path: "C:\\game\\saves\\world-20261022.vivarium".into(),
+                width: 512,
+                height: 512,
+                tick: 12345,
+                size: "1.0 MB".into(),
+                modified: "10-22 22:41".into(),
+            },
+            crate::state::SaveEntry {
+                name: "alpha".into(),
+                path: "C:\\game\\saves\\alpha.vivarium".into(),
+                width: 256,
+                height: 256,
+                tick: 40,
+                size: "101 KB".into(),
+                modified: "10-21 09:03".into(),
+            },
+        ];
+        let (out, mut full) = ui.show(&mut state, &snap, screen());
+        let after = full.shapes.len();
+        let clip_ok = full.shapes.iter().all(|s| s.clip_rect.width() >= 0.0);
+        full.textures_delta.clear();
+
+        assert!(out.modal, "「世界」打开时必须报 modal，否则点击会漏到世界上");
+        assert!(
+            after > before + 40,
+            "「世界」应当画出滑块、勾选、按钮和两张表：{before} → {after}"
+        );
+        assert!(clip_ok, "有图元的裁剪矩形宽度为负——面板被挤出了屏幕");
+    }
+
+    /// 两个模态不能同时打开。
+    ///
+    /// 叠在一起时下面那个的遮罩会把上面那个压暗，而"哪个按钮能点"就没有答案。
+    #[test]
+    fn only_one_modal_is_open_at_a_time() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot::default();
+
+        state.workshop.open = true;
+        state.world.open = true;
+        let (_, mut full) = ui.show(&mut state, &snap, screen());
+        // `TexturesDelta` 带"必须被消费"的断言，测试里手动清掉。
+        full.textures_delta.clear();
+        assert!(!state.workshop.open, "「世界」打开时工坊必须让位");
+    }
+
+    /// 「世界」窗口里的丢弃提醒**必须真的是红的**。
+    ///
+    /// 这是这一屏最重要的一句话（"新建/读取会丢弃当前世界"），而
+    /// "画了但颜色是普通文字色"这种事在截图上几乎看不出来——
+    /// 深色底上灰字和红字的明度差不多。所以直接查图元：
+    /// 一个危险色的矩形描边（二次确认按钮）+ 一段危险色的文字（那行提醒）。
+    ///
+    /// 这条不能用像素探针做：9.5px 中文的抗锯齿会把 #ff4020 混成
+    /// 一百多种中间色，实测**一个精确匹配的像素都没有**。
+    #[test]
+    fn the_discard_warning_is_drawn_in_the_danger_colour() {
+        // 判据取 RGB 的**反预乘**值，不是 `Color32` 直接相等。
+        //
+        // 原因很具体：`egui` 给新出现的 `Window` 做淡入动画，头几帧整块
+        // 图元都带一个 `opacity_factor`（实测 0.6），颜色被预乘成
+        // `#9b2714 9b` 而不是 `#ff4020 ff`。直接比 `Color32` 会得到
+        // "一个红像素都没有"的结论，而红字明明画出来了。
+        fn is_danger(c: egui::Color32) -> bool {
+            let want = theme::DANGER.to_srgba_unmultiplied();
+            let got = c.to_srgba_unmultiplied();
+            (0..3).all(|i| got[i].abs_diff(want[i]) <= 2)
+        }
+
+        fn walk(shape: &egui::Shape, reds: &mut (usize, usize)) {
+            match shape {
+                egui::Shape::Rect(r) if is_danger(r.stroke.color) => reds.0 += 1,
+                egui::Shape::Text(t) if is_danger(t.fallback_color) => reds.1 += 1,
+                egui::Shape::Vec(v) => {
+                    for s in v {
+                        walk(s, reds);
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot::default();
+        state.world.open = true;
+        // 让"等待二次确认"这个状态也画出来——红按钮只在那时候存在。
+        state.world.confirm = Some((state::WorldAction::New, f64::INFINITY));
+
+        let (_, shapes) = show_twice(&mut ui, &mut state, &snap);
+        let mut reds = (0usize, 0usize);
+        for s in &shapes {
+            walk(&s.shape, &mut reds);
+        }
+
+        assert!(
+            reds.0 >= 1,
+            "二次确认按钮没有用危险色描边（红色矩形 {} 个）",
+            reds.0
+        );
+        assert!(
+            reds.1 >= 1,
+            "那行丢弃提醒没有用危险色（红色文字 {} 段）",
+            reds.1
+        );
+    }
+
+    /// 面板不能把整个窗口盖满——中间必须留给世界。
     /// 这一条是布局的**核心不变量**：世界是主角，界面是框。如果哪天
     /// 加面板加过头把中央盖住了，画面会变成"一堆面板"，而且不会报错。
     #[test]

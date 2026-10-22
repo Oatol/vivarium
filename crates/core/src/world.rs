@@ -95,23 +95,47 @@ impl CellOwner {
 pub enum WorldError {
     /// 尺寸为 0。
     ZeroSize,
-    /// 尺寸不是 [`CHUNK_SIZE`] 的整数倍。
-    NotChunkAligned { width: usize, height: usize },
+    /// 尺寸超出上限。
+    ///
+    /// 上限不是为了省内存，是为了**在构造时就拦住**——一张 20000×20000 的
+    /// 世界会先吃掉 8 GB 再被显卡拒绝，而那时候报错的位置已经离用户的操作很远了。
+    TooLarge { width: usize, height: usize, max: usize },
 }
 
 impl fmt::Display for WorldError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::ZeroSize => write!(f, "world size must be non-zero"),
-            Self::NotChunkAligned { width, height } => write!(
-                f,
-                "world size {width}x{height} must be a multiple of CHUNK_SIZE ({CHUNK_SIZE})"
-            ),
+            Self::TooLarge {
+                width,
+                height,
+                max,
+            } => write!(f, "world size {width}x{height} exceeds the limit {max}"),
         }
     }
 }
 
 impl std::error::Error for WorldError {}
+
+/// 世界单边最大格数。
+///
+/// 2000 是"内存 × 显卡纹理上限"两条约束里更紧的那条：2000² 的材质表 8 MB、
+/// 世界纹理 16 MB，而多数适配器的 `max_texture_dimension_2d` 是 8192，
+/// 所以纹理不成问题。真正要挡的是"手滑把滑块拖到一个天文数字"。
+pub const MAX_WORLD_SIDE: usize = 2000;
+
+/// [`World::mark_dirty`] 的横向晕影半径（格）。
+///
+/// 必须 **≥** 材质层一次移动能横跨的最大距离（`sim::LATERAL_REACH` = 8），
+/// 否则"某格变了"无法传播到"离它 8 格之外、因此变得可动"的那一格。
+/// 两者的关系在 `sim.rs` 里有编译期断言钉着。
+pub const DIRTY_HALO_X: usize = 8;
+
+/// [`World::mark_dirty`] 的纵向晕影半径（格）。
+///
+/// 一次移动纵跨 1 格，所以 1 就够。写在这里而不是硬编码，是为了让它和
+/// 横向那个数字一起被看见——它们是同一个问题的两个方向，只改一个必然出错。
+pub const DIRTY_HALO_Y: usize = 1;
 
 const FNV_OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
 const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
@@ -135,17 +159,33 @@ pub struct World {
 }
 
 impl World {
-    /// 创建空世界。尺寸必须是 [`CHUNK_SIZE`] 的整数倍。
+    /// 创建空世界。
+    ///
+    /// ## 尺寸可以是任意值，不必是 [`CHUNK_SIZE`] 的整数倍
+    ///
+    /// 早先要求对齐，理由是分块扫描要"一整块一整块地拷"。那条约束是从
+    /// **实现**里长出来的，却写进了**接口**——于是玩家想开一个 600×450 的世界
+    /// 时，唯一的出路是偷偷把它凑成 640×512，而多出来的那一条会在画面上
+    /// 出现、在水位统计里出现、在相机取景里出现。
+    ///
+    /// 现在分块允许"最后一行/列是残块"：`chunk_cols = ceil(width / CHUNK_SIZE)`，
+    /// 每块的真实宽高由 [`World::chunk_w`] / [`World::chunk_h`] 给出。
+    /// 代价是材质层不能再按常数拷贝整块，必须按残块尺寸拷贝——
+    /// 那几行改完之后，"块"和"格"的关系重新变得干净。
     pub fn new(width: usize, height: usize) -> Result<Self, WorldError> {
         if width == 0 || height == 0 {
             return Err(WorldError::ZeroSize);
         }
-        if width % CHUNK_SIZE != 0 || height % CHUNK_SIZE != 0 {
-            return Err(WorldError::NotChunkAligned { width, height });
+        if width > MAX_WORLD_SIDE || height > MAX_WORLD_SIDE {
+            return Err(WorldError::TooLarge {
+                width,
+                height,
+                max: MAX_WORLD_SIDE,
+            });
         }
 
-        let chunk_cols = width / CHUNK_SIZE;
-        let chunk_rows = height / CHUNK_SIZE;
+        let chunk_cols = width.div_ceil(CHUNK_SIZE);
+        let chunk_rows = height.div_ceil(CHUNK_SIZE);
         let chunk_count = chunk_cols * chunk_rows;
 
         Ok(Self {
@@ -196,6 +236,24 @@ impl World {
     #[inline]
     pub const fn chunk_count(&self) -> usize {
         self.chunk_cols * self.chunk_rows
+    }
+
+    /// 第 `cx` 列分块的实际宽度（格）。
+    ///
+    /// 只有最右边那一列可能小于 [`CHUNK_SIZE`]——但材质层不能假设
+    /// "只有最后一列"，它必须每块都问一次。写成特判会让"残块"变成
+    /// 一个隐藏的边界条件，而隐藏的边界条件正是这套代码最怕的东西。
+    #[inline]
+    pub fn chunk_w(&self, cx: usize) -> usize {
+        let x0 = cx * CHUNK_SIZE;
+        (self.width - x0).min(CHUNK_SIZE)
+    }
+
+    /// 第 `cy` 行分块的实际高度（格）。见 [`World::chunk_w`]。
+    #[inline]
+    pub fn chunk_h(&self, cy: usize) -> usize {
+        let y0 = cy * CHUNK_SIZE;
+        (self.height - y0).min(CHUNK_SIZE)
     }
 
     /// 坐标是否落在世界内。接受 `isize` 以便邻域查询时直接传 `x - 1`。
@@ -445,7 +503,7 @@ impl World {
         self.dirty_count = self.chunk_count();
     }
 
-    /// 标记某格**及其一圈邻格**所在的分块为脏。
+    /// 标记某格**及其影响范围**所在的分块为脏。
     ///
     /// ## 为什么必须带上邻格
     ///
@@ -454,18 +512,33 @@ impl World {
     /// 而 (10, 9) 自己一个字节都没变过。
     ///
     /// 只标变化格所在的分块，就会出现"这一格已经该动了，但它所在的分块
-    /// 被判定为静止而跳过"，于是跳块扫描与全扫的结果**不一致**——
-    /// 而 M1 的验收断言正是"两者逐 tick 相同"。带上 1 格晕影，
-    /// 变化的影响范围就覆盖住了所有可能因此变得可动的格子。
+    /// 被判定为静止而跳过"，于是跳块扫描与全扫的结果**不一致**。
     ///
-    /// 代价是最多多标 4 个分块。对 512²（64 块）来说完全可忽略，
-    /// 而且渲染层多上传几个没变的分块是安全的。
+    /// ## 晕影为什么横向是 8 格而不是 1 格
+    ///
+    /// 这一条曾经是 1，而它是**错的**——错得很安静，跑了很久才被抓到。
+    ///
+    /// 液体找平一次能横跨 [`crate::sim::LATERAL_REACH`] = 8 格：水在 (52, 88)
+    /// 看中了 (60, 88) 的空位，一 tick 就跳过去。于是"52 号格变了"这件事
+    /// 会改变**60 号格**能不能动，而 60 号格自己一个字节都没变。
+    /// 1 格晕影覆盖不到 8 格，跨分块时就会分叉：
+    ///
+    /// ```text
+    /// tick 117  跳块：水停在 52、60         全扫：52→60→68→76 一路推过去
+    /// ```
+    ///
+    /// 实测触发场景是"沙块砸进浅水"——被挤出来的水沿着水面横向连锁，
+    /// 一次 tick 能串起四五段 8 格的跳跃，正好跨在分块边界上。
+    /// 旧的 512² 演示世界里这种连锁很少跨块，所以一直没显形。
+    ///
+    /// 纵向仍然是 1：一次移动纵跨 1 格，所以"变了"只影响上下各一格。
+    /// 两个数字的关系写成了编译期断言（见 `sim.rs`），改任何一边都会编译失败。
     #[inline]
     pub fn mark_dirty(&mut self, x: usize, y: usize) {
-        // 以格为单位往外扩一圈，再折算成分块——比"直接给分块坐标 ±1"
+        // 以格为单位往外扩，再折算成分块——比"直接给分块坐标 ±1"
         // 精确得多，后者会在格子不贴边时白标一圈分块。
-        for dy in -1isize..=1 {
-            for dx in -1isize..=1 {
+        for dy in -(DIRTY_HALO_Y as isize)..=(DIRTY_HALO_Y as isize) {
+            for dx in -(DIRTY_HALO_X as isize)..=(DIRTY_HALO_X as isize) {
                 let (nx, ny) = (x as isize + dx, y as isize + dy);
                 if !self.in_bounds(nx, ny) {
                     continue;
@@ -524,6 +597,16 @@ impl World {
         self.tick += 1;
     }
 
+    /// 直接设定 tick 计数。
+    ///
+    /// 只有一个正当用途：**读档**。存档里带着它自己的 tick，而 `tick` 是
+    /// 世界内容的一部分（`tick % 25` 之类的周期规则、标题栏、可复现性断言
+    /// 都读它）。读回来从 0 重新数会让"存档那一刻发生了什么"永远对不上。
+    #[inline]
+    pub fn set_tick(&mut self, tick: u64) {
+        self.tick = tick;
+    }
+
     /// 统计某种材质的格子数。
     pub fn count_of(&self, kind: MaterialKind) -> usize {
         self.cells.iter().filter(|c| c.kind == kind).count()
@@ -571,23 +654,67 @@ impl World {
     pub fn cells(&self) -> &[MaterialCell] {
         &self.cells
     }
+
+    /// 读档：整张材质表一次性装回去。长度不符返回 `false`。
+    ///
+    /// 不走 [`World::set`] 一格一格写，理由是**成本**：`set` 会调
+    /// [`World::mark_dirty`]，而那里要扩一圈 17×3 的晕影。512² 就是
+    /// 26 万格 × 51 次写 = 1300 万次，2000² 直接上两亿——读一个档要好几秒，
+    /// 而它做的事只是"把这些字节放到那张表里"。
+    ///
+    /// 装完之后**所有块都标脏**：读档等于换了一个世界，没有任何一块能假定
+    /// 自己上一 tick 的状态还有意义。
+    ///
+    /// 占格表不动。它由生命层在 [`crate::save::decode`] 里逐个有机体
+    /// [`crate::life::Organism::claim`] 重建——材质层不该知道细胞怎么摆。
+    pub fn restore_cells(&mut self, cells: &[MaterialCell]) -> bool {
+        if cells.len() != self.cells.len() {
+            return false;
+        }
+        self.cells.copy_from_slice(cells);
+        self.mark_all_dirty();
+        true
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{CellOwner, World, WorldError, CHUNK_SIZE};
+    use super::{CellOwner, World, WorldError, CHUNK_SIZE, DIRTY_HALO_X, MAX_WORLD_SIDE};
     use crate::material::MaterialKind;
 
     #[test]
-    fn rejects_unaligned_size() {
+    fn rejects_impossible_sizes() {
+        assert_eq!(World::new(0, 0).unwrap_err(), WorldError::ZeroSize);
+        assert_eq!(World::new(0, 64).unwrap_err(), WorldError::ZeroSize);
         assert_eq!(
-            World::new(100, 64).unwrap_err(),
-            WorldError::NotChunkAligned {
-                width: 100,
-                height: 64
+            World::new(MAX_WORLD_SIDE + 1, 64).unwrap_err(),
+            WorldError::TooLarge {
+                width: MAX_WORLD_SIDE + 1,
+                height: 64,
+                max: MAX_WORLD_SIDE
             }
         );
-        assert_eq!(World::new(0, 0).unwrap_err(), WorldError::ZeroSize);
+    }
+
+    /// 任意尺寸都能开——**包括不是 64 倍数的**。
+    ///
+    /// 这条曾经是反的（要求对齐）。改掉的理由是玩家要的是"600×450 的世界"，
+    /// 而不是"640×512 的世界再告诉他凑合一下"。
+    #[test]
+    fn accepts_any_size() {
+        for (w, h) in [(1, 1), (20, 20), (100, 70), (256, 512), (768, 728)] {
+            let world = World::new(w, h).expect("任意尺寸都该能建");
+            assert_eq!(world.width(), w);
+            assert_eq!(world.height(), h);
+            assert_eq!(world.chunk_cols(), w.div_ceil(CHUNK_SIZE));
+            assert_eq!(world.chunk_rows(), h.div_ceil(CHUNK_SIZE));
+            // 每块宽高加起来必须**刚好**等于世界宽高：多一格会读到界外，
+            // 少一格会有一列永远不被扫描。
+            let sum_w: usize = (0..world.chunk_cols()).map(|cx| world.chunk_w(cx)).sum();
+            let sum_h: usize = (0..world.chunk_rows()).map(|cy| world.chunk_h(cy)).sum();
+            assert_eq!(sum_w, w, "{w}x{h}: 分块宽度之和不对");
+            assert_eq!(sum_h, h, "{w}x{h}: 分块高度之和不对");
+        }
     }
 
     #[test]
@@ -596,6 +723,20 @@ mod tests {
         assert_eq!(w.chunk_cols(), 4);
         assert_eq!(w.chunk_rows(), 8);
         assert_eq!(w.chunk_count(), 32);
+        assert_eq!(w.chunk_w(0), CHUNK_SIZE);
+        assert_eq!(w.chunk_h(7), CHUNK_SIZE);
+    }
+
+    /// 残块尺寸：最后一行/列只到自己该到的地方。
+    #[test]
+    fn ragged_edge_chunks_report_their_real_size() {
+        let w = World::new(100, 70).unwrap();
+        assert_eq!(w.chunk_cols(), 2);
+        assert_eq!(w.chunk_rows(), 2);
+        assert_eq!(w.chunk_w(0), 64);
+        assert_eq!(w.chunk_w(1), 36);
+        assert_eq!(w.chunk_h(0), 64);
+        assert_eq!(w.chunk_h(1), 6);
     }
 
     #[test]
@@ -818,12 +959,12 @@ mod tests {
     // 脏标记晕影
     // -----------------------------------------------------------------------
 
-    /// 变化格**周围一圈**所在的分块也要标脏。
+    /// 变化格的**影响范围**所在的分块也要标脏。
     ///
     /// 这条是"跳块扫描 == 全扫"的前提：邻居的流动会让本格变得可动，
     /// 而本格自己没变过。
     #[test]
-    fn dirty_marks_a_one_cell_halo() {
+    fn dirty_marks_the_influence_radius() {
         let mut w = World::new(256, 256).unwrap();
         w.clear_dirty();
         // 正好落在块 (0,0) 的右下角——晕影会溢出到右边和下边的块。
@@ -834,6 +975,31 @@ mod tests {
         assert!(w.is_chunk_dirty(1, 1), "diagonal neighbour chunk");
         assert!(!w.is_chunk_dirty(2, 0), "two chunks away is not affected");
         assert_eq!(w.dirty_chunk_count(), 4);
+    }
+
+    /// **横向晕影必须覆盖住一次移动的跨度。**
+    ///
+    /// 这条守的是那个安静了很久的 bug：液体找平一次能横跨 8 格，
+    /// 而晕影只有 1 格，于是"52 号格变了"传不到"离它 8 格、因此变得可动"
+    /// 的那一格——跨分块时跳块与全扫就分叉。
+    ///
+    /// 判据取的是**最刁钻的位置**：距离块边界正好 `DIRTY_HALO_X` 格的那一格，
+    /// 它的影响范围恰好够到隔壁块。少一格就漏，多一格就白扫。
+    #[test]
+    fn halo_reaches_exactly_across_the_chunk_border() {
+        let mut w = World::new(256, 256).unwrap();
+        w.clear_dirty();
+        // x = 63 - 8 = 55：往右 8 格正好是 63，还没过界。
+        w.set(55, 30, MaterialKind::Stone);
+        assert!(!w.is_chunk_dirty(1, 0), "55 + 8 = 63 仍在块内");
+
+        w.clear_dirty();
+        // x = 56：往右 8 格是 64，正好跨过边界。
+        w.set(56, 30, MaterialKind::Stone);
+        assert!(
+            w.is_chunk_dirty(1, 0),
+            "56 + {DIRTY_HALO_X} = 64 已经跨块，隔壁必须被标脏"
+        );
     }
 
     #[test]

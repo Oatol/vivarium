@@ -65,6 +65,16 @@ const NEIGHBORS_4: [(isize, isize); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
 /// 液体能横穿小半张图，看起来像瞬移。
 const LATERAL_REACH: isize = 8;
 
+/// **晕影必须覆盖得住一次移动的横向跨度。**
+///
+/// 这两条数字是同一个问题的两面：`LATERAL_REACH` 说"一次移动能跨多远"，
+/// `DIRTY_HALO_X` 说"一格变了要连累多远"。前者大于后者时，跳块扫描就会
+/// 漏掉一格"因为八格之外的变化而变得可动"的格子——而那不报错，只是让
+/// 世界跑出另一个终态。
+///
+/// 它们曾经是 8 和 1，于是 512² 世界里沙块砸进浅水就能分叉（实测 tick 117）。
+const _: () = assert!(LATERAL_REACH as usize <= crate::world::DIRTY_HALO_X);
+
 /// 棋盘式相位的执行顺序。
 ///
 /// 4 个相位按 `(cx % 2, cy % 2)` 划分：同一相位里任意两块在 x、y 上
@@ -275,7 +285,7 @@ struct Outbound {
 /// 已经被处理过的分块收到标记也没关系：它这一 tick 不会再被访问。
 #[derive(Debug, Default)]
 struct LocalMoved {
-    /// 本块格子的标记，行主序，`CHUNK_SIZE²` 字节。每次装填时清零。
+    /// 本块格子的标记，行主序，`w × h` 字节。每次装填时清零。
     bits: Vec<u8>,
     /// 跨块标记（真世界的扁平下标），写回时并入全局掩码。
     spill: Vec<usize>,
@@ -283,9 +293,12 @@ struct LocalMoved {
 
 impl LocalMoved {
     /// 清空，准备处理下一个分块。
-    fn reset(&mut self) {
+    ///
+    /// 尺寸是**每块现问**的：世界不必是 `CHUNK_SIZE` 的整数倍，
+    /// 最右一列/最下一行的分块是残块。
+    fn reset(&mut self, w: usize, h: usize) {
         self.bits.clear();
-        self.bits.resize(CHUNK_SIZE * CHUNK_SIZE, 0);
+        self.bits.resize(w * h, 0);
         self.spill.clear();
     }
 }
@@ -297,7 +310,10 @@ impl LocalMoved {
 struct Workspace {
     x0: usize,
     y0: usize,
-    /// 本块格子，行主序，`CHUNK_SIZE²` 个。
+    /// 本块的真实宽高（格）。**不是** [`CHUNK_SIZE`]——边缘的块可能更小。
+    w: usize,
+    h: usize,
+    /// 本块格子，行主序，`w × h` 个。
     cells: Vec<MaterialCell>,
     moved: LocalMoved,
     outbox: Vec<Outbound>,
@@ -309,7 +325,9 @@ impl Workspace {
         Self {
             x0: 0,
             y0: 0,
-            cells: vec![MaterialCell::default(); CHUNK_SIZE * CHUNK_SIZE],
+            w: CHUNK_SIZE,
+            h: CHUNK_SIZE,
+            cells: Vec::new(),
             moved: LocalMoved::default(),
             outbox: Vec::new(),
             stats: StepStats::default(),
@@ -321,6 +339,7 @@ impl std::fmt::Debug for Workspace {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Workspace")
             .field("chunk", &(self.x0 / CHUNK_SIZE, self.y0 / CHUNK_SIZE))
+            .field("size", &(self.w, self.h))
             .field("outbox", &self.outbox.len())
             .finish()
     }
@@ -342,15 +361,19 @@ impl Ctx<'_> {
     #[inline]
     fn in_chunk(&self, x: isize, y: isize) -> bool {
         x >= self.ws.x0 as isize
-            && x < (self.ws.x0 + CHUNK_SIZE) as isize
+            && x < (self.ws.x0 + self.ws.w) as isize
             && y >= self.ws.y0 as isize
-            && y < (self.ws.y0 + CHUNK_SIZE) as isize
+            && y < (self.ws.y0 + self.ws.h) as isize
     }
 
     /// 本块内坐标 → 副本里的偏移。
+    ///
+    /// 步长是 `ws.w` 而不是 `CHUNK_SIZE`：残块每行更短，用常数会让
+    /// 第 2 行起全部错位——而错位的症状是"世界右边缘和底边缘有一片
+    /// 莫名其妙的东西"，看起来完全不像索引问题。
     #[inline]
     fn off(&self, x: usize, y: usize) -> usize {
-        (y - self.ws.y0) * CHUNK_SIZE + (x - self.ws.x0)
+        (y - self.ws.y0) * self.ws.w + (x - self.ws.x0)
     }
 
     /// 读一格。
@@ -1052,13 +1075,16 @@ impl Ctx<'_> {
 fn load(world: &World, cx: usize, cy: usize, ws: &mut Workspace) {
     ws.x0 = cx * CHUNK_SIZE;
     ws.y0 = cy * CHUNK_SIZE;
+    ws.w = world.chunk_w(cx);
+    ws.h = world.chunk_h(cy);
     ws.cells.clear();
-    for y in ws.y0..ws.y0 + CHUNK_SIZE {
+    ws.cells.reserve(ws.w * ws.h);
+    for y in ws.y0..ws.y0 + ws.h {
         let start = world.index_of(ws.x0, y);
         ws.cells
-            .extend_from_slice(&world.cells()[start..start + CHUNK_SIZE]);
+            .extend_from_slice(&world.cells()[start..start + ws.w]);
     }
-    ws.moved.reset();
+    ws.moved.reset(ws.w, ws.h);
     ws.outbox.clear();
     ws.stats = StepStats::default();
 }
@@ -1067,6 +1093,7 @@ fn load(world: &World, cx: usize, cy: usize, ws: &mut Workspace) {
 fn run_chunk(world: &World, moved: &MovedMask, ws: &mut Workspace, tick: u64) {
     let x0 = ws.x0;
     let y0 = ws.y0;
+    let (w, h) = (ws.w, ws.h);
     let mut ctx = Ctx {
         world,
         global_moved: moved,
@@ -1077,13 +1104,13 @@ fn run_chunk(world: &World, moved: &MovedMask, ws: &mut Workspace, tick: u64) {
     // 行内方向逐行交替：不交替的话，一行里所有粉末都朝同一侧滑，
     // 整块沙会像被风吹一样横移——那是纯粹的扫描顺序伪影，不是物理。
     // 交替之后左右偏移在相邻行之间抵消。
-    for y in (y0..y0 + CHUNK_SIZE).rev() {
+    for y in (y0..y0 + h).rev() {
         if y % 2 == 0 {
-            for x in x0..x0 + CHUNK_SIZE {
+            for x in x0..x0 + w {
                 ctx.visit(x, y, tick);
             }
         } else {
-            for x in (x0..x0 + CHUNK_SIZE).rev() {
+            for x in (x0..x0 + w).rev() {
                 ctx.visit(x, y, tick);
             }
         }
@@ -1110,25 +1137,25 @@ fn apply(
     let (cx, cy) = ((ws.x0 / CHUNK_SIZE) as isize, (ws.y0 / CHUNK_SIZE) as isize);
     let mut mask: u16 = 0;
 
-    for dy in 0..CHUNK_SIZE {
+    for dy in 0..ws.h {
         let y = ws.y0 + dy;
-        let row = dy * CHUNK_SIZE;
+        let row = dy * ws.w;
         // "贴上/贴下"两位逐行算一次就够。
         let v = if dy == 0 {
             4usize
-        } else if dy == CHUNK_SIZE - 1 {
+        } else if dy == ws.h - 1 {
             8
         } else {
             0
         };
-        for dx in 0..CHUNK_SIZE {
+        for dx in 0..ws.w {
             if !world.put_cell_quiet(ws.x0 + dx, y, ws.cells[row + dx]) {
                 continue;
             }
             let mut key = v;
             if dx == 0 {
                 key |= 1;
-            } else if dx == CHUNK_SIZE - 1 {
+            } else if dx == ws.w - 1 {
                 key |= 2;
             }
             mask |= NEIGHBOR_MASK[key];
@@ -1588,6 +1615,64 @@ mod tests {
             sim_full.step(&mut full);
             assert_eq!(skipping.hash(), full.hash(), "跳块与全扫在第 {t} tick 分叉");
         }
+    }
+
+    /// **残块世界里，跳块也必须等于全扫。**
+    ///
+    /// 世界不再要求 64 对齐之后，最右一列和最下一行的分块是残块
+    /// （20×20 的世界只有一块 20×20 的残块）。这条测试守的是那次改动的核心：
+    /// `off()` 的步长必须用 `ws.w` 而不是 `CHUNK_SIZE`——用常数的话，
+    /// 残块从第 2 行起整片错位，而错位**不会报错**，只会让右边缘和底边缘
+    /// 出现一片没人设计过的物质。
+    ///
+    /// 尺寸刻意挑成两轴都不齐、且底部残块只剩 4 格高（100×68）：
+    /// 石头地板铺在那 4 格上，所有下落的物质都要跨一次块边界才落得下去。
+    ///
+    /// ## 场景刻意是"安静的"
+    ///
+    /// 只用**沙**和**一洼水**，不用"沙块砸进浅水"那种激烈场景。理由不是
+    /// 图省事：那种场景会暴露另一个**既有**的等价性缺口——脏块集合是
+    /// tick 开始时算的，而同一 tick 内后面的相位能看到前面相位的写入，
+    /// 于是一条 8 格的横向连锁能在 tick 中途跨进一个"本 tick 没被标脏"的块。
+    /// 那和残块无关，混进来只会让这条测试指向两个方向。
+    #[test]
+    fn ragged_chunks_match_a_full_scan() {
+        let build = || {
+            let mut w = World::new(100, 68).unwrap();
+            // 地板正好铺在最下面那个 4 格高的残块行上。
+            w.fill_rect(0, 64, 100, 4, MaterialKind::Stone);
+            // 沙落在右半边（残块列，宽 36），水在左半边自己摊平。
+            w.fill_rect(70, 8, 20, 20, MaterialKind::Sand);
+            w.fill_rect(10, 40, 12, 12, MaterialKind::Water);
+            w
+        };
+        let mut skipping = build();
+        let mut full = build();
+        let mut sim_skip = MaterialSim::new();
+        let mut sim_full = MaterialSim::new();
+
+        for t in 0..300 {
+            sim_skip.step(&mut skipping);
+            full.mark_all_dirty();
+            sim_full.step(&mut full);
+            assert_eq!(
+                skipping.hash(),
+                full.hash(),
+                "残块世界（100×68）跳块与全扫在第 {t} tick 分叉"
+            );
+        }
+        // 世界必须真的动过：两边都静止的话，这条测试什么都没证明。
+        assert_ne!(
+            skipping.hash(),
+            build().hash(),
+            "300 tick 之后世界一格没变——这条测试没测到东西"
+        );
+        // 沙必须真的落到了残块行上，否则"跨块下落"这件事根本没发生。
+        assert_eq!(
+            skipping.get(80, 63),
+            MaterialKind::Sand,
+            "沙没有落到地板上"
+        );
     }
 
     /// SPEC 第 15 节的验收锚点：10,000 tick 之后同种子哈希仍一致。

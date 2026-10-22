@@ -41,6 +41,12 @@ pub enum BtnState {
     Selected,
     /// 禁用。
     Disabled,
+    /// **危险**：点下去会丢掉东西（当前世界、存档）。
+    ///
+    /// 单独一个状态而不是"Normal + 红字"：红色在这套皮肤里只有两个用途
+    /// ——出错，和"要毁掉东西"。两者共用一种颜色是可以的，但**不能靠
+    /// 调用方自己记得染红**：那样第一个忘记染的地方就是一个静默的陷阱。
+    Danger,
 }
 
 /// 扁平按钮。**这是整套界面的基础件**，其他控件都是它的变体。
@@ -59,6 +65,7 @@ pub fn flat_button(ui: &mut Ui, label: &str, state: BtnState) -> Response {
         match state {
             BtnState::Selected => theme::ACCENT,
             BtnState::Disabled => theme::TEXT_FAINT,
+            BtnState::Danger => theme::DANGER,
             BtnState::Normal => theme::TEXT,
         },
     );
@@ -81,6 +88,15 @@ pub fn flat_button(ui: &mut Ui, label: &str, state: BtnState) -> Response {
         (theme::TEXT, Color32::WHITE, theme::PANEL)
     } else if state == BtnState::Selected {
         (theme::ACCENT_DIM, theme::ACCENT, theme::ACCENT)
+    } else if state == BtnState::Danger {
+        // 悬停时把底稍微提亮，但不换成 `HOVER`——危险按钮在悬停时
+        // 变得更"亮"会读成"更安全"，而它恰恰是唯一需要人犹豫一下的那个。
+        let fill = if hovered {
+            Color32::from_rgb(0x3A, 0x12, 0x0C)
+        } else {
+            Color32::from_rgb(0x24, 0x0B, 0x07)
+        };
+        (fill, theme::DANGER, theme::DANGER)
     } else if state == BtnState::Disabled {
         (theme::PANEL, theme::LINE, theme::TEXT_FAINT)
     } else if hovered {
@@ -164,6 +180,8 @@ pub enum Icon {
     Step,
     /// 生物工坊：一个 2×2 的方格（"画身体"这件事最直白的图标）。
     Workshop,
+    /// 世界：一个地球（圆 + 赤道 + 两条经线）。
+    Globe,
 }
 
 fn draw_icon(p: &egui::Painter, icon: Icon, r: Rect, ink: Color32, s: Stroke) {
@@ -278,6 +296,25 @@ fn draw_icon(p: &egui::Painter, icon: Icon, r: Rect, ink: Color32, s: Stroke) {
                 [egui::pos2(rt, t), egui::pos2(rt, b)],
                 Stroke::new(2.0, ink),
             );
+        }
+        Icon::Globe => {
+            // 圆 + 赤道 + 两条经线。经线用折线近似一个竖椭圆——
+            // 在 14px 的尺寸上，四条折线已经读得出"球"了。
+            let r = (rt - l) * 0.5;
+            p.circle_stroke(egui::pos2(cx, cy), r, s);
+            p.line_segment([egui::pos2(l, cy), egui::pos2(rt, cy)], s);
+            for dir in [-1.0f32, 1.0] {
+                let pts: Vec<egui::Pos2> = (0..=4)
+                    .map(|i| {
+                        let a = std::f32::consts::PI * i as f32 / 4.0;
+                        egui::pos2(
+                            cx + dir * r * 0.5 * a.sin(),
+                            cy - r * a.cos(),
+                        )
+                    })
+                    .collect();
+                p.add(egui::Shape::line(pts, s));
+            }
         }
     }
 }

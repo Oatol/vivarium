@@ -29,6 +29,28 @@ impl Rng {
         rng
     }
 
+    /// 内部状态 `(state, inc)`。
+    ///
+    /// 存档要把发生器的**当前**位置写进去，而不是种子：读档之后继续跑，
+    /// 必须和"从没存过档"逐 tick 一致。只存种子会回到序列开头，
+    /// 于是同一段随机数被用第二次——那种偏差在画面上完全看不出来，
+    /// 只会让"读档后的世界和存档时不一样"变成一件说不清的事。
+    #[inline]
+    pub const fn state(&self) -> (u64, u64) {
+        (self.state, self.inc)
+    }
+
+    /// 从 [`Rng::state`] 的值恢复。
+    ///
+    /// `inc` 必须是奇数（PCG 的要求：偶数会让状态永远停在偶数侧）。
+    /// 传进来的值不合法时退回 `inc = 1`，而不是断言——
+    /// 这是**读档**路径，一个坏文件不该让进程 panic。
+    #[inline]
+    pub fn set_state(&mut self, state: u64, inc: u64) {
+        self.inc = if inc % 2 == 1 { inc } else { 1 };
+        self.state = state;
+    }
+
     /// 下一个 32 位随机数。
     #[inline]
     pub fn next_u32(&mut self) -> u32 {

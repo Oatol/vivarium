@@ -231,6 +231,8 @@ pub struct Snapshot {
     pub cells: usize,
     /// 生物能量总和。
     pub energy: u64,
+    /// 物种数（按体型判同，见 `Organism::body_fingerprint`）。
+    pub species: usize,
     /// 杀手细胞数。
     pub killers: usize,
     /// 最小 / 最大体型。
@@ -273,6 +275,7 @@ impl Default for Snapshot {
             organisms: 0,
             cells: 0,
             energy: 0,
+            species: 0,
             killers: 0,
             body_range: (0, 0),
             generation: 0,
@@ -414,10 +417,6 @@ pub enum Command {
     SetScale(TimeScale),
     /// 重新生成地貌（同一个种子，用来验证增量上传）。
     Reseed,
-    /// 在水面附近投放 N 条。
-    Drop(usize),
-    /// 在最高的岛顶点点一把火。
-    Ignite,
     /// 镜头回正。
     CenterView,
     /// 缩放。
@@ -448,6 +447,28 @@ pub enum Command {
     },
     /// 从生物库删掉一条。
     DeleteBody(String),
+    /// 新建一个世界。
+    ///
+    /// `seed` 为 `None` 表示"随便挑一个"——界面不认识随机数，
+    /// 挑种子是主循环的事（它有 `Rng`，也知道当前种子）。
+    NewWorld {
+        width: u32,
+        height: u32,
+        seed: Option<u64>,
+        /// 要不要生成地形（海洋 + 岛屿）。不生成就是一张空世界。
+        terrain: bool,
+        /// 要不要随机投放初始生命。
+        life: bool,
+    },
+    /// 把当前世界存到 `saves/<name>.vivarium`。
+    SaveWorld(String),
+    /// 读一个存档。路径由界面原样带回——它自己不解析路径。
+    LoadWorld(String),
+    /// 重新扫一遍存档目录。
+    ///
+    /// 打开"世界"窗口时发一次，存完档再发一次。刻意不做自动刷新：
+    /// 每帧扫目录在 2000² 的档上是几十毫秒，而这个列表只在用户看的时候才有意义。
+    RefreshSaves,
     /// 退出。
     Quit,
 }
@@ -593,6 +614,175 @@ pub struct LibraryEntry {
 }
 
 // ---------------------------------------------------------------------------
+// 世界窗口
+// ---------------------------------------------------------------------------
+
+/// 新建世界时宽度的下限与上限（格）。
+///
+/// 20 是"还能看出是个世界"的最小尺寸：再小连一列水柱都铺不下，
+/// 地形生成器会退化成一片石头。上限比 [`vivarium_core::world::MAX_WORLD_SIDE`]
+/// （2000）小得多，因为那个数是**内存与纹理的硬边界**，不是"好玩"的边界——
+/// 2000² 的世界在 1100px 的窗口里是 0.55 px/格，什么都看不见。
+pub const MIN_SIDE: u32 = 20;
+/// 宽度上限。见 [`MIN_SIDE`]。
+pub const MAX_WIDTH: u32 = 600;
+/// 高度上限。比宽度小，因为世界是**横板侧视**：高度是水深，
+/// 600 格深的水在画面上是一条谁也不会看的窄缝。
+pub const MAX_HEIGHT: u32 = 450;
+
+/// 三个预设。
+pub const PRESETS: [(&str, u32, u32); 3] =
+    [("小 256×256", 256, 256), ("标准 512×512", 512, 512), ("大 768×728", 768, 728)];
+
+/// 二次确认的有效秒数。
+///
+/// 3 秒是"够我读完那行红字"的长度。更长会让"点两次"变成默认行为，
+/// 更短则会让人手忙脚乱——而这个确认存在的意义是**让人停一下**，
+/// 不是考手速。
+pub const CONFIRM_SECONDS: f64 = 3.0;
+
+/// 一个会丢弃当前世界的动作。
+///
+/// 只有这两种：新建和读取。保存不丢东西，所以不在这张表里。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorldAction {
+    /// 新建。
+    New,
+    /// 读取某个存档（带路径）。
+    Load(String),
+}
+
+/// 存档列表里的一条。
+///
+/// 全部字段由主循环填好——**包括格式化过的字符串**。界面不碰文件系统、
+/// 不碰 `SystemTime`，所以这一整块能在没有磁盘的机器上测。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SaveEntry {
+    /// 显示名（文件名去掉扩展名）。
+    pub name: String,
+    /// 完整路径。界面原样带回给主循环。
+    pub path: String,
+    /// 世界宽（格）。
+    pub width: u32,
+    /// 世界高（格）。
+    pub height: u32,
+    /// 存档那一刻的 tick。
+    pub tick: u64,
+    /// 文件大小，已格式化（"1.0 MB"）。
+    pub size: String,
+    /// 修改时间，已格式化（"10-22 22:41"）。
+    pub modified: String,
+}
+
+/// 「世界」窗口的全部界面状态。
+#[derive(Debug, Clone)]
+pub struct WorldPanel {
+    /// 是否打开。打开时它是模态的——和生物工坊一样盖住整个世界。
+    pub open: bool,
+
+    // --- 新建 ---
+    /// 宽（格）。
+    pub width: u32,
+    /// 高（格）。
+    pub height: u32,
+    /// 种子输入框。**留空 = 随机**。
+    pub seed: String,
+    /// 是否生成地形。
+    pub terrain: bool,
+    /// 是否随机投放初始生命。
+    pub life: bool,
+
+    // --- 保存 ---
+    /// 文件名（不带扩展名）。
+    pub save_name: String,
+    /// 存档目录的显示文本。主循环填，用来回答"文件到底存哪儿了"。
+    pub saves_dir: String,
+
+    // --- 读取 ---
+    /// 存档列表。主循环填。
+    pub saves: Vec<SaveEntry>,
+
+    /// 正在等待二次确认的动作，以及它的截止时刻（`egui` 的时间轴）。
+    ///
+    /// 存的是**截止时刻**而不是"还剩几秒"：每帧减一次秒数会在掉帧时
+    /// 变慢或变快，而截止时刻与帧率无关。
+    pub confirm: Option<(WorldAction, f64)>,
+    /// 上一次操作的结果，显示在窗口底部。
+    pub hint: Option<String>,
+}
+
+impl Default for WorldPanel {
+    fn default() -> Self {
+        Self {
+            open: false,
+            // 默认就是"标准世界"：第一次打开窗口的人多半只是想看看，
+            // 而 512×512 是这个项目的默认世界。
+            width: 512,
+            height: 512,
+            seed: String::new(),
+            terrain: true,
+            life: true,
+            // 文件名由主循环在启动时填（它才知道今天是几号）。
+            save_name: String::new(),
+            saves_dir: String::new(),
+            saves: Vec::new(),
+            confirm: None,
+            hint: None,
+        }
+    }
+}
+
+impl WorldPanel {
+    /// 记下一个"要丢世界"的意图。返回 `true` 表示**这次点击是确认**。
+    ///
+    /// 三段语义：
+    /// - 第一次点：进入待确认，返回 `false`；
+    /// - 3 秒内再点**同一个动作**：确认，返回 `true`，状态清空；
+    /// - 超时或点了**别的**动作：重新开始计时，返回 `false`。
+    ///
+    /// 最后一条是刻意的：先点"新建"再点"读取"，不该被当成"确认新建"。
+    /// 两个不同的动作共用一个确认位，是这类交互里最容易写错的地方。
+    pub fn confirm_click(&mut self, want: WorldAction, now: f64) -> bool {
+        match &self.confirm {
+            Some((pending, deadline)) if *pending == want && now <= *deadline => {
+                self.confirm = None;
+                true
+            }
+            _ => {
+                self.confirm = Some((want, now + CONFIRM_SECONDS));
+                false
+            }
+        }
+    }
+
+    /// 这个动作现在是不是在等确认（且没超时）。
+    pub fn is_confirming(&self, want: &WorldAction, now: f64) -> bool {
+        matches!(&self.confirm, Some((p, deadline)) if p == want && now <= *deadline)
+    }
+
+    /// 超时的确认要清掉。每帧开头调一次。
+    pub fn expire_confirm(&mut self, now: f64) {
+        if let Some((_, deadline)) = &self.confirm {
+            if now > *deadline {
+                self.confirm = None;
+            }
+        }
+    }
+
+    /// 把种子输入框解析成一个数。空串 = `None`（随机）。
+    ///
+    /// 非空但解析不了时也返回 `None`：一个打错的种子不该让"新建"失败，
+    /// 而"留空=随机"已经是这个输入框的语义，多一种退路不会让人困惑。
+    pub fn parsed_seed(&self) -> Option<u64> {
+        let text = self.seed.trim();
+        if text.is_empty() {
+            return None;
+        }
+        text.parse().ok()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 界面状态
 // ---------------------------------------------------------------------------
 
@@ -625,6 +815,8 @@ pub struct UiState {
     pub workshop: Workshop,
     /// 生物库（名字 + 细胞表）。主循环每次载入/保存后回填。
     pub library: Vec<LibraryEntry>,
+    /// 「世界」窗口（新建 / 保存 / 读取）。
+    pub world: WorldPanel,
     /// 顶部那条"上一次操作"的提示，两秒后自己消失。
     ///
     /// 存在的理由：很多操作**没有可见反馈**（设速度、切工具），
@@ -646,6 +838,7 @@ impl Default for UiState {
             console: Console::new(),
             workshop: Workshop::default(),
             library: Vec::new(),
+            world: WorldPanel::default(),
             commands: Vec::new(),
             toast: None,
         }
@@ -660,7 +853,7 @@ impl UiState {
         s.console.push(
             0,
             Level::Info,
-            "空格 暂停 · 1/2/3/4 速度 · L 放鱼 · Esc 退出",
+            "空格 暂停 · 1/2/3/4 速度 · W 工坊 · G 世界 · Esc 退出",
         );
         s
     }

@@ -484,6 +484,11 @@ pub struct LifeStats {
     /// 一代代往上爬进天空，种群从 145 掉到 11，而能量账一分不差、画面上
     /// 也看不出异常。
     pub stranded: usize,
+    /// 当前有几个**物种**（按体型判同，见 [`Organism::body_fingerprint`]）。
+    ///
+    /// 界面"世界"窗口顶上那行要用它。刻意不按基因组判同：
+    /// 那样报出来的是"有几种不同的神经权重"，而玩家想看的是"有几种长法"。
+    pub species: usize,
 }
 
 /// 一次位移是**主动游动**还是**被重力拉下来**。
@@ -653,6 +658,71 @@ impl LifeSim {
     #[inline]
     pub fn ledger(&self) -> EnergyLedger {
         self.ledger
+    }
+
+    /// 下一个要分配的编号。
+    ///
+    /// 存档要存它：读档后新生的个体会拿到**和存档那一刻接续**的编号，
+    /// 而不是从 1 重新数。编号同时进 [`World::hash`]（占格表里存着它），
+    /// 所以"读档后再跑 200 tick 的哈希 == 没存过档跑 200 tick 的哈希"
+    /// 这条断言，靠的就是这个值也被原样带回来。
+    #[inline]
+    pub fn next_id(&self) -> OrganismId {
+        self.next_id
+    }
+
+    /// 随机数发生器的内部状态，见 [`Rng::state`]。
+    #[inline]
+    pub fn rng_state(&self) -> (u64, u64) {
+        self.rng.state()
+    }
+
+    /// 藻席生长是否开着。
+    #[inline]
+    pub fn food_growth(&self) -> bool {
+        self.food_growth
+    }
+
+    /// 读档：把一份完整状态装回一个新调度器。
+    ///
+    /// 和 [`LifeSim::new`] 的区别只有一处，但很关键：`new` 会**扫一遍世界**
+    /// 把已有的残骸算成"注入"，而这里账本是从存档里原样带回来的。
+    /// 走 `new` 再覆盖账本会做一遍白工，走 `new` 不覆盖则会凭空多出
+    /// "残骸标称值之和"这笔注入——读一次档账本就崩一次，而画面毫无异样。
+    ///
+    /// 装完立刻重建占格表（[`Organism::claim`]）并重算光场：
+    /// 渲染器和拾取都靠占格表，它们不该知道"刚才是读档"。
+    pub fn restore(world: &mut World, save: crate::save::LifeSave) -> Self {
+        let mut field = AirField::new(world);
+        // 长度不符的温标会被 `restore` 整个拒掉，退回环境温度——
+        // 一个坏档不值得让整个读档失败，但也不该装进去一半。
+        field.restore(world, &save.sources, &save.temp);
+
+        let mut sim = Self {
+            organisms: Vec::new(),
+            next_id: save.next_id.max(1),
+            ledger: save.ledger,
+            rng: Rng::new(LIFE_SEED),
+            founder: save.founder,
+            stats: LifeStats::default(),
+            food_growth: save.food_growth,
+            moved_total: [0; 4],
+            fell_total: 0,
+            plankton_ids: Vec::new(),
+            eaten_plankton: Vec::new(),
+            field,
+        };
+        sim.rng.set_state(save.rng_state.0, save.rng_state.1);
+
+        for org in save.organisms {
+            // 编号比 `next_id` 还大的有机体只可能来自一个被手工改过的档。
+            // 与其让它和未来的新生儿撞号（撞号之后占格表会指向错误的身体，
+            // 表现是"某条鱼动了另一条鱼"），不如当场把计数器顶上去。
+            sim.next_id = sim.next_id.max(org.id + 1);
+            org.claim(world);
+            sim.organisms.push(org);
+        }
+        sim
     }
 
     /// 所有有机体。
@@ -909,10 +979,14 @@ impl LifeSim {
         let mut killers = 0usize;
         let mut energy = 0u64;
         let mut max_gen = 0u32;
+        // 物种：按体型指纹去重。**藻也算**——一片藻席里如果长出了两种
+        // 不同大小的单细胞，那就是真的有两个物种，不该被"它们都是藻"抹平。
+        let mut species: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for org in &self.organisms {
             cells += org.cell_count();
             energy += org.energy as u64;
             max_gen = max_gen.max(org.generation);
+            species.insert(org.body_fingerprint());
             if org.is_plankton() {
                 plankton += 1;
                 continue;
@@ -944,6 +1018,7 @@ impl LifeSim {
         self.stats.killers = killers;
         self.stats.energy = energy;
         self.stats.max_generation = max_gen;
+        self.stats.species = species.len();
         // 平均代数只算**动物**：藻每分裂一次代数就 +1，几百个藻会把
         // "平均代数"拉到和鱼完全无关的量级上。
         let (sum, n) = self

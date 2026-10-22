@@ -51,6 +51,13 @@ use crate::rng::Rng;
 /// 卡在 8 会让"长一条长身体"在基因层面做不到。
 pub const MAX_DEPTH: usize = 16;
 
+/// 一个身体最多能有多少格（`Grn::max_cells` 的上界）。
+///
+/// 写在这里而不是散在 `mutate` 的 `clamp(1, 24)` 和存档的校验里：
+/// 它是**同一件事**——"身体能长多大"。两处各写一个数字，早晚有一处先改，
+/// 而症状会是"读档之后这条鱼比存档时少了两格"。
+pub const MAX_BODY_CELLS: u8 = 24;
+
 /// 四个方向，**顺序固定**。
 ///
 /// 右、下、左、上。这个顺序不是随便定的：广度优先生长时，
@@ -239,7 +246,8 @@ impl Grn {
         // 体型上限也会漂：它是"长到多大就不长了"的那条线。
         if rng.next_f32() < 0.05 * edits as f32 {
             let step = if rng.next_f32() < 0.5 { 1i16 } else { -1 };
-            self.max_cells = (self.max_cells as i16 + step).clamp(1, 24) as u8;
+            self.max_cells =
+                (self.max_cells as i16 + step).clamp(1, MAX_BODY_CELLS as i16) as u8;
         }
     }
 

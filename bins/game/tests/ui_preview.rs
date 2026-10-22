@@ -59,6 +59,7 @@ fn demo_snapshot() -> Snapshot {
         organisms: 52,
         cells: 648,
         energy: 46_887,
+        species: 17,
         killers: 3,
         body_range: (10, 14),
         generation: 54,
@@ -179,6 +180,14 @@ fn workshop_mode() -> bool {
     std::env::var("VIVARIUM_WORKSHOP").is_ok()
 }
 
+/// 「世界」窗口模式：`VIVARIUM_WORLD=1`。
+///
+/// 和工坊同一个理由：这张图要回答的问题——"红字够不够显眼""表格的列
+/// 有没有对齐""滑块和勾选挤不挤"——全是看一眼就知道、写断言却说不清的。
+fn world_mode() -> bool {
+    std::env::var("VIVARIUM_WORLD").is_ok()
+}
+
 /// 指针放哪儿：`VIVARIUM_HOVER=375,12`。
 ///
 /// 有了它就能把"悬停某个按钮时会不会有东西挡住界面"变成一张图，
@@ -227,6 +236,46 @@ fn demo_state() -> UiState {
             },
         ];
     }
+    if world_mode() {
+        state.world.open = true;
+        state.world.saves_dir = "C:\\Users\\安\\WorkBuddy AI\\life engine\\dist\\saves".to_owned();
+        state.world.save_name = "world-20261022".to_owned();
+        state.world.seed = "20261016".to_owned();
+        state.world.saves = vec![
+            vivarium_ui::SaveEntry {
+                name: "world-20261022".into(),
+                path: "saves/world-20261022.vivarium".into(),
+                width: 512,
+                height: 512,
+                tick: 28_431,
+                size: "1.0 MB".into(),
+                modified: "刚刚".into(),
+            },
+            vivarium_ui::SaveEntry {
+                name: "深海大世界".into(),
+                path: "saves/deep.vivarium".into(),
+                width: 600,
+                height: 450,
+                tick: 120_004,
+                size: "2.4 MB".into(),
+                modified: "3 小时前".into(),
+            },
+            vivarium_ui::SaveEntry {
+                name: "alpha".into(),
+                path: "saves/alpha.vivarium".into(),
+                width: 256,
+                height: 256,
+                tick: 40,
+                size: "101 KB".into(),
+                modified: "2 天前".into(),
+            },
+        ];
+        // 让二次确认的红按钮也出现在图里——那是最该被看见的一个状态。
+        state.world.confirm = Some((
+            vivarium_ui::state::WorldAction::New,
+            f64::INFINITY,
+        ));
+    }
     state.log(0, Level::Info, "Vivarium 已启动");
     state.log(
         0,
@@ -270,7 +319,18 @@ fn ui_preview_png() {
     let mut state = demo_state();
     let snap = demo_snapshot();
 
-    // --- 跑一帧界面 ---
+    // --- 跑两帧界面 ---
+    //
+    // **两帧，不是一帧。** `egui::Window` 的尺寸在**第一次**显示时还不知道：
+    // 它按"上一帧量出来的内容大小"决定自己多大，第一帧量到的是 0。
+    // 于是 `anchor(CENTER_CENTER)` 会把一个 0×0 的框摆到正中央，然后内容
+    // 从那个点往右下角铺开——截图里就是"面板不在中间，右边一截被裁掉"。
+    //
+    // 真实运行时每秒六十帧，第一帧的偏差没人看得见；截图只有一帧，
+    // 于是它成了唯一会撞上这件事的地方。
+    //
+    // 多跑几帧还顺带解决了**淡入**：`Window` 出现时有一小段透明度动画，
+    // 一帧之后整块面板还是半透明的，截图上会显得"发灰"。
     let input = egui::RawInput {
         screen_rect: Some(egui::Rect::from_min_size(
             egui::pos2(0.0, 0.0),
@@ -281,8 +341,32 @@ fn ui_preview_png() {
         ..Default::default()
     };
 
+    let mut warmup = ui.show(&mut state, &snap, input.clone()).1;
+    let mut kept = std::mem::take(&mut warmup.textures_delta);
+    // 16 帧 ≈ 0.27 秒，够淡入动画走完（`style.animation_time` 默认 0.2 秒）。
+    for _ in 0..15 {
+        let mut w = ui.show(&mut state, &snap, input.clone()).1;
+        for (id, deltas) in &w.textures_delta.set {
+            kept.set.entry(*id).or_default().extend(deltas.iter().cloned());
+        }
+        w.textures_delta.clear();
+    }
     let (out, mut full) = ui.show(&mut state, &snap, input);
     assert!(out.repaint);
+    // 预热帧的纹理增量**不能丢**：字体图集是在第一帧建的，而 egui 的
+    // 实心矩形和文字共用同一张图集——漏了它，整个画面会一片空白
+    // （渲染器找不到纹理就整批跳过，不报错）。这个坑踩过一次，
+    // 症状是"PNG 里只有一个纯色的底"。
+    //
+    // `mem::take` 而不是 `clone`：`TexturesDelta` 在 drop 时断言"必须被消费"，
+    // 留着副本不交出去会 panic。
+    for (id, deltas) in std::mem::take(&mut kept.set) {
+        full.textures_delta
+            .set
+            .entry(id)
+            .or_default()
+            .extend(deltas);
+    }
 
     let ppp = full.pixels_per_point;
     let paint_jobs = ui.ctx().tessellate(full.shapes, ppp);
@@ -428,6 +512,8 @@ fn ui_preview_png() {
         .join("target")
         .join(if workshop_mode() {
             "workshop-preview.png"
+        } else if world_mode() {
+            "world-preview.png"
         } else {
             "ui-preview.png"
         });
@@ -457,16 +543,58 @@ fn ui_preview_png() {
     // 所以"顶栏是面板色""中央留给世界"这些断言必然不成立。
     // 这里只保留"画面上确实有一块比遮罩亮的区域"（= 面板真的画出来了），
     // 具体长什么样交给 PNG 本身。
-    if workshop_mode() {
+    //
+    // 「世界」窗口同理，而且是同一个判据：模态面板盖住了整张图，
+    // 下面那些"哪块面板在哪儿"的断言全都失去意义。
+    if workshop_mode() || world_mode() {
         let lit = pixels
             .chunks_exact(4)
             .filter(|p| p[0] > 24 || p[1] > 24 || p[2] > 24)
             .count();
         assert!(
             lit > (W * H / 4) as usize,
-            "工坊面板应当占掉四分之一以上的画面，实际只有 {lit} 个亮像素"
+            "模态面板应当占掉四分之一以上的画面，实际只有 {lit} 个亮像素"
         );
-        println!("工坊截图：{}", path.display());
+
+        if world_mode() {
+            // **红字必须真的画出来。**
+            //
+            // 这是这一屏最该被看见的东西（"新建/读取会丢弃当前世界"），
+            // 而它恰好是"画了但颜色错了"或"被布局挤没了"的高发区。
+            //
+            // 判据是"偏红的像素有多少个"，不是"有多少个像素精确等于
+            // `theme::DANGER`"：9.5px 的中文字经过抗锯齿，笔画中心和边缘
+            // 的混合比例各不相同，实测**一个精确匹配都没有**，而偏红的
+            // 像素有四千多个。钉精确值等于钉住字体渲染的实现细节。
+            let reddish = pixels
+                .chunks_exact(4)
+                .filter(|p| {
+                    let (r, g, b) = (u32::from(p[0]), u32::from(p[1]), u32::from(p[2]));
+                    r > 40 && r * 2 > g * 3 && r * 2 > b * 3
+                })
+                .count();
+            assert!(
+                reddish > 1000,
+                "红字 / 危险按钮没画出来：只找到 {reddish} 个偏红像素"
+            );
+
+            // 四个角都在遮罩底下：模态面板居中，不该盖住整个窗口。
+            //
+            // 刻意**不**断言面板内部的底色等于 `theme::PANEL`：遮罩画在
+            // 基础层、面板画在更上面的层，两者在边缘处的混合结果取决于
+            // 图元顺序，钉住它只会让这条测试在无关的改动上变红。
+            // 面板自己的几何与配色由 `vivarium-ui` 的布局测试负责。
+            for (x, y) in [(2, 2), (W - 3, 2), (2, H - 3), (W - 3, H - 3)] {
+                let c = px(x, y);
+                assert!(
+                    c[0] <= 10 && c[1] <= 12 && c[2] <= 16,
+                    "({x},{y}) 没有被遮罩压暗：{}",
+                    hex(c)
+                );
+            }
+        }
+
+        println!("截图：{}", path.display());
         return;
     }
 

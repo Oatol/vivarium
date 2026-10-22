@@ -300,6 +300,74 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     }
 }
 
+/// 从**已有**的网格反推地表形状。
+///
+/// 读档之后没有"生成结果"可拿：存档里只有材质，没有当初那条水面线和海床基线。
+/// 但相机取景（[`WorldLayout::focus_left`]）和统计面板要它们，所以只能扫一遍。
+///
+/// ## 判据
+///
+/// 每列最上面那一格**固体**（石或沙）就是地表。水、气、残骸、尸体都不算——
+/// 它们是"落在地表上"的东西。把漂过的尸体当地表，水面线会随着它上下跳，
+/// 而那正好是相机取景最敏感的量。
+///
+/// `seabed` 取各地表的**中位数**——注意它不等于生成时那条基线，见下面
+/// "它恢复不了什么"一节。中位数而不是平均值：一座岛会把平均值拽偏几十格，
+/// 而中位数几乎不受影响。
+///
+/// ## 它恢复不了什么
+///
+/// 生成时的 `seabed` 是"海床漂移与岛屿抬升都归零的那条线"，而材质里
+/// 只留下"这一列的地表最终在哪"。岛会把大片列抬高——实测一个 256² 的
+/// 种子，中位地表比基线高 55 格（几座岛的坡脚连起来盖住了大半张图）。
+///
+/// 所以这里给的是**中位地表**，语义是"地面通常在哪儿"，只用于界面文案
+/// 与取景兜底，**不参与任何模拟判据**。将来谁要拿它当"海底在哪"用，
+/// 会得到一张错的水深图——所以这件事写在文档里，而不是留给读代码的人猜。
+///
+/// 一滴水都没有的世界里，`waterline` 退化成最高地表——那样
+/// [`WorldLayout::focus_top`] 会把视野对准那座最高的山，而不是对准世界顶部。
+pub fn scan(world: &World) -> WorldLayout {
+    let (w, h) = (world.width(), world.height());
+    let mut surface = vec![h as isize; w];
+    let mut top_water: Option<usize> = None;
+
+    for (x, slot) in surface.iter_mut().enumerate() {
+        for y in 0..h {
+            match world.get_unchecked(x, y) {
+                MaterialKind::Stone | MaterialKind::Sand => {
+                    *slot = y as isize;
+                    break;
+                }
+                // `usize::MAX` 当"还没有见过水"的哨兵：第一格水一定比它小。
+                // 用 `unwrap_or(usize::MAX)` 而不是 `is_none_or`，后者要
+                // Rust 1.82，而这个 workspace 声明的是 1.80。
+                MaterialKind::Water if top_water.unwrap_or(usize::MAX) > y => {
+                    top_water = Some(y);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let highest = surface.iter().copied().min().unwrap_or(0).max(0) as usize;
+    let waterline = top_water.unwrap_or(highest).min(h);
+
+    let mut sorted = surface.clone();
+    sorted.sort_unstable();
+    let seabed = sorted
+        .get(sorted.len() / 2)
+        .copied()
+        .unwrap_or(h as isize)
+        .clamp(waterline as isize, h as isize) as usize;
+
+    WorldLayout {
+        waterline,
+        seabed,
+        surface,
+    }
+}
+
 /// 岛屿的横向剖面，输入 `t ∈ [-1, 1]`，输出 `0..=1` 的相对高度。
 ///
 /// **平顶 + 陡坡**，而不是纯余弦钟形。纯钟形画出来是一个圆锥，
@@ -363,6 +431,54 @@ mod tests {
         let (a, _) = build(W, H, SEED);
         let (b, _) = build(W, H, SEED + 1);
         assert_ne!(a.hash(), b.hash(), "换种子应当换一张图");
+    }
+
+    #[test]
+    fn scan_recovers_the_layout_that_generation_reported() {
+        // 读档路径没有"生成结果"可拿，只能从材质反推。这里钉住的是
+        // **反推出来的东西和生成时说的是同一件事**——否则读档之后
+        // 相机会跳到一个和存档前完全不同的位置。
+        let (world, generated) = build(W, H, SEED);
+        let scanned = scan(&world);
+        assert_eq!(scanned.waterline, generated.waterline, "水面线对不上");
+        assert_eq!(scanned.surface.len(), generated.surface.len());
+        // 地表允许差几格：生成时"地表"是设计线，扫出来的是沙层真实顶边，
+        // 而沙层厚度是 3~8 格随机的。要求逐列相等等于要求沙层厚度为 0。
+        let mut worst = 0isize;
+        for (a, b) in scanned.surface.iter().zip(&generated.surface) {
+            worst = worst.max((a - b).abs());
+        }
+        assert!(worst <= 12, "地表差得太多（最大 {worst} 格）");
+        // **海床基线无法从材质里恢复**，这里不假装能。
+        //
+        // 生成时的 `seabed` 是"漂移和岛屿都归零的那条线"，而材质里只有
+        // "这一列的地表最终在哪"。岛会把大片列抬高——这个种子里中位数
+        // 比基线高 55 格，因为几座岛的坡脚连起来盖住了大半张图。
+        // 所以 `scan` 给的是**中位地表**（"地面通常在哪儿"），不是基线。
+        // 它只用于界面文案，不参与任何模拟判据——这一点必须说清楚，
+        // 否则将来有人拿它当"海底在哪"用，会得到一张错的水深图。
+        let (lo, hi) = (
+            scanned.surface.iter().copied().min().unwrap_or(0),
+            scanned.surface.iter().copied().max().unwrap_or(0),
+        );
+        assert!(
+            (lo..=hi).contains(&(scanned.seabed as isize)),
+            "中位地表 {} 落在所有地表 {lo}..={hi} 之外",
+            scanned.seabed
+        );
+        assert!(scanned.seabed >= scanned.waterline);
+    }
+
+    #[test]
+    fn scan_of_an_empty_world_does_not_panic_or_go_out_of_bounds() {
+        // 一个"没有地形"的世界（新建时取消勾选"生成地形"）是合法的。
+        // 扫描它不能 panic，也不能给出一个越界的取景建议。
+        let world = World::new(100, 70).unwrap();
+        let l = scan(&world);
+        assert_eq!(l.surface, vec![70isize; 100]);
+        assert_eq!(l.waterline, 70);
+        assert!(l.focus_left(64) <= 100);
+        assert!(l.focus_top(64) <= 70);
     }
 
     #[test]

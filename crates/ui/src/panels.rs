@@ -528,11 +528,28 @@ fn tool_strip(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                 ui,
                 Icon::Workshop,
                 state.workshop.open,
-                "生物工坊（G）——在网格上画一副身体",
+                "生物工坊（W）——在网格上画一副身体",
             )
             .clicked()
             {
                 state.workshop.open = !state.workshop.open;
+            }
+
+            ui.add_space(6.0);
+            if widgets::icon_button(
+                ui,
+                Icon::Globe,
+                state.world.open,
+                "世界（G）——新建 / 保存 / 读取",
+            )
+            .clicked()
+            {
+                state.world.open = !state.world.open;
+                // 打开时立刻要一份存档列表：那个目录可能刚被用户在外面改过，
+                // 而"打开面板看到的是上一次的列表"会让人以为存档丢了。
+                if state.world.open {
+                    state.emit(Command::RefreshSaves);
+                }
             }
 
             ui.add_space(6.0);

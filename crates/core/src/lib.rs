@@ -34,6 +34,7 @@ pub mod life_sim;
 pub mod material;
 pub mod palette;
 pub mod rng;
+pub mod save;
 pub mod sim;
 pub mod time_scale;
 pub mod world;

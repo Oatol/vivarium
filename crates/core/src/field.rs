@@ -512,6 +512,31 @@ impl AirField {
         self.update_temp(world);
     }
 
+    /// 读档：把光源与温度表整体装回去，然后**只**重算光照。
+    ///
+    /// 为什么重算光照却不重算温度：光照是布局的**纯函数**（关灯即暗），
+    /// 读回来的世界布局已经变了，那份光照必然作废；而温度是**积分状态**，
+    /// 存的就是它此刻的值，再松弛一步等于把存档时刻的温度抹掉一点点——
+    /// 读档之后"和存档时不一样"这件事，恰恰是玩家最容易察觉的那种不对。
+    ///
+    /// `temp` 长度不符时返回 `false` 并且**不改变任何东西**：一个坏档
+    /// 应该整个被拒绝，而不是装进去一半。
+    pub fn restore(&mut self, world: &World, sources: &[LightSource], temp: &[f32]) -> bool {
+        if temp.len() != self.temp.len() {
+            return false;
+        }
+        self.temp.copy_from_slice(temp);
+        self.next.copy_from_slice(temp);
+        self.sources.clear();
+        // 超上限的灯直接丢掉，而不是让 `sources` 无界增长：
+        // 上限是渲染器和界面都假定的（`SOURCE_CAP` 个圆环），
+        // 读档路径没有理由成为唯一能突破它的入口。
+        self.sources
+            .extend(sources.iter().copied().take(SOURCE_CAP));
+        self.update_light(world);
+        true
+    }
+
     // -- 内部 ---------------------------------------------------------------
 
     /// 扫一遍世界，把每个粗格的材质摘要算出来。
