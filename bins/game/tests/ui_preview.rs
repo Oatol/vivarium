@@ -179,6 +179,22 @@ fn workshop_mode() -> bool {
     std::env::var("VIVARIUM_WORKSHOP").is_ok()
 }
 
+/// 指针放哪儿：`VIVARIUM_HOVER=375,12`。
+///
+/// 有了它就能把"悬停某个按钮时会不会有东西挡住界面"变成一张图，
+/// 而不用改代码再重跑——tooltip 这类东西**只有真的悬停才会出现**，
+/// 而它恰恰是最容易挡住内容的。
+fn hover_at() -> egui::Pos2 {
+    let Some(spec) = std::env::var("VIVARIUM_HOVER").ok() else {
+        return egui::pos2(520.0, 420.0);
+    };
+    let (x, y) = spec.split_once(',').unwrap_or(("520", "420"));
+    egui::pos2(
+        x.trim().parse().unwrap_or(520.0),
+        y.trim().parse().unwrap_or(420.0),
+    )
+}
+
 fn demo_state() -> UiState {
     let mut state = UiState::new();
     if workshop_mode() {
@@ -261,7 +277,7 @@ fn ui_preview_png() {
             egui::vec2(W as f32, H as f32),
         )),
         // 指针放在中央，让"悬停"这一态也出现在图里。
-        events: vec![egui::Event::PointerMoved(egui::pos2(520.0, 420.0))],
+        events: vec![egui::Event::PointerMoved(hover_at())],
         ..Default::default()
     };
 

@@ -111,17 +111,26 @@ fn hover_readout(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::R
     let line_h = 13.0;
     let height = line_h * galleys.len() as f32 + 8.0;
 
-    // 贴指针的右上角；贴近屏幕右边时翻到左边。
-    let anchor = egui::pos2(pos.x + 18.0, pos.y - height - 8.0);
-    let anchor = if anchor.x + width > central.right() {
-        egui::pos2(pos.x - 18.0 - width, anchor.y)
-    } else {
-        anchor
-    };
-    let anchor = egui::pos2(
-        anchor.x.max(central.left()),
-        anchor.y.max(central.top()),
-    );
+    // 贴指针的右上角；放不下就翻到另一边。
+    //
+    // **两条边都要"翻"，不能"夹"。** 第一版只处理了右边，上下用
+    // `max(central.top())` 夹住——指针贴着顶栏时，框被按在指针正上方，
+    // 正好盖住你刚切完滤镜要看的那一片（玩家报的"切视图时提示挡住界面"
+    // 就是这个：那个框浮在顶栏下面，看着就像一条提示）。
+    let gap = 18.0;
+    let mut x = pos.x + gap;
+    let mut y = pos.y - height - 8.0;
+    if x + width > central.right() {
+        x = pos.x - gap - width; // 右边放不下 → 翻到左边
+    }
+    if y < central.top() {
+        y = pos.y + gap; // 上面放不下 → 翻到下面
+    }
+    // 翻完之后如果两边都放不下（世界很矮），才允许贴边——这时已经无解了，
+    // 但至少不要画出世界。
+    let max_x = (central.right() - width).max(central.left());
+    let max_y = (central.bottom() - height).max(central.top());
+    let anchor = egui::pos2(x.clamp(central.left(), max_x), y.clamp(central.top(), max_y));
     let rect = egui::Rect::from_min_size(anchor, egui::vec2(width, height));
 
     let p = ui.painter();
@@ -375,7 +384,7 @@ fn top_bar(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                 // 互斥的图，叠在一起谁也看不清。TPT 的复选是因为它有
                 // 气压、速度、涡度这些**可以叠加**的空气通道，而我们没有。
                 ui.label(
-                    egui::RichText::new("视图")
+                    egui::RichText::new("视图 V")
                         .size(theme::TITLE_SIZE)
                         .color(theme::TEXT_FAINT),
                 );
@@ -390,19 +399,18 @@ fn top_bar(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     if resp.clicked() {
                         want_view = Some(mode);
                     }
-                    // **不给 tooltip。** 顶栏在最上面，提示只能往下弹，
-                    // 正好压在世界上——切滤镜的时候那行字会盖住你要看的东西，
-                    // 而切滤镜恰恰是最需要看世界的时刻。说明改写进控制台。
+                    // **不给 tooltip，也不往控制台写一行。**
+                    //
+                    // 顶栏在最上面，tooltip 只能往下弹，正好压在世界上；
+                    // 而切滤镜恰恰是最需要看世界的时刻。玩家连着报过两次
+                    // "切换视图的提示挡住 UI"，所以这次一个字都不弹：
+                    // 热键直接写进标题（"视图 V"），名字自己就说明了看什么。
+                    //
+                    // 通则：**说明不该出现在你正要看的那个地方。**
                 }
                 if let Some(mode) = want_view {
                     state.view = mode;
                     state.emit(Command::SetViewMode(mode));
-                    let tick = snap.tick;
-                    state.log(
-                        tick,
-                        Level::Info,
-                        format!("视图 · {}：{}（V 键循环）", mode.label(), mode.describe()),
-                    );
                 }
 
                 // 右侧：帧率与成本。用 `right_to_left` 让它们贴右。

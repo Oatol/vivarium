@@ -338,6 +338,75 @@ mod tests {
         assert!(widest <= 1100.5, "读数被画到了屏幕外：右边界 {widest}");
     }
 
+    /// 读数框贴边时**翻到另一边**，不是被夹住。
+    ///
+    /// 玩家连着报过两次"切视图时提示挡住 UI"：第一次是 tooltip，
+    /// 第二次就是这个框——它靠上边界时被 `max(central.top())` 夹住，
+    /// 正好按在指针正上方，看着像顶栏下面挂了一条提示。
+    ///
+    /// 判据用"多出来的那个矩形"：同一个快照渲两帧，差集里就是读数框。
+    #[test]
+    fn the_readout_flips_instead_of_being_clamped() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let mut snap = Snapshot::default();
+
+        let render = |ui: &mut Ui, state: &mut UiState, snap: &Snapshot, at: egui::Pos2| {
+            let input = egui::RawInput {
+                events: vec![egui::Event::PointerMoved(at)],
+                ..screen()
+            };
+            let (_, mut full) = ui.show(state, snap, input);
+            let rects: Vec<egui::Rect> = full
+                .shapes
+                .iter()
+                .filter_map(|s| match &s.shape {
+                    egui::Shape::Rect(r) => Some(r.rect),
+                    _ => None,
+                })
+                .collect();
+            full.textures_delta.clear();
+            rects
+        };
+
+        // 指针贴着世界顶部（顶栏下面一点）。
+        let high = egui::pos2(520.0, 60.0);
+        let plain = render(&mut ui, &mut state, &snap, high);
+        snap.hover = Some(hover_cell());
+        let with = render(&mut ui, &mut state, &snap, high);
+        let added: Vec<egui::Rect> = with.into_iter().filter(|r| !plain.contains(r)).collect();
+        let boxed = added
+            .iter()
+            .find(|r| r.width() > 40.0 && r.height() > 30.0)
+            .copied()
+            .expect("悬停时应当多画一个读数框");
+        assert!(
+            boxed.top() > high.y,
+            "上面放不下时应当翻到指针下面，实测框顶 {} / 指针 {}",
+            boxed.top(),
+            high.y
+        );
+
+        // 指针在世界中间：框还是应该在指针**上方**（不要为了修这个把它一律翻下去）。
+        let mid = egui::pos2(520.0, 420.0);
+        snap.hover = None; // 先把框关掉，否则"差集"是空的
+        let plain = render(&mut ui, &mut state, &snap, mid);
+        snap.hover = Some(hover_cell());
+        let with = render(&mut ui, &mut state, &snap, mid);
+        let added: Vec<egui::Rect> = with.into_iter().filter(|r| !plain.contains(r)).collect();
+        let boxed = added
+            .iter()
+            .find(|r| r.width() > 40.0 && r.height() > 30.0)
+            .copied()
+            .expect("悬停时应当多画一个读数框");
+        assert!(
+            boxed.bottom() < mid.y,
+            "世界中间时框应当仍在指针上方，实测框底 {} / 指针 {}",
+            boxed.bottom(),
+            mid.y
+        );
+    }
+
     /// 换滤镜**不许动世界的矩形**。
     ///
     /// 滤镜只改 shader 里的分支，不该参与布局。要是哪天某个滤镜按钮

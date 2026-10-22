@@ -574,12 +574,8 @@ impl Game {
         let next = self.ui.state.view.next();
         self.ui.state.view = next;
         self.renderer.set_view_mode(next);
-        let tick = self.world.tick();
-        self.ui.log(
-            tick,
-            vivarium_ui::Level::Info,
-            format!("视图：{}（{}）", next.label(), next.describe()),
-        );
+        // 不写控制台：切滤镜是高频动作，一行日志既没用又会把真正重要的
+        // 那几行（能量漏账、灭绝）挤出去。按钮上已经写着名字了。
     }
 
     /// 左键点在世界上。
