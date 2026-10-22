@@ -39,8 +39,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
+use vivarium_core::life::{Cell, CellType, Organism, BIRTH_ENERGY_PER_CELL};
 use vivarium_core::life::{Genome, INPUTS, OUTPUTS};
-use vivarium_core::life_sim::{stock_surface, LifeSim, MAX_AGE};
+use vivarium_core::life_sim::{handcrafted_fish_genome, stock_surface, LifeSim, Tactic, MAX_AGE};
 use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
 use vivarium_ui::state::{SelectedOrganism, Snapshot};
 mod ui_glue;
@@ -259,14 +260,14 @@ impl ApplicationHandler for App {
                 match (state, button) {
                     // 左键：落笔（或者检查 / 取样，取决于工具）。
                     (ElementState::Pressed, MouseButton::Left) => {
-                        if !consumed && !game.ui.pointer_over_ui {
+                        if !consumed && !game.ui.pointer_over_ui && !game.ui.modal {
                             game.on_press();
                         }
                     }
                     (ElementState::Released, MouseButton::Left) => game.on_release(),
                     // 右键 / 中键：拖拽平移。**不给左键**，因为左键要画画。
                     (ElementState::Pressed, MouseButton::Right | MouseButton::Middle) => {
-                        if !consumed && !game.ui.pointer_over_ui {
+                        if !consumed && !game.ui.pointer_over_ui && !game.ui.modal {
                             game.pan_anchor = game.cursor;
                         }
                     }
@@ -351,6 +352,12 @@ struct Game {
     history: Vec<f32>,
     /// 上次采样时的 tick。用来做"每 N tick 采一点"。
     history_tick: u64,
+    /// 工坊里"放置"之后等待落点的那副身体。
+    ///
+    /// 放置是**两段式**的：工坊里点"放置到世界"只记下要放什么，
+    /// 然后等用户在世界里点一下决定放哪儿。一段式（直接放在屏幕中心）
+    /// 看起来更省事，但"我想把它放在那片浅滩上"是最常见的诉求。
+    pending_body: Option<Vec<(i16, i16, u8)>>,
     /// 光标在窗口里的位置（物理像素）。点击时用它换算成世界格。
     cursor: Option<(f64, f64)>,
     /// 左键按着，而且当前工具会落笔。
@@ -402,7 +409,11 @@ impl Game {
             println!("启动时投放 {} 条鱼", ids.len());
         }
 
-        let ui = ui_glue::Egui::new(renderer.device(), renderer.surface_format(), &window);
+        let mut ui = ui_glue::Egui::new(renderer.device(), renderer.surface_format(), &window);
+        // 生物库在启动时载入一次。之后每次保存 / 删除都重新扫一遍目录——
+        // 目录里只有几个小文本文件，扫一遍比维护增量状态简单得多，
+        // 而且用户可能在外面手改了文件。
+        ui.state.library = load_library();
 
         Ok(Self {
             window,
@@ -418,6 +429,7 @@ impl Game {
             ui,
             history: Vec::with_capacity(160),
             history_tick: 0,
+            pending_body: None,
             cursor: None,
             painting: false,
             last_paint: None,
@@ -504,6 +516,9 @@ impl Game {
                 "f" | "F" => self.pick_tool(vivarium_ui::state::Tool::Fill),
                 "i" | "I" => self.pick_tool(vivarium_ui::state::Tool::Pick),
                 "q" | "Q" => self.pick_tool(vivarium_ui::state::Tool::Inspect),
+                // W = 生物工坊。G 已经被"点火"占了，而且 G 这个键在
+                // 玩家的肌肉记忆里是"grid/生成"，不是"工坊"。
+                "w" | "W" => self.ui.state.workshop.open = !self.ui.state.workshop.open,
                 "g" | "G" => self.ignite_peak(),
                 "l" | "L" => self.release_fish(),
                 "r" | "R" => self.reseed(),
@@ -541,8 +556,59 @@ impl Game {
     /// 左键按下。
     ///
     /// 分三种：会落笔的工具开始画；检查工具选中生物；取样工具吸一口材质。
+    /// 把工坊画好的身体放在光标处。
+    ///
+    /// 落点合法性交给 `spawn`：它会检查边界和占格，失败就什么都不做。
+    /// 界面那边已经把"没有嘴 / 超过 16 格 / 不连通"拦住了，但**能不能放下**
+    /// 只有世界知道（可能压在石头上），所以这里仍然要处理失败。
+    fn place_body(&mut self, cells: Vec<(i16, i16, u8)>) {
+        let tick = self.world.tick();
+        let Some((cx, cy)) = self.cell_under_cursor() else {
+            return;
+        };
+        if cells.is_empty() {
+            return;
+        }
+        let body: Vec<Cell> = cells
+            .iter()
+            .map(|&(dx, dy, kind)| Cell::new(CellType::from_u8(kind), (dx, dy)))
+            .collect();
+        // 有没有牙决定社交倾向——和 `stock_surface` 里同一条规则。
+        let tactic = if body.iter().any(|c| c.kind == CellType::Killer) {
+            Tactic::Hunt
+        } else {
+            Tactic::Ignore
+        };
+        let mut org = Organism::new(0, (cx, cy), body, handcrafted_fish_genome(tactic));
+        // 启动能量按格数算：刚好够它活到能繁殖。给多了等于凭空注能。
+        let n = org.cells.len().max(1) as u32;
+        org.energy = BIRTH_ENERGY_PER_CELL * n * 6 / 5;
+        match self.life.spawn_injected(&mut self.world, org) {
+            Ok(id) => {
+                self.ui.state.selected = Some(id);
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("放下了一副 {n} 格的身体 #{}", id),
+                );
+            }
+            Err(e) => {
+                self.ui
+                    .log(tick, vivarium_ui::Level::Warn, format!("这里放不下：{e}"));
+            }
+        }
+    }
+
     fn on_press(&mut self) {
         use vivarium_ui::state::Tool;
+
+        // 工坊的"放置"优先于一切：它是一次性的、明确的动作，
+        // 而且工坊关掉之后工具还停在原来的位置——先处理它才不会
+        // "点了放置、结果用画笔在海上涂了一笔"。
+        if let Some(cells) = self.pending_body.take() {
+            self.place_body(cells);
+            return;
+        }
 
         let tool = self.ui.state.tool;
         match tool {
@@ -977,6 +1043,38 @@ impl Game {
             }
             C::Zoom(factor) => self.renderer.zoom_by(factor),
             C::RunFor(_) => {}
+            C::PlaceBody(cells) => {
+                // 只记下来，等用户在世界里点一下再落。
+                self.pending_body = Some(cells);
+            }
+            C::SaveBody { name, cells } => {
+                let tick = self.world.tick();
+                match save_body(&name, &cells) {
+                    Ok(path) => {
+                        self.ui.state.library = load_library();
+                        self.ui.log(
+                            tick,
+                            vivarium_ui::Level::Info,
+                            format!("已存进生物库：{}（{}）", name, path.display()),
+                        );
+                    }
+                    Err(e) => {
+                        self.ui
+                            .log(tick, vivarium_ui::Level::Error, format!("保存失败：{e}"))
+                    }
+                }
+            }
+            C::DeleteBody(name) => {
+                let tick = self.world.tick();
+                if let Err(e) = delete_body(&name) {
+                    self.ui
+                        .log(tick, vivarium_ui::Level::Error, format!("删除失败：{e}"));
+                } else {
+                    self.ui.state.library = load_library();
+                    self.ui
+                        .log(tick, vivarium_ui::Level::Info, format!("已删除：{name}"));
+                }
+            }
             C::Quit => event_loop.exit(),
             // 界面已经处理过的（Select / SetTool / SetBrush / SetMaterial / SetCell）。
             _ => {}
@@ -1282,5 +1380,172 @@ mod tests {
         let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Water, FILL_CAP);
         assert_eq!(n, 0);
         assert!(!capped);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 生物库
+// ---------------------------------------------------------------------------
+//
+// 存在**可执行文件旁边的 `bodies/` 目录**里，格式是纯文本：
+//
+// ```text
+// 三节虫
+// 0 0 2
+// 1 0 2
+// 0 -1 1
+// ```
+//
+// 第一行是名字，之后每行是 `x y 细胞类型`（坐标相对锚点）。
+//
+// ## 为什么不用 JSON / 二进制
+//
+// 一个 `serde` 依赖就是几十万行代码和几分钟编译时间，而这里要存的只是
+// 十几个三元组。纯文本还带来一个实际好处：**用户能直接打开看、能手改、
+// 能贴进 issue**。存档格式的门槛越低，它被分享的机会越多。
+//
+// 代价是没有转义，所以名字要过滤掉路径分隔符——见 `safe_file_name`。
+
+/// 生物库目录。可执行文件旁边。
+fn library_dir() -> std::path::PathBuf {
+    let base = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|p| p.to_path_buf()))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    base.join("bodies")
+}
+
+/// 把名字变成安全的文件名。
+///
+/// 只保留字母、数字、汉字和几个安全的符号，其余一律换成 `_`。
+/// **不能只去掉 `..`**：Windows 上 `:` `*` `?` 都不合法，而用户起名字时
+/// 完全可能用它们。换掉而不是报错，是因为"存不进去"比"名字被改了一个字符"
+/// 更让人困惑。
+fn safe_file_name(name: &str) -> String {
+    let mut out = String::with_capacity(name.len());
+    for c in name.chars() {
+        if c.is_alphanumeric() || matches!(c, '-' | '_' | ' ') {
+            out.push(c);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim().to_owned();
+    if trimmed.is_empty() {
+        "未命名".to_owned()
+    } else {
+        trimmed
+    }
+}
+
+/// 扫一遍生物库目录。
+///
+/// 读不了的文件**跳过而不是报错**：目录里可能有用户手放的说明文件，
+/// 一个坏文件不该让整个库都打不开。
+fn load_library() -> Vec<vivarium_ui::LibraryEntry> {
+    let dir = library_dir();
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("txt") {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        if let Some(body) = parse_body(&text) {
+            out.push(body);
+        }
+    }
+    // 名字排序：目录顺序在不同文件系统上不一样，不排的话列表每次启动都变。
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// 解析一份身体文件。格式不对就返回 `None`（跳过这一个文件）。
+fn parse_body(text: &str) -> Option<vivarium_ui::LibraryEntry> {
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let name = lines.next()?.trim().to_owned();
+    let mut cells = Vec::new();
+    for line in lines {
+        let mut parts = line.split_whitespace();
+        let x: i16 = parts.next()?.parse().ok()?;
+        let y: i16 = parts.next()?.parse().ok()?;
+        let k: u8 = parts.next()?.parse().ok()?;
+        cells.push((x, y, k));
+    }
+    if cells.is_empty() {
+        return None;
+    }
+    Some(vivarium_ui::LibraryEntry { name, cells })
+}
+
+/// 存一份身体。返回写到的路径。
+fn save_body(name: &str, cells: &[(i16, i16, u8)]) -> std::io::Result<std::path::PathBuf> {
+    let dir = library_dir();
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join(format!("{}.txt", safe_file_name(name)));
+    let mut text = String::with_capacity(32 + cells.len() * 10);
+    text.push_str(name.trim());
+    text.push('\n');
+    for &(x, y, k) in cells {
+        text.push_str(&format!("{x} {y} {k}\n"));
+    }
+    std::fs::write(&path, text)?;
+    Ok(path)
+}
+
+/// 删一份身体。
+fn delete_body(name: &str) -> std::io::Result<()> {
+    let path = library_dir().join(format!("{}.txt", safe_file_name(name)));
+    std::fs::remove_file(path)
+}
+
+#[cfg(test)]
+mod library_tests {
+    use super::*;
+
+    /// 存一轮再读回来，细胞一格不差。
+    ///
+    /// 这条测试守的是"格式和解析器对得上"——手写格式最容易犯的错就是
+    /// 写的时候多一个字段、读的时候少一个，而症状是"存进去的身体少了几格"，
+    /// 从界面上完全看不出来。
+    #[test]
+    fn body_round_trips_through_text() {
+        let cells = vec![(0i16, 0i16, 2u8), (1, 0, 2), (0, -1, 1), (-1, 0, 0)];
+        let mut text = String::from("三节虫\n");
+        for &(x, y, k) in &cells {
+            text.push_str(&format!("{x} {y} {k}\n"));
+        }
+        let parsed = parse_body(&text).expect("应当解析得出来");
+        assert_eq!(parsed.name, "三节虫");
+        assert_eq!(parsed.cells, cells);
+    }
+
+    /// 坏文件被跳过，而不是让整个库打不开。
+    #[test]
+    fn malformed_body_is_skipped() {
+        assert!(parse_body("").is_none());
+        assert!(parse_body("只有名字\n").is_none());
+        assert!(parse_body("名字\n不是数字 0 2\n").is_none());
+        // 空行不算坏：手写文件常常多一个换行。
+        assert!(parse_body("名字\n\n0 0 2\n").is_some());
+    }
+
+    /// 名字里的非法字符被换掉，而不是报错或逃出目录。
+    #[test]
+    fn file_names_cannot_escape_the_directory() {
+        // 每个非法字符换一个 `_`：`.` `.` `/` 三个 → `___`。
+        // 关键是**没有 `/` 也没有 `..` 剩下**，名字就逃不出目录。
+        assert_eq!(safe_file_name("../etc/passwd"), "___etc_passwd");
+        assert!(!safe_file_name("../x").contains('/'));
+        assert!(!safe_file_name("../x").contains(".."));
+        assert_eq!(safe_file_name("a:b*c?"), "a_b_c_");
+        assert_eq!(safe_file_name("   "), "未命名");
+        // 汉字要保留——中文名字是常态。
+        assert_eq!(safe_file_name("银鱼"), "银鱼");
     }
 }

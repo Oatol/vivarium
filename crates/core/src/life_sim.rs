@@ -98,6 +98,62 @@ pub const MAX_AGE: u32 = 20_000;
 /// 突变率：每个权重被扰动的概率。
 pub const MUTATION_RATE: f32 = 0.05;
 
+/// `IN_LIGHT` 的衰减尺度：水面下多少格降到 0。
+///
+/// 取 180 是因为这个世界最深处（海床线 337 - 水面 153）约 184 格，
+/// 于是"海底"的光接近 0、"水面"的光是 1。**它必须与世界尺寸无关**——
+/// 早先的公式是 `1 - y / 世界高`，同一个设定点在 64² 和 512² 里
+/// 对应完全不同的深度，行为也就完全不同。
+pub const LIGHT_DEPTH: i32 = 180;
+
+/// 手工基因组瞄准的**等光线**：`IN_LIGHT` 的设定点。
+///
+/// 这个数字**不是"目标深度"，是"竞争平衡点"**——两者差得很远，因为
+/// `pick_direction` 取的是"超过阈值的最大值"，而巡航偏置恒在。
+///
+/// 真正的平衡点是 `设定点 + 巡航偏置/增益`：
+///
+/// ```text
+/// tanh(gain × (light − setpoint)) = tanh(cruise_bias)
+///   ⇒ light = setpoint + tanh(bias) / gain
+///          = 0.60 + 0.60 / 12 ≈ 0.65
+///   ⇒ 深度 = (1 − 0.65) × LIGHT_DEPTH ≈ 63 格
+/// ```
+///
+/// 上浮那一侧对称：`0.60 − 0.05 ≈ 0.55` → 81 格。
+/// 所以鱼的活动带是**水面下 63 到 81 格**——一条 18 格高的走廊，
+/// 它们会在这条走廊的两端之间**来回**：到 77 就上浮，到 67 就下潜。
+///
+/// 为什么是水面下 63 格而不是贴着水面：贴着水面时鱼有一半身体在空气里，
+/// 视觉上像"浮着"；而且水面是光最多的地方，待在那里等于放弃
+/// "在二维里游"这件事。往下 67 格的光是 0.63，生产者收益少一成，
+/// 但鱼真的在水里了。
+///
+/// 为什么平衡点要贴近水面而不是"透光层中段"：生产者收益与光成正比，
+/// 而水面处的光是 0.70、水面下 90 格只有 0.52。把平衡点设在深处，
+/// 种群会掉到四分之一（实测 60 → 11）。**鱼待在水面附近是对的**，
+/// 垂直移动留给觅食和躲避，不靠趋光硬赶。
+///
+/// 早先写 0.66 时平衡点算出来是 0.74（水面下 25 格），而水面本身的光就是
+/// 0.70——**平衡点比水面还浅**，鱼一辈子没下潜过，看起来就是"只沿 X 轴游"。
+///
+/// 写成一个**设定点**而不是"趋光/避光"，是因为带设定点的行为有稳定点：
+/// 光太亮会往下、太暗会往上，中间不产生垂直信号。而"越亮越想上"会让鱼
+/// 贴着水面那一行抖——上去一格变亮、又想上去，最后卡死在那儿。
+pub const LIGHT_SETPOINT: f32 = 0.90;
+
+/// 趋光增益：光每偏离设定点 0.1，垂直方向就想移动多少。
+///
+/// `pick_direction` 取"超过阈值的**最大值**"，而巡航偏置恒为
+/// `tanh(1.0) ≈ 0.76`。垂直信号压不过它，就等于没接——这正是
+/// "只沿 X 轴移动"的根因。
+///
+/// 12.0 是被测出来的，不是拍的：要让水面（光 0.70）处的下沉信号压过 0.76，
+/// 需要 `tanh(gain × 0.10) > 0.76`，即 `gain > 10`。第一版给 5.0，
+/// 水面处的信号只有 0.46——鱼照样一路浮到水面之上，然后被水陆判据拦住，
+/// 于是"全都在半空里漂着"。
+pub const PHOTO_GAIN: f32 = 12.0;
+
 /// 突变强度（高斯标准差）。
 pub const MUTATION_SIGMA: f32 = 0.15;
 
@@ -171,7 +227,12 @@ pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 /// 用"离水面多深"而不是"光照阈值"：光照是 `1 - y/height`，它把**世界尺寸**
 /// 也编进去了——同一个阈值在 512² 和 128² 里对应完全不同的深度。
 /// 而这里要表达的是"藻悬浮在透光层"，那是一个深度问题。
-pub const ALGAE_DEPTH: i32 = 28;
+///
+/// 60 格 ≈ 透光层的一大半。**这不是为了让藻更多，是为了让鱼有理由上下移动**：
+/// 早先只撒在水面下 28 格，而鱼的活动带也在那儿，食物和光挤在同一层——
+/// 鱼不需要下潜就能吃饱，垂直方向自然永远不动。食物在深度上有分布，
+/// "去哪儿吃"才成为一个真问题。
+pub const ALGAE_DEPTH: i32 = 60;
 
 /// 藻的存量上限（格）。
 ///
@@ -231,6 +292,20 @@ const NEIGHBORS_4: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
 
 /// 尸体腐烂用的位置派生随机盐。必须和材质层的盐不同。
 const SALT_CORPSE_ROT: u32 = 0xDEAD;
+
+/// 空气里的藻干掉的概率（百分比，每次清扫）。
+///
+/// **这条规则不是为了"清洁"，是为了堵住一个能破坏水陆判据的漏洞。**
+/// 藻算水（见 `touches_water`），而藻可以被沙顶到空气里、也可以在水退去
+/// 之后悬在半空。悬空的藻就成了一块**踏脚石**：鱼贴着它就能浮到水面之上，
+/// 而那正是"生物全在半空里漂着"的成因之一。
+///
+/// 给 25%（平均 100 tick 消失）而不是 100%：藻被鱼挤开的瞬间可能
+/// 短暂离开水，立刻蒸发会让"挤开"变成"销毁"。
+const ALGAE_DRY_PERCENT: u32 = 25;
+
+/// 藻干掉的随机盐。必须和腐烂、生长都不同。
+const SALT_ALGAE_DRY: u32 = 0xA1AE;
 
 /// 一格藻蕴含的生物可用能量。
 ///
@@ -371,6 +446,23 @@ pub struct LifeStats {
     pub eaten: u32,
     /// 本 tick 发生的捕食次数（一枚杀手细胞咬到一口算一次）。
     pub bitten: u32,
+    /// 本 tick 四个方向的移动次数：`[左, 右, 上, 下]`。
+    ///
+    /// 这个数组是"二维移动到底有没有发生"的唯一直接证据。
+    /// 看深度范围是不够的——一群鱼全在水面那一层上下游三格，深度范围
+    /// 也有 3，但那和"在二维里游"是两件事。
+    ///
+    /// 健康的比例大致是"水平明显多于垂直，但垂直不为零"：
+    /// 水平是巡航，垂直是觅食与趋光。**垂直恒为 0 就是有 bug**。
+    pub moved: [u32; 4],
+    /// 最浅的那个个体的锚点 y（越小越靠近水面）。空种群时为 0。
+    ///
+    /// 和 `deepest` 一起看，才知道"鱼是在水里散开的，还是全挤在水面一层"。
+    /// 只报平均值是不够的：一半浮在水面、一半沉在海底，平均值看起来
+    /// 完全正常。
+    pub shallowest: i32,
+    /// 最深的那个个体的锚点 y。
+    pub deepest: i32,
     /// 最小的身体有多少格。
     ///
     /// 和 `max_cells` 一起看：形态发生模式下这两个数会**分开**——
@@ -429,6 +521,13 @@ pub struct LifeSim {
     stats: LifeStats,
     /// 海底要不要长藻。默认开，见 [`LifeSim::set_food_growth`]。
     food_growth: bool,
+    /// 四个方向的累计移动次数 `[左, 右, 上, 下]`。
+    ///
+    /// 和 `stats.moved` 的区别是**它不清零**：`stats` 每 tick 重建，
+    /// 所以单 tick 的样本小到看不出比例（六十个生物里只有几次移动是常态，
+    /// 大部分 tick 在转身、被挡、或者刚出生）。累计值才能回答
+    /// "垂直方向到底有没有在用"。
+    moved_total: [u64; 4],
 }
 
 impl Default for LifeSim {
@@ -445,6 +544,7 @@ impl Default for LifeSim {
             founder: None,
             stats: LifeStats::default(),
             food_growth: true,
+            moved_total: [0; 4],
         }
     }
 }
@@ -482,6 +582,7 @@ impl LifeSim {
             founder: None,
             stats: LifeStats::default(),
             food_growth: true,
+            moved_total: [0; 4],
         }
     }
 
@@ -629,6 +730,15 @@ impl LifeSim {
         }
     }
 
+    /// 四个方向的**累计**移动次数 `[左, 右, 上, 下]`。
+    ///
+    /// 这是"二维移动真的在发生吗"的直接证据。垂直两项长期为 0
+    /// 就说明行为网络里根本没有垂直通路在起作用。
+    #[inline]
+    pub fn moved_total(&self) -> [u64; 4] {
+        self.moved_total
+    }
+
     /// 初代基因组。没投放过的世界返回 `None`。
     #[inline]
     pub fn founder(&self) -> Option<&Genome> {
@@ -739,6 +849,8 @@ impl LifeSim {
         // 5) 统计。
         self.stats.organisms = self.organisms.len();
         self.stats.cells = self.organisms.iter().map(|o| o.cell_count()).sum();
+        self.stats.shallowest = self.organisms.iter().map(|o| o.anchor.1).min().unwrap_or(0);
+        self.stats.deepest = self.organisms.iter().map(|o| o.anchor.1).max().unwrap_or(0);
         self.stats.min_cells = self
             .organisms
             .iter()
@@ -1011,7 +1123,32 @@ impl LifeSim {
         for y in 0..h {
             for x in 0..w {
                 let (xs, ys) = (x as isize, y as isize);
-                if world.get(xs, ys) != MaterialKind::Corpse {
+                let kind = world.get(xs, ys);
+
+                // --- 空气里的藻会干掉 ---------------------------------------
+                //
+                // 藻算水，所以悬空的藻等于给鱼搭了一块踏脚石。这里把它拆掉。
+                // 判据是"四邻一个水或藻都没有"：藻团边缘贴着水的那些不算干。
+                if kind == MaterialKind::Algae {
+                    let anchored =
+                        [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
+                            .iter()
+                            .any(|&(dx, dy)| {
+                                matches!(
+                                    world.get(xs + dx, ys + dy),
+                                    MaterialKind::Water | MaterialKind::Algae
+                                )
+                            });
+                    if anchored || !Rng::at_percent(x, y, tick, SALT_ALGAE_DRY, ALGAE_DRY_PERCENT) {
+                        continue;
+                    }
+                    // 藻带走的能量是热量，进耗散。
+                    rotted += world.flags(xs, ys) as u64;
+                    world.set(xs, ys, MaterialKind::Empty);
+                    continue;
+                }
+
+                if kind != MaterialKind::Corpse {
                     continue;
                 }
                 let wet = underwater(world, x, y);
@@ -1171,8 +1308,6 @@ impl LifeSim {
         }
 
         if let Some((dx, dy)) = pick_direction(&out) {
-            // 移动细胞多就跑得远（见 `Organism::speed`）。每一格都独立验通行性，
-            // 所以不会穿墙——走不动就停在撞上的前一格。
             let speed = self.organisms[i].speed();
             for _ in 0..speed {
                 if !self.try_move(world, i, dx, dy) {
@@ -1213,7 +1348,6 @@ impl LifeSim {
         // 异种那一路喂给"扑上去"。现在合并着，等有了物种再分开。
         inp[IN_ALIEN_AHEAD] = inp[IN_KIN_AHEAD];
 
-        let (_, ay) = org.anchor;
         // 探针必须贴着**身体表面**，不能是 `anchor ± 1`。
         //
         // 老写法在三格鱼上就已经是错的：身体本来就占住锚点右侧那一格，
@@ -1237,11 +1371,42 @@ impl LifeSim {
         inp[IN_FACING_X] = org.facing.x as f32;
         inp[IN_FACING_Y] = org.facing.y as f32;
 
-        // 光照：只看深度，不算遮挡。算遮挡要扫 84 格，而 `inject_sunlight`
-        // 已经做过一次了——感知这里只给"我在多深"这个粗略信号就够了。
-        // 鱼要学会的是"往浅处游"，不是精确估计自己拿到多少能量。
-        let height = world.height().max(1) as f32;
-        inp[IN_LIGHT] = (1.0 - (ay.max(0) as f32 / height)).clamp(0.0, 1.0);
+        // 光照：**到水面的距离**，不是"到世界顶的距离"。
+        //
+        // 早先写的是 `1 - y / height`，那把**世界尺寸编进了信号**：同一个
+        // 基因组在 64² 的小池子里和水面 512 格深的海里表现完全不同。
+        // 实测的后果很具体——64² 的测试池里水面在 y=30，`1 - 30/64 = 0.53`，
+        // 而设定点是 0.60，于是鱼永远觉得"这儿太暗"，一直想上浮，
+        // 上浮到水面又被水陆判据拦住，**卡在那里一格不动**。
+        //
+        // 改成"头顶往上数，到第一个非水格（也就是水面）有多远"之后，
+        // 信号与世界大小无关，设定点也才真的是"水面下多少格"。
+        //
+        // 只看水，不算遮挡：算遮挡要扫整列，而 `inject_sunlight` 已经
+        // 做过一次了。鱼要学会的是"往浅处游"，不是精确估计自己拿到多少能量。
+        // 起点必须是**身体的顶**，不是锚点：锚点上方那一格通常是身体自己
+        // （材质是 `Empty`），从那儿开始扫会立刻 break，于是 `IN_LIGHT`
+        // 恒为 1.0——鱼永远觉得"我在水面"，垂直行为整个失效。
+        let (ax, ay) = (org.anchor.0, org.anchor.1);
+        let top = org
+            .cells
+            .iter()
+            .map(|c| ay + c.offset.1 as i32)
+            .min()
+            .unwrap_or(ay);
+        let mut depth = 0i32;
+        let mut ny = top - 1;
+        while ny >= 0 && depth < LIGHT_DEPTH {
+            if !matches!(
+                world.get(ax as isize, ny as isize),
+                MaterialKind::Water | MaterialKind::Algae
+            ) {
+                break;
+            }
+            depth += 1;
+            ny -= 1;
+        }
+        inp[IN_LIGHT] = (1.0 - depth as f32 / LIGHT_DEPTH as f32).clamp(0.0, 1.0);
 
         // 嗅觉：四向射线。撞到固体就断（墙后面闻不到），找到含能量的食物
         // 就按 1/距离 累加一个方向分量。
@@ -1307,11 +1472,16 @@ impl LifeSim {
         match world.get(x as isize, y as isize) {
             MaterialKind::Empty | MaterialKind::Gas => true,
             MaterialKind::Water => body <= SMALL_BODY_MAX,
-            // 藻是悬浮在水里的食物，**不是障碍**：鱼要能游进去吃。
+            // 藻是悬浮的食物，**不是障碍**：鱼要能游进去吃。
             //
-            // 做成障碍的后果不是"鱼被挡住"这么轻：悬在透光层里的几千格藻
-            // 会把水流切成碎块，实测整个世界静止（`移动 0`）、
-            // 全部鱼被顶进空气里——而"藻"和"石头"在材质表上只差一个枚举值。
+            // 曾经试过"藻不让进"（配合"藻算水"，防止鱼住在藻团里）——
+            // 结果是灾难：700 格藻散布在透光层，把 61 个生物里九成的移动
+            // 都挡掉了（实测 300 tick 内 3854 次 `passable` 失败，
+            // 全是藻）。藻华本来就该是能穿过去的。
+            //
+            // "鱼住在藻里"这个风险改由另一条规则挡：**不在水里的藻会消失**
+            // （见 `tick_organics`）。空气里的藻不能当踏脚石，因为
+            // 它撑不过几个 tick。
             MaterialKind::Algae => true,
             _ => false,
         }
@@ -1417,7 +1587,15 @@ impl LifeSim {
         // 实测加大体型之后，5000 tick 就有个体停在水面上方 25 格，
         // 能量晒满、既不能动也不能繁殖，整个种群随之冻死。
         //
-        // 判据用"贴着水"而不是"目标格里有水"，理由见 [`Self::touches_water`]。
+        // 判据见 [`Self::touches_water`]。**只查 `targets`，绝不能把旧位置
+        // 也算进去**——那是这一条上踩过的坑：合并 `old ∪ targets` 之后，
+        // 旧位置（在水里）的表面会把新位置（在空中）的表面盖过去，
+        // 于是鱼可以一格一格往上爬，每次检查时旧位置总有水。
+        // 实测这样能一路爬到水面上方十几格，而 `stranded` 指标看得一清二楚、
+        // 移动却从不被拦。
+        //
+        // 新位置内部的邻格不用担心：它们也在 `targets` 里，
+        // `is_body` 会把它们排除掉，所以不会把厚身体的占比拉低。
         if !Self::touches_water(world, org.width, &targets) {
             return false;
         }
@@ -1473,6 +1651,16 @@ impl LifeSim {
         }
         // 移动消耗的能量变成热离开生物可用池，必须记账。
         self.ledger.dissipated += cost as u64;
+        // 方向计数：`[左, 右, 上, 下]`。
+        let dir = match (dx.signum(), dy.signum()) {
+            (-1, _) => 0,
+            (1, _) => 1,
+            (_, -1) => 2,
+            (_, 1) => 3,
+            _ => 1,
+        };
+        self.stats.moved[dir] += 1;
+        self.moved_total[dir] += 1;
         true
     }
 
@@ -1587,38 +1775,65 @@ impl LifeSim {
         None
     }
 
-    /// 一组格子是不是**贴着**水或气（四邻）。
+    /// 身体是不是**在水面之下**。
     ///
     /// 这是"生物默认水生"（SPEC §2.0）唯一需要的那条不变量。
     ///
-    /// 为什么不是"这组格子里有一格是水"：身体格的材质**永远是 `Empty`**
-    /// （材质层与生命层的互斥约定），所以"身体自己身上有水"这件事根本无从谈起。
-    /// 而如果改成"目标位置里有一格水"，就会漏掉一整类崩坏——实测过的：
+    /// ## 判据：每个 x 列的**头顶**，往上必须能扫到水
     ///
-    /// 一条鱼贴着水面生孩子，出生时那一格水会被**借走**再被顶到身体上方，
-    /// 而那格悬空的水成了下一次出生的"锚"，子代再往上生一格……
-    /// 实测 5000 tick 之后 4 条叶背鱼停在 y≈128，而水面线在 y=153——
-    /// 它们飘在水面上方 25 格，能量晒满、动不了也生不了，世界就此冻住。
-    /// （当时水会被"挤"到身体上方；现在改成借水模型，见 `spawn`，
-    /// 但这条不变量仍然要留着——否则子代照样能生在空气里。）
+    /// 取身体在每一列里最高的那一格，从它上方往上扫：扫到 `Water` 就算这列
+    /// 在水下，扫到空气 / 固体就算露出来了。**所有列都必须在水下**。
     ///
-    /// 换成"贴着水"之后，往上爬一格就会失去与水的接触，梯子从根上断掉。
+    /// 这条判据换过三版，每一版都对应一次真实的故障：
+    ///
+    /// **1. "任意一格的四邻有水"** —— 一条 12 格的鱼可以整条浮在水面之上，
+    /// 只有尾巴尖蹭到一格水。现象：`stranded` 报到十几个，但移动从不被拦。
+    ///
+    /// **2. "身体表面的邻格里水占一半"** —— 好一些，但**窄鱼**的侧面几乎
+    /// 总是水：一条 3 列宽的鱼哪怕头顶出水 4 格，侧面 6 个邻格全是水，
+    /// 占比照样过半。现象：鱼全都浮在水面那一层，`stranded` 高达 60%。
+    ///
+    /// **3. 看头顶**（现在这条）—— 露不露出来，看的是头顶，不是侧面。
+    ///
+    /// 附带一条：**藻算水，气体不算**。藻是水里的悬浮物，而它比水轻，
+    /// 会被一路顶到水面那一行；不认它的话，鱼在藻层下面时头顶是藻、
+    /// 扫不到水，整批鱼会被判成"不在水里"。气体（气泡）不是介质。
+    ///
+    /// 判据要求头顶至少在水面下 1 格（身体顶部那格本身可以是水面那一行，
+    /// 因为那格水被身体借走了，向上扫就是空气）。所以投放时要把身体
+    /// 往下压一格，见 [`stock_surface`]。
     fn touches_water(world: &World, width: i32, cells: &[(i32, i32)]) -> bool {
-        cells.iter().any(|&(x, y)| {
-            [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
-                .iter()
-                .any(|&(dx, dy)| {
-                    let nx = if width > 0 {
-                        (x + dx).rem_euclid(width)
-                    } else {
-                        x + dx
-                    };
-                    matches!(
-                        world.get(nx as isize, (y + dy) as isize),
-                        MaterialKind::Water | MaterialKind::Gas | MaterialKind::Algae
-                    )
-                })
-        })
+        if cells.is_empty() {
+            return false;
+        }
+        // 每列只留最高的那一格。身体有几列就有几个采样点——比"每个细胞都查"
+        // 便宜一个数量级，而且语义更准：露不露出来只看头顶。
+        let mut tops: Vec<(i32, i32)> = Vec::new();
+        for &(x, y) in cells {
+            match tops.iter_mut().find(|(tx, _)| *tx == x) {
+                Some((_, ty)) => *ty = (*ty).min(y),
+                None => tops.push((x, y)),
+            }
+        }
+
+        for (x, top) in tops {
+            let xx = if width > 0 { x.rem_euclid(width) } else { x };
+            // 藻**算**水：它是水里的悬浮物，而它比水轻，会被一路顶到
+            // 水面那一行。不算的话，鱼在藻层下面时头顶是藻、扫不到水，
+            // 整批鱼会被判成"不在水里"——而它们明明就在水里。
+            //
+            // 只认藻不认气：气泡不是介质。
+            let submerged = (0..top).rev().any(|y| {
+                matches!(
+                    world.get(xx as isize, y as isize),
+                    MaterialKind::Water | MaterialKind::Algae
+                )
+            });
+            if !submerged {
+                return false;
+            }
+        }
+        true
     }
 
     /// 这个有机体的身体能不能完整落在这个位置。
@@ -1855,7 +2070,24 @@ pub enum Tactic {
 /// 才会把水域用满——这是 M2 里第一次看到"行为影响生态"的地方。
 pub fn handcrafted_fish_genome(tactic: Tactic) -> Genome {
     let mut g = Genome::blank();
-    g.weights[Genome::b_o(OUT_RIGHT)] = 1.0;
+    // **巡航偏置 0.6，不是 1.0。**
+    //
+    // `pick_direction` 取"超过阈值的最大值"，所以巡航偏置就是**垂直方向的
+    // 门槛**：垂直信号得比它大才会被选中。给 1.0 时门槛是 `tanh(1.0) ≈ 0.76`，
+    // 于是趋光只能在很小的一段深度里赢——实测垂直移动只占全部移动的 3.5%，
+    // 而且**上浮是 0 次**（鱼能下潜到 162 就再也够不到需要上浮的深度）。
+    //
+    // 它还决定**死区有多宽**：垂直信号只在 `light` 偏离设定点超过
+    // `tanh(bias)/gain` 时才赢，所以死区 ≈ `2 × tanh(bias) / gain`（光），
+    // 乘 `LIGHT_DEPTH` 就是深度。
+    //
+    // **但不能低于 0.7。** 试过 0.35，结果 85% 的 tick 里鱼根本不选方向：
+    // `tanh(0.35) ≈ 0.34` 只比 `MOVE_THRESHOLD`（0.15）高一倍，而隐藏层的
+    // 突变噪声可以贡献 ±0.5——噪声直接把巡航偏置压到阈值以下。
+    // 现象是"鱼全都不动"，看起来像卡死，实际是**信号被噪声吃掉**。
+    //
+    // 0.7 → 死区约 18 格，`tanh(0.7) ≈ 0.60`，两倍于阈值、也高于噪声底。
+    g.weights[Genome::b_o(OUT_RIGHT)] = 0.7;
     g.weights[Genome::b_o(OUT_EAT)] = 2.0;
     g.weights[Genome::b_o(OUT_REPRODUCE)] = 1.5;
     // 撞到哪一侧的墙，就往另一侧走。**不能**写成"前方被挡就往左"——
@@ -1882,8 +2114,16 @@ pub fn handcrafted_fish_genome(tactic: Tactic) -> Genome {
     // 那才是选择该做的事，而不是我在常数里替它决定。
     g.connect(IN_FOOD_DIR_X, OUT_RIGHT, 1.5);
     g.connect(IN_FOOD_DIR_X, OUT_LEFT, -1.5);
-    g.connect(IN_FOOD_DIR_Y, OUT_DOWN, 1.5);
-    g.connect(IN_FOOD_DIR_Y, OUT_UP, -1.5);
+    // **垂直方向给得更小（0.8 vs 水平 1.5），这是被实测逼出来的。**
+    //
+    // 藻比水轻，会被一路顶到水面那一行，所以"食物在上方"这个信号在浅水里
+    // 恒为真。给 1.5 时它把趋光的下潜信号整个抵消掉——鱼被食物钉在水面，
+    // 垂直方向一辈子不动，看起来就是"只沿 X 轴游"。
+    //
+    // 0.8 让它只起"微调"作用：食物确实在下面时才值得为它改变深度，
+    // 而"上方有藻"这种常态不再能压过趋光。
+    g.connect(IN_FOOD_DIR_Y, OUT_DOWN, 0.8);
+    g.connect(IN_FOOD_DIR_Y, OUT_UP, -0.8);
 
     // --- 捕食：前方有别的生物就往那边靠 --------------------------------
     //
@@ -1914,20 +2154,25 @@ pub fn handcrafted_fish_genome(tactic: Tactic) -> Genome {
     g.connect(IN_ORGANISM_DIR_Y, OUT_DOWN, toward);
     g.connect(IN_ORGANISM_DIR_Y, OUT_UP, away);
 
-    // --- 续命：暗了就往上 ------------------------------------------------
+    // --- 趋光性：瞄准一条"等光线" ----------------------------------------
     //
-    // 光随深度线性衰减，海底几乎是 0。只往下追食物会饿死在下面，
-    // 所以要有一条"这儿太暗了，上去"的回路。
+    // **这是二维移动的全部来源。**
     //
-    // 写法是**负向抑制**而不是正向驱动：默认有一点想往上（偏置 1.2），
-    // 光越强越不往上（−3）。正面驱动会让鱼贴着水面抖——
-    // 上去一格变亮，又想上去，最后卡在水面那一行。
+    // 在此之前垂直方向只有一路负向抑制（`OUT_UP = 1.2 − 3×光`），它在浅水里
+    // 恒为负；而 `OUT_DOWN` 根本没有驱动，恒为 0。于是"往上是负、往下是零、
+    // 往右是 +1"——鱼只有两个方向可选，看起来就是**只沿 X 轴移动**。
     //
-    // 拐点落在光 ≈ 0.4：比这暗就开始往上。第一版写 −6（拐点在 0.08）
-    // 等于"只有快贴到海底才想起来上浮"，于是下潜觅食的鱼有去无回——
-    // 实测种群从 52 掉到 37，细胞数从 688 掉到 442。
-    g.weights[Genome::b_o(OUT_UP)] = 1.2;
-    g.connect(IN_LIGHT, OUT_UP, -3.0);
+    // 现在写成两条对称的**正向**驱动，交点在 `LIGHT_SETPOINT`：
+    //
+    //     光 > 设定点 → 想往下（太亮了，往深处走）
+    //     光 < 设定点 → 想往上（太暗了，晒不到）
+    //     光 = 设定点 → 垂直方向归零，专心巡航
+    //
+    // 增益必须压过巡航偏置，理由见 `PHOTO_GAIN` 的注释。
+    g.weights[Genome::b_o(OUT_DOWN)] = -PHOTO_GAIN * LIGHT_SETPOINT;
+    g.connect(IN_LIGHT, OUT_DOWN, PHOTO_GAIN);
+    g.weights[Genome::b_o(OUT_UP)] = PHOTO_GAIN * LIGHT_SETPOINT;
+    g.connect(IN_LIGHT, OUT_UP, -PHOTO_GAIN);
     g
 }
 
@@ -2022,9 +2267,14 @@ pub fn stock_surface(
         }
         let Some(y) = surface else { continue };
 
-        // 让最上面那一格贴着水面：生产者要光。
+        // 身体最上面那一格压在水面**下**一格：生产者要光，但**不能露头**。
+        //
+        // `+1` 是必需的，不是保守：`touches_water` 要求每列的头顶向上能扫到水，
+        // 而身体最上面那格的水被借走变成了 `Empty`——如果它就落在水面那一行，
+        // 向上扫到的第一格就是空气，判据直接失败。实测贴着水面投放时，
+        // 整批鱼在出生的第一个 tick 就被判成"不在水里"。
         let top = cells.iter().map(|c| c.offset.1).min().unwrap_or(0) as i32;
-        let anchor = (x, y - top);
+        let anchor = (x, y - top + 1);
         // 启动能量按**实际长出来的格数**算，不是按体型表的格数——
         // 形态发生模式下这两者可能不一样，而"够不够活到能繁殖"只看前者。
         let n = cells.len().max(1) as u32;
@@ -2069,21 +2319,21 @@ mod tests {
     fn spawn_claims_every_cell() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        let org = LifeSim::simple_fish((20, 25), Genome::blank(), 100);
+        let org = LifeSim::simple_fish((20, 35), Genome::blank(), 100);
         let id = sim.spawn_injected(&mut w, org).unwrap();
         assert_eq!(w.occupied_count(), 3);
-        assert_eq!(w.owner(20, 25).organism, id);
-        assert_eq!(w.owner(21, 25).organism, id);
-        assert_eq!(w.owner(20, 24).organism, id);
+        assert_eq!(w.owner(20, 35).organism, id);
+        assert_eq!(w.owner(21, 35).organism, id);
+        assert_eq!(w.owner(20, 34).organism, id);
     }
 
     #[test]
     fn spawn_rejects_occupied_and_out_of_bounds() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 10))
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 10))
             .unwrap();
-        let again = sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 10));
+        let again = sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 10));
         assert_eq!(again.unwrap_err(), SpawnError::CellOccupied);
 
         let edge = sim.spawn_injected(&mut w, LifeSim::simple_fish((0, 0), Genome::blank(), 10));
@@ -2194,7 +2444,7 @@ mod tests {
         w.set_flags(22, 25, REMAINS_ENERGY as u8);
         let mut sim = LifeSim::new(&mut w);
         let id = sim
-            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 50))
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 50))
             .unwrap();
 
         let before = sim.audit(&w);
@@ -2232,7 +2482,7 @@ mod tests {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         let poor = sim
-            .spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 100))
             .unwrap();
         assert!(sim.reproduce(&mut w, poor).is_none());
 
@@ -2381,7 +2631,7 @@ mod tests {
         let mut sim = LifeSim::new(&mut w);
         // 能量按体型现算，不写死 400：三格鱼的繁殖门槛是 402，
         // 写 400 会让这条测试在门槛改动之后莫名其妙地红。
-        let mut fish = LifeSim::simple_fish((20, 25), Genome::blank(), 0);
+        let mut fish = LifeSim::simple_fish((20, 35), Genome::blank(), 0);
         fish.energy = fish.reproduction_energy();
         let parent = sim.spawn_injected(&mut w, fish).unwrap();
         assert_eq!(sim.organism(parent).unwrap().generation, 0);
@@ -2397,7 +2647,7 @@ mod tests {
     fn generations_keep_counting_up() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        let mut fish = LifeSim::simple_fish((20, 25), Genome::blank(), 0);
+        let mut fish = LifeSim::simple_fish((20, 35), Genome::blank(), 0);
         fish.energy = fish.reproduction_energy();
         let mut id = sim.spawn_injected(&mut w, fish).unwrap();
 
@@ -2422,7 +2672,7 @@ mod tests {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         assert!(sim.founder().is_none());
-        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 100))
             .unwrap();
         assert!(sim.founder().is_some());
         assert_eq!(sim.gene_distance(), 0.0, "初代自己的距离必须是 0");
@@ -2432,7 +2682,7 @@ mod tests {
     fn gene_distance_grows_as_mutations_accumulate() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 25), Genome::blank(), 100))
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 35), Genome::blank(), 100))
             .unwrap();
         assert_eq!(sim.gene_distance(), 0.0);
 
@@ -2870,6 +3120,9 @@ mod tests {
         g.weights[Genome::b_o(OUT_REPRODUCE)] = 0.0;
 
         let mut inputs = [0.0f32; INPUTS];
+        // 中性光照：趋光的权重是 ±12，全零输入等于"无光海底"，
+        // 那会把 DOWN 直接按到 -1 饱和，再往上加什么都看不出来。
+        inputs[IN_LIGHT] = LIGHT_SETPOINT;
         let quiet = g.think(&inputs);
 
         inputs[IN_FOOD_DIR_Y] = 1.0; // 食物在下方
@@ -3091,6 +3344,11 @@ mod tests {
     #[test]
     fn hunters_approach_and_prey_flee() {
         let mut inputs = [0.0f32; INPUTS];
+        // **必须给一个中性的光照。** `IN_LIGHT` 的权重是 ±12（趋光是这套
+        // 基因组里最强的信号），而全零输入意味着 light=0 —— 那在行为上
+        // 等于"在无光的海底"，趋光会把垂直方向整个按死，
+        // 测到的就不是"社交倾向"而是"趋光"。
+        inputs[IN_LIGHT] = LIGHT_SETPOINT;
         inputs[IN_ORGANISM_DIR_Y] = 0.5; // 别人在下方
 
         let hunt = handcrafted_fish_genome(Tactic::Hunt).think(&inputs);
@@ -3101,7 +3359,7 @@ mod tests {
             hunt[OUT_UP]
         );
 
-        let flee = handcrafted_fish_genome(Tactic::Ignore).think(&inputs);
+        let flee = handcrafted_fish_genome(Tactic::Flee).think(&inputs);
         assert!(
             flee[OUT_UP] > flee[OUT_DOWN],
             "没牙的应当往上（逃）：up {} vs down {}",

@@ -158,6 +158,8 @@ pub enum Icon {
     Pause,
     /// 单步。
     Step,
+    /// 生物工坊：一个 2×2 的方格（"画身体"这件事最直白的图标）。
+    Workshop,
 }
 
 fn draw_icon(p: &egui::Painter, icon: Icon, r: Rect, ink: Color32, s: Stroke) {
@@ -216,6 +218,30 @@ fn draw_icon(p: &egui::Painter, icon: Icon, r: Rect, ink: Color32, s: Stroke) {
                 [egui::pos2(cx + 2.0, t), egui::pos2(cx + 2.0, b)],
                 Stroke::new(2.0, ink),
             );
+        }
+        Icon::Workshop => {
+            // 2×2 的四个小方格，左上那个填实——"在一张网格上摆东西"。
+            let w = (rt - l) * 0.30;
+            let h = (b - t) * 0.30;
+            let q = |i: f32, j: f32| {
+                Rect::from_min_size(
+                    egui::pos2(
+                        cx + (i - 0.5) * (w + 2.0) - w * 0.5,
+                        cy + (j - 0.5) * (h + 2.0) - h * 0.5,
+                    ),
+                    Vec2::new(w, h),
+                )
+            };
+            for i in 0..2 {
+                for j in 0..2 {
+                    let r = q(i as f32, j as f32);
+                    if i == 0 && j == 0 {
+                        p.rect_filled(r, CornerRadius::ZERO, ink);
+                    } else {
+                        p.rect_stroke(r, CornerRadius::ZERO, s, StrokeKind::Inside);
+                    }
+                }
+            }
         }
         Icon::Step => {
             // 播放三角 + 一道竖线。
@@ -746,7 +772,7 @@ pub fn input_strip(ui: &mut Ui, values: &[f32], names: &[&str]) -> Response {
 /// 而且连线长度、弯曲、交叉全都在骗人。矩阵把每个权重放在**固定位置**，
 /// 扫一眼就能看出"哪一行全亮"（这一路输入接了好几个输出）。
 ///
-/// 颜色只用两种：正权重绿、负权重红，亮度按 `|w| / 8`（权重上限是 ±8）。
+/// 颜色只用两种：正权重绿、负权重红，亮度按 `|w| / WEIGHT_LIMIT`。
 /// 不用彩虹色是因为"正负"才是权重的语义，大小只是程度。
 pub fn weight_matrix(ui: &mut Ui, rows: usize, cols: usize, weights: &[f32]) -> Response {
     let cell = 7.0;
@@ -765,7 +791,7 @@ pub fn weight_matrix(ui: &mut Ui, rows: usize, cols: usize, weights: &[f32]) -> 
     for r in 0..rows {
         for c in 0..cols {
             let w = weights.get(r * cols + c).copied().unwrap_or(0.0);
-            let t = (w.abs() / 8.0).clamp(0.0, 1.0);
+            let t = (w.abs() / vivarium_core::life::WEIGHT_LIMIT).clamp(0.0, 1.0);
             let color = if w >= 0.0 {
                 // 正权重：从底色渐亮到强调绿。
                 lerp_color(theme::SUNKEN, theme::ACCENT, t)

@@ -332,8 +332,160 @@ pub enum Command {
     SetCell(CellType),
     /// 让世界跑一批 tick 再停下（"快进 N 步"）。
     RunFor(u32),
+    /// 把工坊里画好的身体放到世界的鼠标位置。
+    ///
+    /// 带的是**相对锚点**的细胞表，主循环负责挑落点和构造有机体——
+    /// 界面不知道世界长什么样，也不该知道。
+    PlaceBody(Vec<(i16, i16, u8)>),
+    /// 把一副身体存进生物库（落盘）。
+    SaveBody {
+        name: String,
+        cells: Vec<(i16, i16, u8)>,
+    },
+    /// 从生物库删掉一条。
+    DeleteBody(String),
     /// 退出。
     Quit,
+}
+
+// ---------------------------------------------------------------------------
+// 生物工坊
+// ---------------------------------------------------------------------------
+
+/// 工坊的画布边长（格）。
+///
+/// 16 是**上限而不是习惯**：最大的手工体型是 14 格，而 `SMALL_BODY_MAX`
+/// 是 16——超过 16 格的身体在水里根本推不动。画布比上限大一点，
+/// 是为了留出边距、让人看得见自己在画什么。
+pub const DRAFT_SIZE: usize = 16;
+
+/// 工坊里正在画的那副身体。
+///
+/// 用 `Vec<Option<CellType>>` 而不是 `Vec<(i16,i16,CellType)>`：画布是**稠密**的，
+/// 按坐标索引比查表快，而且"这一格有没有细胞"是最常问的问题。
+#[derive(Debug, Clone)]
+pub struct Workshop {
+    /// 是否打开。打开时它盖住整个窗口（模态）。
+    pub open: bool,
+    /// 当前画笔的细胞类型。
+    pub brush: CellType,
+    /// 是否处于擦除模式。
+    pub erasing: bool,
+    /// 画布：`DRAFT_SIZE × DRAFT_SIZE`，行优先。
+    pub cells: Vec<Option<CellType>>,
+    /// 名字（保存时用）。
+    pub name: String,
+    /// 上一次操作的提示（"已保存"/"没有嘴"），几秒后消失。
+    pub hint: Option<(String, f64)>,
+}
+
+impl Default for Workshop {
+    fn default() -> Self {
+        Self {
+            open: false,
+            brush: CellType::Producer,
+            erasing: false,
+            cells: vec![None; DRAFT_SIZE * DRAFT_SIZE],
+            name: String::new(),
+            hint: None,
+        }
+    }
+}
+
+impl Workshop {
+    /// 取一格。
+    #[inline]
+    pub fn get(&self, x: usize, y: usize) -> Option<CellType> {
+        self.cells.get(y * DRAFT_SIZE + x).copied().flatten()
+    }
+
+    /// 画一格。
+    #[inline]
+    pub fn set(&mut self, x: usize, y: usize, v: Option<CellType>) {
+        if let Some(slot) = self.cells.get_mut(y * DRAFT_SIZE + x) {
+            *slot = v;
+        }
+    }
+
+    /// 清空。
+    pub fn clear(&mut self) {
+        self.cells.iter_mut().for_each(|c| *c = None);
+    }
+
+    /// 有几格细胞。
+    pub fn count(&self) -> usize {
+        self.cells.iter().filter(|c| c.is_some()).count()
+    }
+
+    /// 把画布转成"相对锚点"的细胞表，锚点是**包围盒中心**。
+    ///
+    /// 用中心而不是左上角：画布是 16×16 的方框，人画的时候凭直觉放在中间，
+    /// 而锚点在身体正中意味着"放进世界时鼠标指的就是它身体的中心"——
+    /// 比"左上角对齐鼠标"符合直觉得多。
+    ///
+    /// 返回空表示画布上什么都没有。
+    pub fn to_cells(&self) -> Vec<(i16, i16, u8)> {
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (usize::MAX, 0usize, usize::MAX, 0usize);
+        for y in 0..DRAFT_SIZE {
+            for x in 0..DRAFT_SIZE {
+                if self.get(x, y).is_some() {
+                    min_x = min_x.min(x);
+                    max_x = max_x.max(x);
+                    min_y = min_y.min(y);
+                    max_y = max_y.max(y);
+                }
+            }
+        }
+        if min_x == usize::MAX {
+            return Vec::new();
+        }
+        // 锚点放在包围盒中心（向下取整）。
+        let cx = (min_x + max_x) / 2;
+        let cy = (min_y + max_y) / 2;
+        let mut out = Vec::with_capacity(self.count());
+        for y in 0..DRAFT_SIZE {
+            for x in 0..DRAFT_SIZE {
+                if let Some(kind) = self.get(x, y) {
+                    out.push((x as i16 - cx as i16, y as i16 - cy as i16, kind.as_u8()));
+                }
+            }
+        }
+        out
+    }
+
+    /// 从一副身体载入画布（锚点对齐到画布中心）。
+    pub fn load(&mut self, cells: &[(i16, i16, u8)]) {
+        self.clear();
+        if cells.is_empty() {
+            return;
+        }
+        let (mut min_x, mut max_x, mut min_y, mut max_y) = (i16::MAX, i16::MIN, i16::MAX, i16::MIN);
+        for &(x, y, _) in cells {
+            min_x = min_x.min(x);
+            max_x = max_x.max(x);
+            min_y = min_y.min(y);
+            max_y = max_y.max(y);
+        }
+        let half = DRAFT_SIZE as i16 / 2;
+        let ox = (min_x + max_x) / 2 - half;
+        let oy = (min_y + max_y) / 2 - half;
+        for &(x, y, kind) in cells {
+            let cx = (x - ox) as usize;
+            let cy = (y - oy) as usize;
+            if cx < DRAFT_SIZE && cy < DRAFT_SIZE {
+                self.set(cx, cy, Some(CellType::from_u8(kind)));
+            }
+        }
+    }
+}
+
+/// 生物库里的一条。
+#[derive(Debug, Clone, Default)]
+pub struct LibraryEntry {
+    /// 名字（同时是文件名）。
+    pub name: String,
+    /// 细胞表，坐标相对锚点。
+    pub cells: Vec<(i16, i16, u8)>,
 }
 
 // ---------------------------------------------------------------------------
@@ -363,6 +515,10 @@ pub struct UiState {
     pub console: Console,
     /// 一帧里攒下的命令。`draw` 结束时由调用方取走。
     pub commands: Vec<Command>,
+    /// 生物工坊。
+    pub workshop: Workshop,
+    /// 生物库（名字 + 细胞表）。主循环每次载入/保存后回填。
+    pub library: Vec<LibraryEntry>,
     /// 顶部那条"上一次操作"的提示，两秒后自己消失。
     ///
     /// 存在的理由：很多操作**没有可见反馈**（设速度、切工具），
@@ -381,6 +537,8 @@ impl Default for UiState {
             show_inspector: true,
             show_console: true,
             console: Console::new(),
+            workshop: Workshop::default(),
+            library: Vec::new(),
             commands: Vec::new(),
             toast: None,
         }

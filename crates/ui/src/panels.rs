@@ -337,6 +337,18 @@ fn tool_strip(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
             }
 
             ui.add_space(6.0);
+            if widgets::icon_button(
+                ui,
+                Icon::Workshop,
+                state.workshop.open,
+                "生物工坊（G）——在网格上画一副身体",
+            )
+            .clicked()
+            {
+                state.workshop.open = !state.workshop.open;
+            }
+
+            ui.add_space(6.0);
             let (r, _) =
                 ui.allocate_exact_size(egui::vec2(ui.available_width(), 1.0), egui::Sense::hover());
             ui.painter().line_segment(

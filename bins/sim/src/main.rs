@@ -412,18 +412,21 @@ fn main() -> ExitCode {
     println!();
     if l.stranded > 0 {
         for o in life.organisms() {
-            let wet = o.footprint().any(|(x, y)| {
-                [(0, 0), (1, 0), (-1, 0), (0, 1), (0, -1)]
-                    .iter()
-                    .any(|(dx, dy)| {
-                        world.get((x + dx) as isize, (y + dy) as isize) == MaterialKind::Water
-                    })
-            });
-            if !wet {
+            let cells: Vec<(i32, i32)> = o.footprint().collect();
+            let ys: Vec<i32> = cells.iter().map(|c| c.1).collect();
+            let (y0, y1) = (*ys.iter().min().unwrap(), *ys.iter().max().unwrap());
+            let xs: Vec<i32> = cells.iter().map(|c| c.0).collect();
+            let x0 = *xs.iter().min().unwrap();
+            let surface = (0..world.height() as i32)
+                .find(|&y| world.get(x0 as isize, y as isize) == MaterialKind::Water)
+                .unwrap_or(-1);
+            if y0 < surface {
                 println!(
-                    "  [飘] id {} 锚点 {:?} 细胞 {} 能量 {}",
+                    "  [飘] id {} 身体 y {}-{} 该列水面 {} 细胞 {} 能量 {}",
                     o.id,
-                    o.anchor,
+                    y0,
+                    y1,
+                    surface,
                     o.cell_count(),
                     o.energy
                 );
@@ -431,11 +434,17 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 体型 {}-{} 格 · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
+        "生命层  生物 {} · 细胞 {} · 体型 {}-{} 格 · 深度 {}-{} · 移动 左{} 右{} 上{} 下{} · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
         l.organisms,
         l.cells,
         l.min_cells,
         l.max_cells,
+        l.shallowest,
+        l.deepest,
+        l.moved[0],
+        l.moved[1],
+        l.moved[2],
+        l.moved[3],
         l.energy,
         l.stranded,
         l.killers,
@@ -446,6 +455,18 @@ fn main() -> ExitCode {
         l.max_generation, l.avg_generation, l.gene_distance
     );
     let audit = life.audit(&world);
+    let mt = life.moved_total();
+    let total: u64 = mt.iter().sum();
+    if total > 0 {
+        println!(
+            "移动累计  左 {} 右 {} 上 {} 下 {}  （垂直占 {:.1}%）",
+            mt[0],
+            mt[1],
+            mt[2],
+            mt[3],
+            (mt[2] + mt[3]) as f64 * 100.0 / total as f64
+        );
+    }
     println!(
         "能量账  注入 {} · 消耗 {} · 残骸 {} · 生物 {} · 差额 {}{}",
         audit.injected,

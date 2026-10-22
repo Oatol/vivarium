@@ -54,6 +54,20 @@ pub const MAX_ENERGY_PER_CELL: u32 = 350;
 /// 67 让三格鱼算出来是 201，对上旧的 `BIRTH_ENERGY = 200`。
 pub const BIRTH_ENERGY_PER_CELL: u32 = 67;
 
+/// 单个权重的绝对值上限。
+///
+/// **不是 8。** 早先写 8，而手工基因组的趋光权重需要 ±12（见
+/// `life_sim::PHOTO_GAIN`）——于是第一代投放时 mutate 一碰到那两个权重，
+/// 就把它们**截断成 ±8**，`OUT_DOWN` 的激活值从 `+1.6` 变成 `-1.2`，
+/// 鱼不但不下潜，还主动上浮。
+///
+/// 这个 bug 极难看出来：基因组表里写的是 12，跑起来是 8，
+/// 而症状是"鱼只沿 X 轴移动"——看起来像行为规则的问题，不是数值截断。
+///
+/// 16 对 `tanh` 来说已经完全饱和（`tanh(4) ≈ 0.999`），所以这个上限
+/// 只起"防止权重爆炸成 NaN 的源头"的作用，不限制表达力。
+pub const WEIGHT_LIMIT: f32 = 16.0;
+
 /// 每次繁殖改几条**形态发生规则**。
 ///
 /// 单独一个常数，因为规则表的变异不能用权重的变异率：规则表有几千个槽，
@@ -489,7 +503,7 @@ impl Genome {
                 let u1 = rng.next_f32().max(1e-7);
                 let u2 = rng.next_f32();
                 let g = (-2.0 * u1.ln()).sqrt() * (std::f32::consts::TAU * u2).cos();
-                *w = (*w + g * sigma).clamp(-8.0, 8.0);
+                *w = (*w + g * sigma).clamp(-WEIGHT_LIMIT, WEIGHT_LIMIT);
             }
         }
     }

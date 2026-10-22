@@ -34,8 +34,9 @@ pub mod panels;
 pub mod state;
 pub mod theme;
 pub mod widgets;
+pub mod workshop;
 
-pub use state::{Command, Console, Level, Snapshot, Tool, UiState};
+pub use state::{Command, Console, Level, LibraryEntry, Snapshot, Tool, UiState, Workshop};
 pub use widgets::BtnState;
 
 /// 一帧的产出。
@@ -51,6 +52,12 @@ pub struct Output {
     pub repaint: bool,
     /// 中央可用矩形（逻辑像素）。世界该画在这里。
     pub central: egui::Rect,
+    /// 这一帧有没有模态面板盖住世界（生物工坊）。
+    ///
+    /// 主循环据此决定"鼠标点下去要不要落到世界上"。不能只看
+    /// `pointer_over_ui`：模态面板周围的遮罩是**画上去的**，不是控件，
+    /// egui 不会把它算进 `pointer_over_ui`，于是点空白处会顺手在世界里涂一笔。
+    pub modal: bool,
 }
 
 impl Default for Output {
@@ -59,6 +66,7 @@ impl Default for Output {
             commands: Vec::new(),
             repaint: true,
             central: egui::Rect::NOTHING,
+            modal: false,
         }
     }
 }
@@ -100,8 +108,13 @@ impl Ui {
         raw_input: egui::RawInput,
     ) -> (Output, egui::FullOutput) {
         let mut central = egui::Rect::NOTHING;
+        let mut modal = false;
         let full = self.ctx.run_ui(raw_input, |ui| {
             central = panels::draw(ui, state, snap);
+            // 工坊是**模态**：它画在所有面板之上，并且吃掉这一帧的鼠标。
+            // 放在 `panels::draw` 之后是因为它要盖住面板；用 `Area` 的
+            // `Foreground` 层，所以不受面板布局约束。
+            modal = workshop::draw(ui, state, snap);
         });
 
         let commands = state.take_commands();
@@ -111,6 +124,7 @@ impl Ui {
                 // 每帧都重绘：tick 和 fps 一直在变，省这一帧只会让数字看起来卡住。
                 repaint: true,
                 central,
+                modal,
             },
             full,
         )
@@ -126,6 +140,7 @@ impl Default for Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use vivarium_core::CellType;
 
     fn screen() -> egui::RawInput {
         egui::RawInput {
@@ -171,6 +186,74 @@ mod tests {
             })
             .sum();
         assert!(verts > 1000, "界面太简陋了：只有 {verts} 个顶点");
+    }
+
+    /// 工坊的画布与细胞表**往返一致**：画几格、转成细胞表、再载回来，
+    /// 格子还在原处。
+    ///
+    /// 这条守的是"锚点对齐"——`to_cells` 把包围盒中心当锚点，
+    /// `load` 又要把它还原到画布中心。两边差一格的话，症状是
+    /// "存进去的身体再载出来会往右下角挪一点"，而画面上很难发现，
+    /// 因为每一次挪动都很小。
+    #[test]
+    fn workshop_round_trips_through_cell_table() {
+        let mut w = state::Workshop::default();
+        w.set(4, 5, Some(CellType::Mover));
+        w.set(5, 5, Some(CellType::Mouth));
+        w.set(4, 4, Some(CellType::Producer));
+
+        let cells = w.to_cells();
+        assert_eq!(cells.len(), 3);
+        // 锚点是包围盒中心，向下取整：(4,4)-(5,5) → (4,4)。
+        // 于是 (4,4) 生产者是 (0,0)、(5,5) 嘴是 (1,1)、(4,5) 移动是 (0,1)。
+        assert!(cells.contains(&(0, 0, CellType::Producer.as_u8())));
+        assert!(cells.contains(&(1, 1, CellType::Mouth.as_u8())));
+        assert!(cells.contains(&(0, 1, CellType::Mover.as_u8())));
+
+        let mut again = state::Workshop::default();
+        again.load(&cells);
+        assert_eq!(again.count(), 3, "载回来少了几格");
+        let mut a = again.to_cells();
+        let mut b = cells.clone();
+        a.sort_unstable();
+        b.sort_unstable();
+        assert_eq!(a, b, "载回来形状变了");
+    }
+
+    /// 打开工坊会**多画一堆东西**——遮罩、面板、网格线、色块。
+    ///
+    /// 数的是 `shapes` 的条数，不是 tessellate 之后的顶点数：`Context`
+    /// 会按 shape 的哈希缓存三角化结果，两次调用之间拿到的顶点数不可靠
+    /// （实测画了 97 个新 shape，顶点数却只涨了 8）。
+    /// 而"多画了 97 个图元"本身就是"面板真的显示了"的直接证据。
+    #[test]
+    fn opening_the_workshop_draws_a_lot_more() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot::default();
+
+        let (_, mut full) = ui.show(&mut state, &snap, screen());
+        let before = full.shapes.len();
+        full.textures_delta.clear();
+
+        state.workshop.open = true;
+        state.workshop.set(3, 3, Some(CellType::Producer));
+        let (out, mut full) = ui.show(&mut state, &snap, screen());
+        let after = full.shapes.len();
+        full.textures_delta.clear();
+
+        assert!(out.modal, "工坊打开时必须报 modal，否则点击会漏到世界上");
+        assert!(
+            after > before + 50,
+            "工坊应当画出网格、色块和按钮：{before} → {after}"
+        );
+
+        // 图元也不能被裁没。`clip_rect` 宽度为负是"布局把它推到屏幕外"的
+        // 典型症状，而那种情况下画了等于没画。
+        assert!(
+            full.shapes.iter().all(|s| s.clip_rect.width() >= 0.0),
+            "有图元的裁剪矩形宽度为负——说明它被布局挤出了屏幕"
+        );
     }
 
     /// 面板不能把整个窗口盖满——中间必须留给世界。

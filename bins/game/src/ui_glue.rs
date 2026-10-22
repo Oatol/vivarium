@@ -45,6 +45,12 @@ pub struct Egui {
     /// 主循环用它决定要不要把鼠标事件交给世界。不判断的话，
     /// 点面板上的按钮会同时在画布上画一笔。
     pub pointer_over_ui: bool,
+    /// 上一帧有没有模态面板盖住世界（生物工坊）。
+    ///
+    /// 鼠标事件比渲染先到，所以这里只能是**上一帧**的值——一帧的延迟
+    /// 在"点下去要不要落到世界上"这个问题上完全够用：模态打开的那一帧
+    /// 用户还没来得及点。
+    pub modal: bool,
 }
 
 impl Egui {
@@ -85,6 +91,7 @@ impl Egui {
             state: UiState::new(),
             central: egui::Rect::NOTHING,
             pointer_over_ui: false,
+            modal: false,
         }
     }
 
@@ -129,6 +136,7 @@ impl Egui {
         // 4. 三角化。纯 CPU，和 GPU 无关。
         let paint_jobs = self.ui.ctx().tessellate(full.shapes, full.pixels_per_point);
 
+        self.modal = out.modal;
         // 界面盖住了鼠标 = 鼠标在中央矩形之外。
         self.pointer_over_ui = !self.central.contains(
             self.ui
@@ -246,6 +254,10 @@ impl Egui {
                 true
             }
             Command::RunFor(_) => false,
+            // 工坊的三条命令都要写世界 / 写磁盘，界面自己做不了。
+            Command::PlaceBody(_) => false,
+            Command::SaveBody { .. } => false,
+            Command::DeleteBody(_) => false,
             Command::Quit => false,
         }
     }

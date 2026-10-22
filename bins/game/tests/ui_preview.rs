@@ -148,8 +148,46 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
     }
 }
 
+/// 工坊模式：环境变量 `VIVARIUM_WORKSHOP=1` 时截的是工坊那一屏。
+///
+/// 用一个环境变量而不是两套测试：截图流程（建纹理、跑一帧、读回、
+/// 写 PNG）有几十行，复制一份就意味着以后改一处要记得改两处。
+fn workshop_mode() -> bool {
+    std::env::var("VIVARIUM_WORKSHOP").is_ok()
+}
+
 fn demo_state() -> UiState {
     let mut state = UiState::new();
+    if workshop_mode() {
+        state.workshop.open = true;
+        state.workshop.name = "三节虫".to_owned();
+        // 画一副 9 格的小鱼：中间一排移动 + 前端嘴 + 背上一排生产者。
+        use vivarium_core::CellType;
+        let body: &[(usize, usize, CellType)] = &[
+            (7, 8, CellType::Producer),
+            (8, 8, CellType::Producer),
+            (9, 8, CellType::Producer),
+            (7, 9, CellType::Mover),
+            (8, 9, CellType::Mover),
+            (9, 9, CellType::Mouth),
+            (10, 9, CellType::Eye),
+            (7, 10, CellType::Armor),
+            (9, 10, CellType::Mover),
+        ];
+        for &(x, y, k) in body {
+            state.workshop.set(x, y, Some(k));
+        }
+        state.library = vec![
+            vivarium_ui::LibraryEntry {
+                name: "银鱼".into(),
+                cells: vec![(0, 0, 2), (1, 0, 0), (0, -1, 1)],
+            },
+            vivarium_ui::LibraryEntry {
+                name: "三节虫".into(),
+                cells: vec![(0, 0, 2), (1, 0, 2), (2, 0, 2)],
+            },
+        ];
+    }
     state.log(0, Level::Info, "Vivarium 已启动");
     state.log(
         0,
@@ -349,7 +387,11 @@ fn ui_preview_png() {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("../..")
         .join("target")
-        .join("ui-preview.png");
+        .join(if workshop_mode() {
+            "workshop-preview.png"
+        } else {
+            "ui-preview.png"
+        });
     let file = std::fs::File::create(&path).expect("创建 PNG 失败");
     let mut enc = png::Encoder::new(std::io::BufWriter::new(file), W, H);
     enc.set_color(png::ColorType::Rgba);
@@ -371,6 +413,23 @@ fn ui_preview_png() {
         [pixels[i], pixels[i + 1], pixels[i + 2]]
     };
     let hex = |c: [u8; 3]| format!("#{:02x}{:02x}{:02x}", c[0], c[1], c[2]);
+
+    // 工坊那一屏是**模态**：整窗被遮罩压暗、中间盖着一块面板，
+    // 所以"顶栏是面板色""中央留给世界"这些断言必然不成立。
+    // 这里只保留"画面上确实有一块比遮罩亮的区域"（= 面板真的画出来了），
+    // 具体长什么样交给 PNG 本身。
+    if workshop_mode() {
+        let lit = pixels
+            .chunks_exact(4)
+            .filter(|p| p[0] > 24 || p[1] > 24 || p[2] > 24)
+            .count();
+        assert!(
+            lit > (W * H / 4) as usize,
+            "工坊面板应当占掉四分之一以上的画面，实际只有 {lit} 个亮像素"
+        );
+        println!("工坊截图：{}", path.display());
+        return;
+    }
 
     // 布局常量（与 `vivarium_ui::theme` 一致）。写死是有意的：
     // 布局变了这里会红，而那时候人本来就该重新看一眼图。
