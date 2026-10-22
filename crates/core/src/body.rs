@@ -212,10 +212,40 @@ pub const HUNTER: BodyPlan = BodyPlan {
     ],
 };
 
+/// 海草：竖直的几节生产者，扎在浅水里。
+///
+/// **它是唯一不动的体型**——没有移动细胞，基因组里也没有方向偏置
+/// （见 `life_sim::rooted_genome`）。它靠光活着，靠分裂繁殖。
+///
+/// 存在理由：让"生物"不只是鱼。一条 4 格的生产者链在生态里扮演的是
+/// **初级生产者**——它把光变成可吃的能量，鱼吃它（或者吃它的尸体）。
+/// 没有它，整个生态的能量入口只有鱼自己身上那几个生产者细胞，
+/// 而"谁吃谁"就没有层次了。
+///
+/// 账：4 生产者 + 0 移动 = 4 格，维持 20、质量 8、不动，
+/// 浅水收入 76.8 → **净 +56.8/tick**。它是全表里最赚的体型，
+/// 代价是它一格也动不了：光变弱时只能等死。
+pub const KELP: BodyPlan = BodyPlan {
+    name: "海草",
+    cells: &[
+        (CellType::Producer, 0, 0),
+        (CellType::Producer, 0, -1),
+        (CellType::Producer, 0, -2),
+        (CellType::Producer, 0, -3),
+    ],
+};
+
 /// 全部手工体型。
 ///
 /// 顺序有意义：[`crate::life_sim::stock_surface`] 按它轮换投放，
 /// 所以换顺序会改变同一个种子里"哪条鱼长什么样"。
+/// **海草不在这个表里。**
+///
+/// 它是"玩家在工坊里画出来的东西"，不是"自动投放的物种"。
+/// 原因是实测的：海草不动、不付移动成本、4 个生产者净赚 56.8/tick，
+/// 比任何一条鱼都富——把它放进轮换投放，它会指数增长到 481 株、
+/// 把光全吃光，鱼一条不剩。**固着生物在"按格数算产能"的模型里天然占优**，
+/// 所以它只能由玩家亲手种，不能自动撒。
 pub const PLANS: &[BodyPlan] = &[SILVERFISH, LEAFBACK, WORM, JELLY, HUNTER];
 
 /// 最大的手工体型有多少格。
@@ -299,6 +329,86 @@ mod tests {
                 plan.name
             );
         }
+    }
+
+    /// 建造细胞**降低整个身体的维持成本**，而且身体越大越划算。
+    ///
+    /// 这是它存在的理由：在此之前 `Builder` 只是一个"付 6/tick、什么都不换"
+    /// 的格子——玩家画上去只会让身体更穷。现在它有了一个真实的权衡：
+    /// 3 格的小鱼带它是亏的（省下的 20% 不够付它自己的 6 点），
+    /// 14 格的身体带 2 个能省 36%。
+    #[test]
+    fn builders_cut_the_upkeep_of_the_whole_body() {
+        use crate::life::{Cell, Genome, Organism};
+        let build = |cells: &[(crate::life::CellType, i16, i16)]| {
+            Organism::new(
+                0,
+                (0, 0),
+                cells
+                    .iter()
+                    .map(|&(k, x, y)| Cell::new(k, (x, y)))
+                    .collect(),
+                Genome::blank(),
+            )
+        };
+        use crate::life::CellType as C;
+
+        // 一条 8 格的鱼（没有建造细胞）。
+        let plain = build(&[
+            (C::Producer, 0, 0),
+            (C::Producer, 1, 0),
+            (C::Producer, 2, 0),
+            (C::Mover, 0, 1),
+            (C::Mover, 1, 1),
+            (C::Mouth, 2, 1),
+            (C::Eye, 0, -1),
+            (C::Armor, 1, -1),
+        ]);
+        let raw = plain.upkeep();
+        assert_eq!(raw, 5 + 5 + 5 + 4 + 4 + 2 + 1 + 1);
+
+        // 把一格装甲换成建造细胞：总成本应当**下降**，
+        // 而且下降的幅度要大于建造细胞自己那 6 点的开销。
+        let with_builder = build(&[
+            (C::Producer, 0, 0),
+            (C::Producer, 1, 0),
+            (C::Producer, 2, 0),
+            (C::Mover, 0, 1),
+            (C::Mover, 1, 1),
+            (C::Mouth, 2, 1),
+            (C::Eye, 0, -1),
+            (C::Builder, 1, -1),
+        ]);
+        let cut = with_builder.upkeep();
+        assert!(cut < raw, "带建造细胞的身体维持成本应当更低：{raw} → {cut}");
+        // 折扣作用在**含建造细胞在内**的总成本上：
+        // 27 − 1（去掉装甲）+ 6（加上建造）= 32，再乘 0.8 = 25。
+        // 净效果是 27 → 25：省 2 点。身体越大，这个差越大。
+        assert_eq!(cut, (raw - 1 + 6) * 80 / 100);
+
+        // 两格建造细胞是乘性叠加（0.64），不是各减 20 点。
+        let two = build(&[
+            (C::Producer, 0, 0),
+            (C::Producer, 1, 0),
+            (C::Producer, 2, 0),
+            (C::Mover, 0, 1),
+            (C::Mover, 1, 1),
+            (C::Mouth, 2, 1),
+            (C::Builder, 0, -1),
+            (C::Builder, 1, -1),
+        ]);
+        assert_eq!(two.upkeep(), (5 + 5 + 5 + 4 + 4 + 2 + 6 + 6) * 60 / 100);
+
+        // 折扣有下限：堆再多也最多省一半。
+        let many = build(&[
+            (C::Builder, 0, 0),
+            (C::Builder, 1, 0),
+            (C::Builder, 2, 0),
+            (C::Builder, 0, 1),
+            (C::Builder, 1, 1),
+            (C::Builder, 2, 1),
+        ]);
+        assert_eq!(many.upkeep(), 36 * 50 / 100);
     }
 
     /// **跑得快更烧钱**：质量相同时，速度每加一档，每 tick 的移动成本就往上跳。

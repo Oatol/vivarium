@@ -422,7 +422,6 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                     MaterialKind::Gas,
                     MaterialKind::Remains,
                     MaterialKind::Corpse,
-                    MaterialKind::Algae,
                 ] {
                     let [r, g, b] = palette::rgb(kind);
                     if widgets::swatch(
@@ -481,6 +480,25 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                     }
                 });
             });
+
+            // --- 描述 ---
+            //
+            // 色块只回答"是什么颜色"，这一行回答"**它会做什么**"——
+            // 而后者才是新手要学的部分。放在色块下面单独一行，
+            // 因为描述有三四十个字，挤在色块之间会把布局撑破。
+            ui.add_space(1.0);
+            ui.horizontal(|ui| {
+                ui.label(
+                    egui::RichText::new(material_label(state.material))
+                        .size(9.5)
+                        .color(theme::TEXT),
+                );
+                ui.label(
+                    egui::RichText::new(state.material.describe())
+                        .size(9.5)
+                        .color(theme::TEXT_DIM),
+                );
+            });
             hairline_top(ui);
         });
 }
@@ -523,7 +541,6 @@ fn material_label(kind: MaterialKind) -> &'static str {
         MaterialKind::Gas => "气",
         MaterialKind::Remains => "碎",
         MaterialKind::Corpse => "尸",
-        MaterialKind::Algae => "藻",
     }
 }
 

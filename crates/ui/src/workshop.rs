@@ -250,6 +250,20 @@ fn board(ui: &mut Ui, state: &mut UiState) {
 fn side_panel(ui: &mut Ui, state: &mut UiState) {
     ui.vertical(|ui| {
         ui.set_width(200.0);
+
+        // --- 当前画笔的说明 ---
+        //
+        // 放在最上面而不是藏在 tooltip 里：画身体的时候要反复问
+        // "这一格到底干什么用"，而悬停查询会打断手上的动作。
+        widgets::section(ui, cell_label(state.workshop.brush));
+        ui.add_space(1.0);
+        ui.label(
+            egui::RichText::new(state.workshop.brush.describe())
+                .size(9.0)
+                .color(theme::TEXT_DIM),
+        );
+        ui.add_space(6.0);
+
         widgets::section(ui, "名字");
         ui.add_space(2.0);
         ui.add(

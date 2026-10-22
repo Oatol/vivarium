@@ -167,7 +167,6 @@ fn material_label(kind: MaterialKind) -> &'static str {
         MaterialKind::Gas => "气",
         MaterialKind::Remains => "骸",
         MaterialKind::Corpse => "尸",
-        MaterialKind::Algae => "藻",
     }
 }
 
@@ -435,8 +434,9 @@ fn main() -> ExitCode {
         }
     }
     println!(
-        "生命层  生物 {} · 细胞 {} · 体型 {}-{} 格 · 深度 {}-{} · 移动 左{} 右{} 上{} 下{} · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
+        "生命层  生物 {} · 藻 {} · 细胞 {} · 体型 {}-{} 格 · 深度 {}-{} · 移动 左{} 右{} 上{} 下{} · 能量 {} · 飘在天上的 {} 个 · 杀手 {} 枚 · 食物 {} 格",
         l.organisms,
+        l.plankton,
         l.cells,
         l.min_cells,
         l.max_cells,

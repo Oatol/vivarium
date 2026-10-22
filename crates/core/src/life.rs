@@ -102,6 +102,25 @@ impl CellType {
     /// 类型总数。
     pub const COUNT: usize = 7;
 
+    /// 一句话描述：它**能换到什么**，以及**代价是什么**。
+    ///
+    /// 和 [`MaterialKind::describe`] 一样，写的是"会发生什么"而不是
+    /// "它是什么"。细胞类型的名字（"移动""眼"）已经说明了名词，
+    /// 玩家要学的是"多长一格会怎样"。
+    ///
+    /// 界面在两处用它：底部调色板的图例、生物工坊的右侧面板。
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Mouth => "嘴。吃邻格的食物：碎屑、尸体、藻。没有嘴就什么都吃不到。维持 2/tick，是最便宜的一格。",
+            Self::Producer => "生产者。在浅水里按光照产能——整个生态唯一的能量入口。越浅越赚，维持 5/tick。",
+            Self::Mover => "移动。每 4 格让每 tick 多走一格（上限 3 格）。跑得快更烧钱：每 tick 成本按速度加成。维持 4/tick。",
+            Self::Eye => "眼。每 1 只让嗅觉射线长 4 格（基础 20，上限 32）。看不见食物就只能碰运气。维持 1/tick。",
+            Self::Killer => "杀手。咬邻格的别的生物，能量从对方身上**转移**过来。有装甲的话会被挡掉一部分。维持 3/tick。",
+            Self::Armor => "装甲。每格挡掉 8 点咬击。只对杀手有用——没有捕食者的世界里它纯粹是配重。维持 1/tick。",
+            Self::Builder => "建造。让**整个身体**的维持成本每格乘 0.8（最多降到一半）。身体越大越划算，3 格的小鱼带它是亏的。维持 6/tick。",
+        }
+    }
+
     /// 全部类型，按 `as_u8` 的顺序。
     pub const ALL: [Self; Self::COUNT] = [
         Self::Mouth,
@@ -665,7 +684,20 @@ impl Organism {
 
     /// 每 tick 的维持成本总和。
     pub fn upkeep(&self) -> u32 {
-        self.cells.iter().map(|c| c.kind.upkeep()).sum()
+        let raw: u32 = self.cells.iter().map(|c| c.kind.upkeep()).sum();
+        // **建造细胞的工作是"维护结构"：它让整个身体的维持成本下降。**
+        //
+        // 每格乘 0.8，最多降到一半。为什么是乘性而不是"每格减固定值"：
+        // 身体越大，维护省下来的越多——这正是"建造"该有的规模效应。
+        // 一条 14 格的身体带 2 个建造细胞能省下 36%，而 3 格的小鱼
+        // 带 1 个只省 20%（还不够付它自己 6 点的维持）。
+        // **所以建造细胞只对大身体划算**，这是刻意的权衡。
+        let builders = self.count(CellType::Builder) as u32;
+        if builders == 0 {
+            return raw;
+        }
+        let keep = 100u32.saturating_sub(20 * builders).max(50);
+        raw * keep / 100
     }
 
     /// 身体总质量。
@@ -762,6 +794,19 @@ impl Organism {
     #[inline]
     pub fn birth_energy(&self) -> u32 {
         BIRTH_ENERGY_PER_CELL * self.cells.len().max(1) as u32
+    }
+
+    /// 是不是**浮游藻**：一格生产者。
+    ///
+    /// 藻不是一种特殊的细胞，而是"只有一格生产者"这个**形状**。
+    /// 用形状而不是新字段来判断，是因为工坊里画一个单格生产者画出来的
+    /// 就该是藻——两边共用同一个定义，不会出现"画出来是鱼、引擎认成藻"。
+    ///
+    /// 它的用途只有一个：**跳过行为网络**。藻没有脑，不需要感知和决策，
+    /// 每 tick 跑一遍 `sense` + `think` 是纯浪费（几百个藻时是十倍的帧时间）。
+    #[inline]
+    pub fn is_plankton(&self) -> bool {
+        self.cells.len() == 1 && self.cells[0].kind == CellType::Producer
     }
 
     /// 每 tick 最多走几格。

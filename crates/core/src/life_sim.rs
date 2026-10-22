@@ -222,47 +222,50 @@ pub const CORPSE_ROT_PERCENT: u32 = 20;
 /// 实测 8000 tick 堆了 4.3 万格。
 pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 
-/// 藻长在水面以下多少格之内。
+/// 浮游藻撒在水面以下多少格之内。
 ///
-/// 用"离水面多深"而不是"光照阈值"：光照是 `1 - y/height`，它把**世界尺寸**
+/// 用"离水面多深"而不是"光照阈值"：光照是 `1 - y/世界高`，它把**世界尺寸**
 /// 也编进去了——同一个阈值在 512² 和 128² 里对应完全不同的深度。
-/// 而这里要表达的是"藻悬浮在透光层"，那是一个深度问题。
+/// 而这里要表达的是"藻悬在透光层"，那是一个深度问题。
 ///
-/// 60 格 ≈ 透光层的一大半。**这不是为了让藻更多，是为了让鱼有理由上下移动**：
-/// 早先只撒在水面下 28 格，而鱼的活动带也在那儿，食物和光挤在同一层——
-/// 鱼不需要下潜就能吃饱，垂直方向自然永远不动。食物在深度上有分布，
-/// "去哪儿吃"才成为一个真问题。
-pub const ALGAE_DEPTH: i32 = 60;
+/// 24 格。**这个数字决定的是"密度"，不是"深度"。**
+///
+/// 藻 300 个封顶，撒在 60 格深里密度只有 0.9%——鱼随机游动撞上它的
+/// 概率太低，而藻又占格（鱼不能穿进去），于是鱼在藻群里饿死。
+/// 24 格把密度提到 2.4%，而且正好和鱼的活动带（水面下 9~27 格）重叠。
+pub const PLANKTON_DEPTH: i32 = 24;
 
-/// 藻的存量上限（格）。
+/// 浮游藻的存量上限（个）。
 ///
-/// **这是"存量"上限，不是"能不能长"的判据。** 早先的版本按"全世界含能量的
-/// 残骸格数"封顶 1500，而世界里天然碎屑本身就有 2791 格——上限一开始就满，
-/// 一格藻都长不出来。那次错的不是"封顶"这件事，是**判据数错了东西**：
-/// 它把天然碎屑和新长出来的藻混成了一件事。现在 `Algae` 是独立材质，
-/// `world.count_of(Algae)` 数的就是藻本身。
-pub const ALGAE_CAP: usize = 700;
+/// 藻是**生物**，理论上可以靠分裂自己涨到光照能支撑的极限。但那样会有
+/// 两个问题：一是几千个单格生物会把每 tick 的遍历拖慢十倍；二是
+/// "藻把整片海填满"在画面上不好看。所以给一个硬上限。
+///
+/// 600 个约占 512² 的 0.23%——视觉上是稀疏的绿点，而不是一层膜。
+pub const PLANKTON_CAP: usize = 150;
 
-/// 每次清扫长出几格藻。
+/// 每次清扫撒几个藻。
 ///
-/// 这是"光 → 藻 → 鱼"这条通路的**能量通量**，和 [`PRODUCER_YIELD`] 是同一类
-/// 常数：它决定这个生态最多能多养活多少东西，而不是"长得多快"。
+/// 这是"光 → 藻 → 鱼"这条通路的**播种通量**。注意它**不是**藻的主要
+/// 增长方式——藻靠分裂繁殖，播种只是让"被吃光的海域"能重新长起来。
 ///
-/// 30 格 / 25 tick ≈ 144 能量/tick。对照：一条 4 生产者的鱼在浅水晒光约
-/// 67 能量/tick，五十条鱼加起来是三千多。所以藻是**补剂**，不是主粮——
-/// 想让鱼真的靠觅食活着，得先压 [`PRODUCER_YIELD`]，那是另一件事。
-///
-/// 取 30 而不是 6：6 的时候藻一长出来就被吃光，存量长期在个位数，
-/// **看不见**。藻是这一步要展示的东西，它得能形成一层看得见的悬浮物。
-pub const ALGAE_GROWTH_PER_SWEEP: usize = 30;
+/// 4 个 / 25 tick = 0.16 个/tick。对照：一条鱼一 tick 能吃一格。
+/// 所以播种远远跟不上捕食，藻群主要还是靠自己的分裂维持。
+pub const PLANKTON_PER_SWEEP: usize = 4;
 
-/// 为长一格藻，最多试几个位置。
+/// 为撒一个藻，最多试几个位置。
 ///
 /// 位置是随机撒的（透光层里空气占了大半），所以大部分尝试会落在不能长的地方。
-const ALGAE_GROWTH_TRIES: usize = 40;
+const PLANKTON_TRIES: usize = 40;
 
-/// 藻生长用的随机种子盐。
-const SALT_ALGAE_SPAWN: u64 = 0xA16A_E5EE_D000_0000;
+/// 藻播种用的随机种子盐。
+const SALT_PLANKTON_SPAWN: u64 = 0xA16A_E5EE_D000_0000;
+
+/// 新藻出生时带多少能量。
+///
+/// 不能给 `BIRTH_ENERGY_PER_CELL`（67）：藻的繁殖门槛是 134，
+/// 给 67 等于"一出生就攒了一半"，会立刻分裂。给 20 让它得自己晒几 tick 光。
+const PLANKTON_START_ENERGY: u32 = 20;
 
 /// 这一格是不是泡在水下。
 ///
@@ -274,11 +277,7 @@ const SALT_ALGAE_SPAWN: u64 = 0xA16A_E5EE_D000_0000;
 fn underwater(world: &World, x: usize, y: usize) -> bool {
     for ny in (0..y).rev() {
         match world.get(x as isize, ny as isize) {
-            // 藻是水里的悬浮物：泡在藻层里也算泡在水里。
-            // 不算的话，水面那层藻下面的尸体会被当成"露在空气里"，
-            // 按干腐烂变成空位——而它那一格水本来是身体借走的，于是水量
-            // 每死一条贴着藻层的鱼就少一格（实测 32000 tick 少了 750 格）。
-            MaterialKind::Water | MaterialKind::Algae => return true,
+            MaterialKind::Water => return true,
             // 空气意味着这一格露在水面之上，不烂。
             MaterialKind::Empty => return false,
             _ => continue,
@@ -292,33 +291,6 @@ const NEIGHBORS_4: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
 
 /// 尸体腐烂用的位置派生随机盐。必须和材质层的盐不同。
 const SALT_CORPSE_ROT: u32 = 0xDEAD;
-
-/// 空气里的藻干掉的概率（百分比，每次清扫）。
-///
-/// **这条规则不是为了"清洁"，是为了堵住一个能破坏水陆判据的漏洞。**
-/// 藻算水（见 `touches_water`），而藻可以被沙顶到空气里、也可以在水退去
-/// 之后悬在半空。悬空的藻就成了一块**踏脚石**：鱼贴着它就能浮到水面之上，
-/// 而那正是"生物全在半空里漂着"的成因之一。
-///
-/// 给 25%（平均 100 tick 消失）而不是 100%：藻被鱼挤开的瞬间可能
-/// 短暂离开水，立刻蒸发会让"挤开"变成"销毁"。
-const ALGAE_DRY_PERCENT: u32 = 25;
-
-/// 藻干掉的随机盐。必须和腐烂、生长都不同。
-const SALT_ALGAE_DRY: u32 = 0xA1AE;
-
-/// 一格藻蕴含的生物可用能量。
-///
-/// 这个数字必须**压过"待在水面晒光"的净收益**，否则觅食就是个坏主意：
-/// 鱼会闻着味道下潜、花掉一截移动成本、吃到一点点，然后发现还不如待在上面。
-///
-/// 三格鱼的账：水面净收益约 +26/tick；一口藻吃一格，所以藻的能量
-/// 必须明显高于"维持成本 37 + 那 26"。取 120 时，坐在藻席上吃是
-/// **+83/tick**——值得专门跑一趟，而且吃几口就饱（能量上限会挡住）。
-///
-/// 第一版取 40 的实测结果是**负收益**：种群从 52 掉到 37，
-/// 细胞数从 688 掉到 442。不是藻没长出来，是长得再多也不值得去。
-pub const FOOD_ENERGY: u32 = 120;
 
 // ---------------------------------------------------------------------------
 // 捕食
@@ -357,7 +329,7 @@ pub const ARMOR_ABSORB: u32 = 8;
 /// 推导平衡点：单条鱼净收益 = `PRODUCER_YIELD × 光 × comp − 维持成本`。
 /// 令其为零、取浅水光 ≈ 0.8、维持 15，得 `P ≈ 0.28 × CAP`。
 /// CAP = 800 对应 **≈ 220 条**，与实测的 240 吻合。
-pub const CARRYING_CAPACITY: f32 = 800.0;
+pub const CARRYING_CAPACITY: f32 = 2400.0;
 
 /// 生成失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -446,6 +418,11 @@ pub struct LifeStats {
     pub eaten: u32,
     /// 本 tick 发生的捕食次数（一枚杀手细胞咬到一口算一次）。
     pub bitten: u32,
+    /// 当前有多少个浮游藻（单细胞生产者）。
+    ///
+    /// 和 `organisms` 分开：藻是**几百个**，混进去之后"生物 640"这个数字
+    /// 就不再是"生态里有几个动物"，而体型统计（min/max）也会被 1 格撑到没意义。
+    pub plankton: usize,
     /// 本 tick 有多少个体**因为重力下落**了一格。
     ///
     /// 和 `moved` 分开：混在一起会把"垂直移动占比"污染成
@@ -553,6 +530,18 @@ pub struct LifeSim {
     moved_total: [u64; 4],
     /// 累计下落次数。
     fell_total: u64,
+    /// 当前所有藻的 id，**升序**。
+    ///
+    /// 每 tick 重建一次。用途只有一个：`sense` 里要判断"射线撞到的那个
+    /// 生物是不是藻"，而那里每 tick 每生物要问 80 次（4 方向 × 20 格）——
+    /// 每次去 `organisms` 里线性查一遍是 O(n²)，几百个藻时直接卡死。
+    plankton_ids: Vec<OrganismId>,
+    /// 被吃掉、等着从 `organisms` 里移除的藻。
+    ///
+    /// **不能当场 `remove`**：`act` 是按索引遍历的（`for i in 0..n`），
+    /// 中途删元素会让后面的索引全部错位——某条鱼被跳过、另一条被处理两次。
+    /// 那种 bug 在画面上看不出来，只会让"为什么这条鱼不动"变成谜。
+    eaten_plankton: Vec<OrganismId>,
 }
 
 impl Default for LifeSim {
@@ -571,6 +560,8 @@ impl Default for LifeSim {
             food_growth: true,
             moved_total: [0; 4],
             fell_total: 0,
+            plankton_ids: Vec::new(),
+            eaten_plankton: Vec::new(),
         }
     }
 }
@@ -610,6 +601,8 @@ impl LifeSim {
             food_growth: true,
             moved_total: [0; 4],
             fell_total: 0,
+            plankton_ids: Vec::new(),
+            eaten_plankton: Vec::new(),
         }
     }
 
@@ -695,29 +688,14 @@ impl LifeSim {
         // 沉下去死了，会还出一格它从没借过的水。实测 32000 tick 多了一万八千格。
         // 落点先算好再动 cells：`cell_at` 要借 `org`，而下面要 `&mut org.cells`。
         let spots: Vec<(i32, i32)> = org.cells.iter().map(|c| org.cell_at(c)).collect();
-        let mut crushed = 0u64;
         for (cell, &(x, y)) in org.cells.iter_mut().zip(&spots) {
             let kind = world.get(x as isize, y as isize);
-            // 只有水和藻才算"借"。气体、火被挤掉不算债务——它们本来就不是水。
-            //
-            // 藻算借，是因为**藻就是水里的悬浮物**：那一格在体积账上本来记成
-            // 藻，身体占住它之后记成细胞，死后变成尸体、烂掉再变回水——
-            // 一路都在同一个守恒量里。写成 `wet = false` 的话这条链断在中间，
-            // 每吃掉一格藻就少一格水。
-            cell.wet = matches!(kind, MaterialKind::Water | MaterialKind::Algae);
-            if kind == MaterialKind::Algae {
-                // 被身体挤掉的那格藻没被吃掉，能量变成热。
-                //
-                // 必须记账：藻的能量是记在 `flags` 里、由 `audit` 数进
-                // "残骸"那一栏的。悄悄清掉它，守恒断言会报"少了 N 点"，
-                // 而报错指向的是生命层，查起来毫无头绪。
-                crushed += world.flags(x as isize, y as isize) as u64;
-            }
-            if kind.is_fluid() || kind == MaterialKind::Algae {
+            // 只有水才算"借"。气体、火被挤掉不算债务——它们本来就不是水。
+            cell.wet = matches!(kind, MaterialKind::Water);
+            if kind.is_fluid() {
                 world.set(x as isize, y as isize, MaterialKind::Empty);
             }
         }
-        self.ledger.dissipated += crushed;
 
         org.id = self.next_id;
         self.next_id += 1;
@@ -797,10 +775,7 @@ impl LifeSim {
     pub fn audit(&self, world: &World) -> EnergyAudit {
         let mut remains = 0u64;
         for cell in world.cells() {
-            if matches!(
-                cell.kind,
-                MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
-            ) {
+            if matches!(cell.kind, MaterialKind::Remains | MaterialKind::Corpse) {
                 remains += cell.flags as u64;
             }
         }
@@ -826,8 +801,11 @@ impl LifeSim {
         // 1) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
         self.inject_sunlight(world);
 
-        // 1b) 尸体腐烂 + 藻的生长。第二条能量注入通道，见 `tick_organics`。
+        // 1b) 尸体腐烂 + 藻的播种，见 `tick_organics`。
         self.tick_organics(world);
+
+        // 1b2) 藻的分裂。放在产能之后：刚晒到的能量这一 tick 就能用来分裂。
+        self.tick_plankton(world);
 
         // 1c) 重力：不在水里的先掉下来。
         //
@@ -836,8 +814,16 @@ impl LifeSim {
         // 拦住一整轮，白等一 tick。
         self.apply_gravity(world);
 
+        // 1d) 重建藻的索引。`act` 里的嗅觉要用它判断"闻到的是不是藻"。
+        self.rebuild_plankton_ids();
+
         // 2) 行为。
         self.act(world);
+
+        // 2a) 清理被吃掉的藻。必须在 `act` 之后、`predate` 之前：
+        //     放在 `act` 里面会让索引错位，放在代谢之后会让它先饿死、
+        //     变成一具本不该存在的尸体。
+        self.clear_eaten_plankton(world);
 
         // 2b) 捕食。放在行为之后：这一 tick 游到嘴边的猎物，这一 tick 就该被咬。
         self.predate(world);
@@ -881,56 +867,63 @@ impl LifeSim {
         }
 
         // 5) 统计。
-        self.stats.organisms = self.organisms.len();
-        self.stats.cells = self.organisms.iter().map(|o| o.cell_count()).sum();
-        self.stats.shallowest = self.organisms.iter().map(|o| o.anchor.1).min().unwrap_or(0);
-        self.stats.deepest = self.organisms.iter().map(|o| o.anchor.1).max().unwrap_or(0);
-        self.stats.min_cells = self
-            .organisms
-            .iter()
-            .map(|o| o.cell_count())
-            .min()
-            .unwrap_or(0);
-        self.stats.max_cells = self
-            .organisms
-            .iter()
-            .map(|o| o.cell_count())
-            .max()
-            .unwrap_or(0);
-        self.stats.stranded = self
-            .organisms
-            .iter()
-            .filter(|o| {
-                let cells: Vec<(i32, i32)> = o.footprint().collect();
-                !Self::touches_water(world, o.width, &cells)
-            })
-            .count();
-        self.stats.killers = self
-            .organisms
-            .iter()
-            .map(|o| {
-                o.cells
-                    .iter()
-                    .filter(|c| c.kind == CellType::Killer)
-                    .count()
-            })
-            .sum();
-        self.stats.energy = self.organisms.iter().map(|o| o.energy as u64).sum();
-        self.stats.max_generation = self
-            .organisms
-            .iter()
-            .map(|o| o.generation)
-            .max()
-            .unwrap_or(0);
-        self.stats.avg_generation = if self.organisms.is_empty() {
-            0.0
-        } else {
-            self.organisms
+        // **动物和藻分开统计。**
+        //
+        // 藻是几百个单格生物，混进 `organisms` 之后"生物 640"就不再是
+        // "生态里有几个动物"；而体型统计（min/max）会被 1 格撑到没意义——
+        // 一条 14 格的叶背鱼和一片藻放在同一个 `min` 里，那个数字永远报 1。
+        let mut plankton = 0usize;
+        let mut animals = 0usize;
+        let mut cells = 0usize;
+        let (mut shallow, mut deep) = (i32::MAX, i32::MIN);
+        let (mut min_cells, mut max_cells) = (usize::MAX, 0usize);
+        let mut stranded = 0usize;
+        let mut killers = 0usize;
+        let mut energy = 0u64;
+        let mut max_gen = 0u32;
+        for org in &self.organisms {
+            cells += org.cell_count();
+            energy += org.energy as u64;
+            max_gen = max_gen.max(org.generation);
+            if org.is_plankton() {
+                plankton += 1;
+                continue;
+            }
+            animals += 1;
+            shallow = shallow.min(org.anchor.1);
+            deep = deep.max(org.anchor.1);
+            let n = org.cell_count();
+            min_cells = min_cells.min(n);
+            max_cells = max_cells.max(n);
+            killers += org
+                .cells
                 .iter()
-                .map(|o| o.generation as f32)
-                .sum::<f32>()
-                / self.organisms.len() as f32
-        };
+                .filter(|c| c.kind == CellType::Killer)
+                .count();
+            let fp: Vec<(i32, i32)> = org.footprint().collect();
+            if !Self::touches_water(world, org.width, &fp) {
+                stranded += 1;
+            }
+        }
+        self.stats.plankton = plankton;
+        self.stats.organisms = animals;
+        self.stats.cells = cells;
+        self.stats.shallowest = if animals == 0 { 0 } else { shallow };
+        self.stats.deepest = if animals == 0 { 0 } else { deep };
+        self.stats.min_cells = if animals == 0 { 0 } else { min_cells };
+        self.stats.max_cells = max_cells;
+        self.stats.stranded = stranded;
+        self.stats.killers = killers;
+        self.stats.energy = energy;
+        self.stats.max_generation = max_gen;
+        // 平均代数只算**动物**：藻每分裂一次代数就 +1，几百个藻会把
+        // "平均代数"拉到和鱼完全无关的量级上。
+        let (sum, n) = self
+            .organisms
+            .iter()
+            .filter(|o| !o.is_plankton())
+            .fold((0f32, 0usize), |(s, n), o| (s + o.generation as f32, n + 1));
+        self.stats.avg_generation = if n == 0 { 0.0 } else { sum / n as f32 };
         self.stats.gene_distance = self.gene_distance();
     }
 
@@ -1123,28 +1116,6 @@ impl LifeSim {
     /// 离开了生物可用池但仍在账上。这正是"腐烂规则必须住在生命层"的理由——
     /// 材质层没有账本，它悄悄清掉一格带能量的尸体，守恒断言就会报"多了 N 点"。
     ///
-    /// ## 藻的生长
-    ///
-    /// 藻**悬浮在水面以下的一层水里**，不在海底。
-    ///
-    /// 这个位置是被两次失败逼出来的：
-    ///
-    /// 1. 长在海底时鱼**够不着**。海深 184 格，一趟下潜往返的移动成本
-    ///    约 `质量 × 距离 ≈ 13 × 368 ≈ 4800`，而一格藻只有 120 能量——
-    ///    整片藻席吃下去也回不了本。食物放在鱼到不了的地方等于没有食物。
-    /// 2. 悬在水里但**是固体**时会把水流切碎。3000 格静态藻让整个世界静止
-    ///    （`移动 0`）、全部鱼被顶进空气里。
-    ///
-    /// 所以现在：**悬浮（不挡路）+ 被水挤开（会漂）+ 长在透光层（够得着）**。
-    /// 三者缺一不可，前两条在材质层（见 `MaterialKind::Algae` 与
-    /// `MoveRule::Drifts`），这一条在生命层。
-    ///
-    /// ## 为什么是"每次撒几格"而不是"每格掷骰子"
-    ///
-    /// 藻长在约两万格水里，全扫一遍每 25 tick 一次，而每次只需要长出
-    /// [`ALGAE_GROWTH_PER_SWEEP`] 格——扫描的 99.9% 是白跑。随机撒点
-    /// 是 O(尝试次数)，和世界大小无关，而且**通量是常数**：
-    /// 决定"藻能养活多少东西"的是这个常数，不是世界有多大。
     fn tick_organics(&mut self, world: &mut World) {
         if world.tick() % ORGANICS_INTERVAL != 0 {
             return;
@@ -1157,32 +1128,7 @@ impl LifeSim {
         for y in 0..h {
             for x in 0..w {
                 let (xs, ys) = (x as isize, y as isize);
-                let kind = world.get(xs, ys);
-
-                // --- 空气里的藻会干掉 ---------------------------------------
-                //
-                // 藻算水，所以悬空的藻等于给鱼搭了一块踏脚石。这里把它拆掉。
-                // 判据是"四邻一个水或藻都没有"：藻团边缘贴着水的那些不算干。
-                if kind == MaterialKind::Algae {
-                    let anchored =
-                        [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)]
-                            .iter()
-                            .any(|&(dx, dy)| {
-                                matches!(
-                                    world.get(xs + dx, ys + dy),
-                                    MaterialKind::Water | MaterialKind::Algae
-                                )
-                            });
-                    if anchored || !Rng::at_percent(x, y, tick, SALT_ALGAE_DRY, ALGAE_DRY_PERCENT) {
-                        continue;
-                    }
-                    // 藻带走的能量是热量，进耗散。
-                    rotted += world.flags(xs, ys) as u64;
-                    world.set(xs, ys, MaterialKind::Empty);
-                    continue;
-                }
-
-                if kind != MaterialKind::Corpse {
+                if world.get(xs, ys) != MaterialKind::Corpse {
                     continue;
                 }
                 let wet = underwater(world, x, y);
@@ -1214,46 +1160,60 @@ impl LifeSim {
         self.ledger.dissipated += rotted;
         self.stats.corpses_rotted = rotted_cells;
 
-        let grown = if self.food_growth {
-            self.grow_algae(world)
-        } else {
-            0
-        };
-        // 藻的能量是新进入生物可用池的（光 → 藻 → 鱼），记注入。
-        self.ledger.injected += grown as u64 * FOOD_ENERGY as u64;
-        self.stats.food_grown = grown;
+        if self.food_growth {
+            self.seed_plankton(world);
+        }
     }
 
-    /// 在水面以下几格的水里撒几格藻。返回实际长出来几格。
+    /// 播种浮游藻：在水里撒几个**单细胞生产者**。
     ///
-    /// 位置是**随机撒的**，不是扫描出来的：透光层有两万格，而每次只长几格，
-    /// 扫一遍是纯浪费。代价是大部分尝试会落在空气或已占用的格子上——
-    /// 所以每个位置要试 [`ALGAE_GROWTH_TRIES`] 次。
-    fn grow_algae(&mut self, world: &mut World) -> u32 {
-        if world.count_of(MaterialKind::Algae) >= ALGAE_CAP {
-            return 0;
+    /// ## 藻为什么是生物，不是材质
+    ///
+    /// 早先 `Algae` 是一种材质（悬浮、可吃、被水挤开）。那套东西能跑，
+    /// 但它有三条别扭的地方，每一条都在逼着补丁：
+    ///
+    /// 1. **能量要单独记一条注入通道**。藻的能量写在材质的 `flags` 里，
+    ///    每长一格就要 `ledger.injected += FOOD_ENERGY`——而 `inject_sunlight`
+    ///    明明已经在按生产者细胞算能量了。两条通道算同一件事。
+    /// 2. **"被吃掉"要走 `eat_remains`**，和碎屑、尸体挤在同一个函数里，
+    ///    于是"该不该还水"要靠材质种类区分。
+    /// 3. **密度是个没法调对的数**：比水轻会被一路顶到水面（鱼也跟着挤上去），
+    ///    和水同重就变成水流的半固体障碍（实测世界冻住）。
+    ///
+    /// 变成生物之后这三条全部消失：它靠 `inject_sunlight` 产能（自动有
+    /// 容纳量制约）、被吃掉是"捕食"、它想待在哪儿由自己的行为决定（不动）。
+    ///
+    /// ## 为什么是"撒点"而不是"每格掷骰子"
+    ///
+    /// 透光层有两万格，而每次只撒几个——扫一遍的 99.9% 是白跑。
+    /// 随机撒点是 O(尝试次数)，和世界大小无关，而且**通量是常数**：
+    /// 决定"藻能养活多少东西"的是这个常数，不是世界有多大。
+    fn seed_plankton(&mut self, world: &mut World) {
+        // **不能用 `self.stats.plankton`**：`stats` 在 `step` 开头刚被重置成
+        // 默认值，这里的 `plankton` 永远是 0，上限检查形同虚设——实测藻
+        // 一路涨到 1156 个（上限是 600），把光全吃光，鱼饿死绝种。
+        let mut count = self.organisms.iter().filter(|o| o.is_plankton()).count();
+        if count >= PLANKTON_CAP {
+            return;
         }
         let (w, h) = (world.width(), world.height());
         if w == 0 || h == 0 {
-            return 0;
+            return;
         }
-        // 每个清扫周期用一个独立的随机源，种子只和 tick 有关——所以
-        // 同一个世界、同一个种子，藻长在哪里是可复现的。
-        let mut rng = Rng::new(world.tick().wrapping_mul(0x9E37_79B9) ^ SALT_ALGAE_SPAWN);
-        let mut grown = 0u32;
-        for _ in 0..ALGAE_GROWTH_PER_SWEEP {
-            if world.count_of(MaterialKind::Algae) >= ALGAE_CAP {
+        let mut rng = Rng::new(world.tick().wrapping_mul(0x9E37_79B9) ^ SALT_PLANKTON_SPAWN);
+        for _ in 0..PLANKTON_PER_SWEEP {
+            if count >= PLANKTON_CAP {
                 break;
             }
-            for _ in 0..ALGAE_GROWTH_TRIES {
+            for _ in 0..PLANKTON_TRIES {
                 let x = rng.gen_range_usize(0, w);
-                // 先找这一列的水面：从顶往下第一格水。找不到就是陆地或空列。
+                // 先找这一列的水面：从顶往下第一格水。
                 let Some(surface) =
                     (0..h).find(|&y| world.get(x as isize, y as isize) == MaterialKind::Water)
                 else {
                     continue;
                 };
-                let depth = rng.gen_range_usize(0, ALGAE_DEPTH as usize);
+                let depth = rng.gen_range_usize(0, PLANKTON_DEPTH as usize);
                 let y = surface + depth;
                 if y >= h {
                     continue;
@@ -1262,13 +1222,19 @@ impl LifeSim {
                 if world.get(xs, ys) != MaterialKind::Water || world.is_occupied(xs, ys) {
                     continue;
                 }
-                world.set(xs, ys, MaterialKind::Algae);
-                world.set_flags(xs, ys, FOOD_ENERGY as u8);
-                grown += 1;
-                break;
+                let mut org = Organism::new(
+                    0,
+                    (x as i32, y as i32),
+                    vec![Cell::new(CellType::Producer, (0, 0))],
+                    plankton_genome(),
+                );
+                org.energy = PLANKTON_START_ENERGY;
+                if self.spawn_injected(world, org).is_ok() {
+                    count += 1;
+                    break;
+                }
             }
         }
-        grown
     }
 
     /// 世界里有多少格含能量的食物（藻席 + 有能量的残骸）。
@@ -1283,7 +1249,7 @@ impl LifeSim {
                 let (xs, ys) = (x as isize, y as isize);
                 if matches!(
                     world.get(xs, ys),
-                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                    MaterialKind::Remains | MaterialKind::Corpse
                 ) && world.flags(xs, ys) > 0
                 {
                     n += 1;
@@ -1302,6 +1268,104 @@ impl LifeSim {
     /// 顺序按编号（= 加入顺序），不按位置。位置顺序会让"谁先动"取决于地图，
     /// 而地图每 tick 都在变，于是同一个种子跑两遍结果不同。编号顺序是稳定的，
     /// 而且它天然表达"老个体先动"。
+    /// 浮游藻分裂：能量够了的单细胞生产者一分为二。
+    ///
+    /// ## 为什么不用 `reproduce`
+    ///
+    /// `reproduce` 要过三道关：`fits`（每一格都能放 + 水陆判据）、
+    /// `nearby` 拥挤检查（O(n) 扫所有生物）、基因组突变。
+    ///
+    /// 对鱼来说这三道都必要。对藻来说**全都是浪费**：藻只有一格、不需要
+    /// 变形状（形状永远是"一格生产者"）、而拥挤由光照容纳量自动制约
+    /// （`inject_sunlight` 里的 `CARRYING_CAPACITY`）。
+    ///
+    /// 几百个藻每 tick 各走一遍 `reproduce` 会让帧时间翻几倍，而换来的
+    /// 只是"藻的基因在漂移"——那不是这一层想展示的东西。
+    fn tick_plankton(&mut self, world: &mut World) {
+        let mut count = self.organisms.iter().filter(|o| o.is_plankton()).count();
+        if count >= PLANKTON_CAP {
+            return;
+        }
+        // 先收集再结算：分裂会 push 新生物，边遍历边 push 借不过编译器。
+        // 正序安全：新生物追加在末尾，不在这个列表里。
+        let ready: Vec<usize> = self
+            .organisms
+            .iter()
+            .enumerate()
+            .filter(|(_, o)| o.is_plankton() && o.energy >= o.reproduction_energy())
+            .map(|(i, _)| i)
+            .collect();
+        for i in ready {
+            if count >= PLANKTON_CAP {
+                break;
+            }
+            if self.split_plankton(world, i) {
+                count += 1;
+            }
+        }
+    }
+
+    /// 重建藻的 id 表。每 tick 一次，O(n log n)。
+    fn rebuild_plankton_ids(&mut self) {
+        self.plankton_ids.clear();
+        self.plankton_ids.extend(
+            self.organisms
+                .iter()
+                .filter(|o| o.is_plankton())
+                .map(|o| o.id),
+        );
+        self.plankton_ids.sort_unstable();
+    }
+
+    /// 让第 `i` 个藻分裂一次。返回是否真的生出来了。
+    fn split_plankton(&mut self, world: &mut World, i: usize) -> bool {
+        if i >= self.organisms.len() {
+            return false;
+        }
+        let (ax, ay) = self.organisms[i].anchor;
+        let width = self.organisms[i].width;
+        let half = self.organisms[i].birth_energy();
+        if self.organisms[i].energy < half {
+            return false;
+        }
+        let generation = self.organisms[i].generation + 1;
+        let id = self.organisms[i].id;
+
+        // 四邻找一格空水。**只找紧邻**：藻没有运动器官，子代只能长在
+        // 身边。这一条让藻群是"从中心慢慢铺开"，而不是瞬间出现在别处。
+        for (dx, dy) in NEIGHBORS_4 {
+            let nx = if width > 0 {
+                (ax + dx).rem_euclid(width)
+            } else {
+                ax + dx
+            };
+            let ny = ay + dy;
+            if !world.in_bounds(nx as isize, ny as isize) {
+                continue;
+            }
+            if world.get(nx as isize, ny as isize) != MaterialKind::Water
+                || world.is_occupied(nx as isize, ny as isize)
+            {
+                continue;
+            }
+            let mut child = Organism::new(
+                0,
+                (nx, ny),
+                vec![Cell::new(CellType::Producer, (0, 0))],
+                plankton_genome(),
+            );
+            child.energy = half;
+            child.parent = Some(id);
+            child.generation = generation;
+            if self.spawn(world, child).is_ok() {
+                // 能量是**转移**，不是注入：亲代少一半，子代多一半。
+                self.organisms[i].energy -= half;
+                return true;
+            }
+        }
+        false
+    }
+
     /// 重力：**不在水里的身体会往下掉**。
     ///
     /// ## 为什么必须有这一条
@@ -1358,6 +1422,12 @@ impl LifeSim {
         if self.organisms[i].acted {
             return 0;
         }
+        // 藻没有脑。几百个藻每 tick 各跑一遍 `sense` + `think` 是纯浪费，
+        // 而它的行为（不动、只繁殖）已经在 `tick_plankton` 里处理完了。
+        if self.organisms[i].is_plankton() {
+            self.organisms[i].acted = true;
+            return 0;
+        }
         let inputs = self.sense(world, i);
         let out = self.organisms[i].genome.think(&inputs);
         // 存下来给检查器看：界面要能回答"它此刻闻到了什么、想干什么"。
@@ -1371,9 +1441,18 @@ impl LifeSim {
         // 生物会永远差一步——它走到食物格上时，食物已经不在邻格了。
         let mut eaten = 0;
         if out[OUT_EAT] > 0.0 {
+            let id = self.organisms[i].id;
+            // 先吃材质（碎屑、尸体），再吃藻。
+            //
+            // 顺序有意义：材质格不会跑，藻会（被水流挤开）。先吃确定的那个，
+            // 少一次查表。而且材质是"现成的尸体"，藻是"活着的猎物"——
+            // 饿的时候先吃白捡的。
             if let Some((x, y)) = self.food_target(world, i) {
-                let id = self.organisms[i].id;
                 if self.eat_remains(world, id, x, y) {
+                    eaten = 1;
+                }
+            } else if let Some(prey) = self.plankton_target(world, i) {
+                if self.eat_plankton(id, prey) {
                     eaten = 1;
                 }
             }
@@ -1407,7 +1486,7 @@ impl LifeSim {
         let (fx, fy) = org.front();
         inp[IN_FOOD_AHEAD] = matches!(
             world.get(fx as isize, fy as isize),
-            MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+            MaterialKind::Remains | MaterialKind::Corpse
         ) as u8 as f32;
         inp[IN_BLOCKED_AHEAD] = (!Self::passable(world, body, fx, fy)) as u8 as f32;
 
@@ -1469,10 +1548,7 @@ impl LifeSim {
         let mut depth = 0i32;
         let mut ny = top - 1;
         while ny >= 0 && depth < LIGHT_DEPTH {
-            if !matches!(
-                world.get(ax as isize, ny as isize),
-                MaterialKind::Water | MaterialKind::Algae
-            ) {
+            if !matches!(world.get(ax as isize, ny as isize), MaterialKind::Water) {
                 break;
             }
             depth += 1;
@@ -1503,11 +1579,21 @@ impl LifeSim {
                 if owner.organism != 0 && owner.organism != org.id {
                     org_x += dx as f32 / d as f32;
                     org_y += dy as f32 / d as f32;
+                    // **藻是食物**：闻到它的时候也记进食物方向。
+                    //
+                    // 这一条是"藻从材质变成生物"之后必须补的：材质时代
+                    // 射线找的是"含能量的 `Remains`"，藻变成生物之后
+                    // 射线看不见它了——于是鱼**闻不到食物**，而藻又占格
+                    // 不让进，结果是鱼在藻群里饿死（实测 500 tick 全灭）。
+                    if self.plankton_ids.binary_search(&owner.organism).is_ok() {
+                        smell_x += dx as f32 / d as f32;
+                        smell_y += dy as f32 / d as f32;
+                    }
                     break;
                 }
                 if matches!(
                     world.get(sxs, sys),
-                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                    MaterialKind::Remains | MaterialKind::Corpse
                 ) && world.flags(sxs, sys) > 0
                 {
                     smell_x += dx as f32 / d as f32;
@@ -1545,16 +1631,6 @@ impl LifeSim {
             MaterialKind::Empty | MaterialKind::Gas => true,
             MaterialKind::Water => body <= SMALL_BODY_MAX,
             // 藻是悬浮的食物，**不是障碍**：鱼要能游进去吃。
-            //
-            // 曾经试过"藻不让进"（配合"藻算水"，防止鱼住在藻团里）——
-            // 结果是灾难：700 格藻散布在透光层，把 61 个生物里九成的移动
-            // 都挡掉了（实测 300 tick 内 3854 次 `passable` 失败，
-            // 全是藻）。藻华本来就该是能穿过去的。
-            //
-            // "鱼住在藻里"这个风险改由另一条规则挡：**不在水里的藻会消失**
-            // （见 `tick_organics`）。空气里的藻不能当踏脚石，因为
-            // 它撑不过几个 tick。
-            MaterialKind::Algae => true,
             _ => false,
         }
     }
@@ -1566,7 +1642,98 @@ impl LifeSim {
     /// 真进去时那格的东西没被挤走"的幽灵材质。
     #[inline]
     fn body_displaces(kind: MaterialKind) -> bool {
-        kind.is_fluid() || kind == MaterialKind::Algae
+        kind.is_fluid()
+    }
+
+    /// 嘴的四邻里有没有**藻**（单细胞生产者）。
+    ///
+    /// 藻是生物不是材质，所以吃它要走"捕食"那条路，而不是 `eat_remains`。
+    /// 但触发条件不一样：吃藻是**吃**（`OUT_EAT`），不是咬（Killer 细胞）。
+    /// 一条只有嘴没有牙的鱼照样该能吃藻——那是初级消费者的定义。
+    fn plankton_target(&self, world: &World, i: usize) -> Option<OrganismId> {
+        let org = &self.organisms[i];
+        for cell in &org.cells {
+            if cell.kind != CellType::Mouth {
+                continue;
+            }
+            let (x, y) = org.cell_at(cell);
+            for (dx, dy) in NEIGHBORS_4 {
+                let nx = org.wrap_x(x + dx);
+                let ny = y + dy;
+                let owner = world.owner(nx as isize, ny as isize);
+                if owner.organism == 0 || owner.organism == org.id {
+                    continue;
+                }
+                if let Some(qi) = self.organisms.iter().position(|o| o.id == owner.organism) {
+                    if self.organisms[qi].is_plankton() {
+                        return Some(owner.organism);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// 吃掉一个藻：能量转移，藻消失。
+    ///
+    /// **不留尸体**——整个被吞下去了。留尸体的话，一条鱼吃藻会在原地
+    /// 吐出一具 1 格的尸体，然后那具尸体烂成水，等于"吃藻会造水"。
+    fn eat_plankton(&mut self, eater: OrganismId, prey: OrganismId) -> bool {
+        if eater == prey {
+            return false;
+        }
+        let Some(qi) = self.organisms.iter().position(|o| o.id == prey) else {
+            return false;
+        };
+        let Some(pi) = self.organisms.iter().position(|o| o.id == eater) else {
+            return false;
+        };
+        let available = self.organisms[qi].energy;
+        if available == 0 {
+            return false;
+        }
+        // 吃不下就浪费掉——和 `eat_remains` 一样：超过上限的部分变成热。
+        let room = self.organisms[pi]
+            .max_energy()
+            .saturating_sub(self.organisms[pi].energy);
+        let gained = available.min(room);
+        if gained == 0 {
+            return false;
+        }
+        self.organisms[pi].energy += gained;
+        self.ledger.dissipated += (available - gained) as u64;
+        // 清空它的能量，然后**推迟**移除（见 `eaten_plankton` 的注释）。
+        // 能量清零是为了让同一 tick 里别的鱼不会再吃一口。
+        self.organisms[qi].energy = 0;
+        self.eaten_plankton.push(prey);
+        true
+    }
+
+    /// 清理这一 tick 被吃掉的藻。
+    fn clear_eaten_plankton(&mut self, world: &mut World) {
+        if self.eaten_plankton.is_empty() {
+            return;
+        }
+        let ids = std::mem::take(&mut self.eaten_plankton);
+        for id in ids {
+            if let Some(i) = self.organisms.iter().position(|o| o.id == id) {
+                let org = self.organisms.remove(i);
+                // **借走的水要还。** 藻出生时占住的那格水被记成"借"
+                // （`Cell::wet`），它整个被吞掉之后水就该回来。
+                // 不还的话每吃一个藻世界就少一格水——而"鱼吃藻"是常态，
+                // 于是水量会随生态活跃度单调下降。实测 600 tick 少了 1919 格。
+                let wet: Vec<(i32, i32)> = org
+                    .cells
+                    .iter()
+                    .filter(|c| c.wet)
+                    .map(|c| org.cell_at(c))
+                    .collect();
+                org.release(world);
+                for (x, y) in wet {
+                    world.set(x as isize, y as isize, MaterialKind::Water);
+                }
+            }
+        }
     }
 
     /// 找一个能吃的残骸格：任何嘴细胞的四邻。x 方向环绕。
@@ -1582,7 +1749,7 @@ impl LifeSim {
                 let ny = y + dy;
                 if matches!(
                     world.get(nx as isize, ny as isize),
-                    MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
+                    MaterialKind::Remains | MaterialKind::Corpse
                 ) {
                     return Some((nx as isize, ny as isize));
                 }
@@ -1910,12 +2077,9 @@ impl LifeSim {
             // 整批鱼会被判成"不在水里"——而它们明明就在水里。
             //
             // 只认藻不认气：气泡不是介质。
-            let submerged = (0..top).rev().any(|y| {
-                matches!(
-                    world.get(xx as isize, y as isize),
-                    MaterialKind::Water | MaterialKind::Algae
-                )
-            });
+            let submerged = (0..top)
+                .rev()
+                .any(|y| matches!(world.get(xx as isize, y as isize), MaterialKind::Water));
             if !submerged {
                 return false;
             }
@@ -1971,7 +2135,7 @@ impl LifeSim {
         }
         matches!(
             world.get(xs, ys),
-            MaterialKind::Empty | MaterialKind::Gas | MaterialKind::Water | MaterialKind::Algae
+            MaterialKind::Empty | MaterialKind::Gas | MaterialKind::Water
         )
     }
 
@@ -1983,10 +2147,7 @@ impl LifeSim {
     /// 咬了一口尸体，守恒断言就差了 20 点。
     pub fn eat_remains(&mut self, world: &mut World, id: OrganismId, x: isize, y: isize) -> bool {
         let kind = world.get(x, y);
-        if !matches!(
-            kind,
-            MaterialKind::Remains | MaterialKind::Corpse | MaterialKind::Algae
-        ) {
+        if !matches!(kind, MaterialKind::Remains | MaterialKind::Corpse) {
             return false;
         }
         let Some(idx) = self.organisms.iter().position(|o| o.id == id) else {
@@ -2014,7 +2175,7 @@ impl LifeSim {
                 x,
                 y,
                 match kind {
-                    MaterialKind::Corpse | MaterialKind::Algae => MaterialKind::Water,
+                    MaterialKind::Corpse => MaterialKind::Water,
                     _ => MaterialKind::Empty,
                 },
             );
@@ -2145,6 +2306,30 @@ pub enum Tactic {
     Flee,
     /// 不理会别的生物。手工起点给非捕食者用。
     Ignore,
+}
+
+/// 浮游藻的基因组：**只繁殖，什么都不做**。
+///
+/// 没有方向偏置，所以 `pick_direction` 永远返回 `None`——藻不动。
+/// 这不是"忘了给它行为"，是它就该静止：藻是浮游植物，没有运动器官。
+///
+/// 它照样会走 `reproduce`（分裂），只不过藻走的是 `tick_plankton` 里
+/// 那条更便宜的路径——见 `LifeSim::split_plankton`。
+pub fn plankton_genome() -> Genome {
+    let mut g = Genome::blank();
+    g.weights[Genome::b_o(OUT_REPRODUCE)] = 2.0;
+    g
+}
+
+/// 固着生物的基因组：**不动，只繁殖**。
+///
+/// 和 [`plankton_genome`] 是同一个东西，分开写是因为用途不同——
+/// 藻是单格，海草是多格，而"为什么它不动"这个理由在两边不一样：
+/// 藻没有运动器官，海草**扎根**在海底。
+pub fn rooted_genome() -> Genome {
+    let mut g = Genome::blank();
+    g.weights[Genome::b_o(OUT_REPRODUCE)] = 2.0;
+    g
 }
 
 /// 一条手工设计的"食腐鱼"的大脑。
@@ -2329,7 +2514,14 @@ pub fn stock_surface(
         // 慢慢产生变异——那要等很多代。播种时给一点抖动，选择从第一 tick 就开始。
         // 幅度刻意压小（sigma 0.12）：大一点就会把手工设计的"会游、会吃"打散，
         // 鱼连基本行为都没有，选择也就无从谈起。
-        let mut genome = handcrafted_fish_genome(tactic_of(&cells));
+        // 没有移动细胞的身体是**固着的**（海草）。给它一份"不动、只繁殖"
+        // 的基因组，而不是鱼的——鱼的那份里有一整套趋光和巡航权重，
+        // 装进一株海草身上会让它试图游走，然后每一格都被水陆判据拦住。
+        let mut genome = if cells.iter().any(|c| c.kind == CellType::Mover) {
+            handcrafted_fish_genome(tactic_of(&cells))
+        } else {
+            rooted_genome()
+        };
         genome.mutate(
             &mut Rng::new(0xF15E_0000 ^ (k as u64).wrapping_mul(0x9E37_79B9)),
             0.35,
@@ -2399,13 +2591,14 @@ mod tests {
             + world.occupied_count()
             + world.count_of(MaterialKind::Remains)
             + world.count_of(MaterialKind::Corpse)
-            + world.count_of(MaterialKind::Algae)
     }
 
     #[test]
     fn spawn_claims_every_cell() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何，不是生态。藻一长出来占格数就变了。
+        sim.set_food_growth(false);
         let org = LifeSim::simple_fish((20, 35), Genome::blank(), 100);
         let id = sim.spawn_injected(&mut w, org).unwrap();
         assert_eq!(w.occupied_count(), 3);
@@ -2431,6 +2624,7 @@ mod tests {
     fn starvation_turns_the_body_into_remains() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         // 生产者放进深水（光很弱）+ 没有嘴 = 必然饿死。
         let org = LifeSim::simple_fish((20, 50), Genome::blank(), 6);
         let id = sim.spawn_injected(&mut w, org).unwrap();
@@ -2632,6 +2826,8 @@ mod tests {
     fn a_fish_wraps_around_the_right_edge() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何，不是生态。藻一长出来占格数就变了。
+        sim.set_food_growth(false);
         // 64 宽的世界，锚点 63 向右走一格应当回到 0。
         let id = sim.spawn_injected(&mut w, swimmer((63, 40), 500)).unwrap();
         sim.step(&mut w);
@@ -2643,6 +2839,8 @@ mod tests {
     fn a_fish_wraps_around_the_left_edge() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何，不是生态。藻一长出来占格数就变了。
+        sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((0, 40), 500)).unwrap();
         // 强行让它往左走一步。
         {
@@ -2659,6 +2857,8 @@ mod tests {
     fn wrapping_keeps_the_body_inside_the_world() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何，不是生态。藻一长出来占格数就变了。
+        sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((62, 40), 5000)).unwrap();
 
         for _ in 0..200 {
@@ -2680,6 +2880,7 @@ mod tests {
         let mut w = pool();
         let before = water_volume(&w);
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((62, 40), 5000)).unwrap();
 
         for _ in 0..300 {
@@ -2840,6 +3041,8 @@ mod tests {
     fn a_swimming_fish_never_tears_its_body() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何，不是生态。藻一长出来占格数就变了。
+        sim.set_food_growth(false);
         sim.spawn_injected(&mut w, swimmer((10, 40), 500)).unwrap();
 
         for _ in 0..50 {
@@ -2853,6 +3056,8 @@ mod tests {
         let mut w = pool();
         let before = water_volume(&w);
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何与体积账，不是生态。
+        sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((10, 40), 5000)).unwrap();
 
         // 出生"借走"两格水：水位会掉两格，但总量守恒。
@@ -2944,6 +3149,8 @@ mod tests {
         for plan in PLANS {
             let mut w = pool();
             let mut sim = LifeSim::new(&mut w);
+            // 关掉播种：这条测的是几何与体积账，不是生态。
+            sim.set_food_growth(false);
             let volume = water_volume(&w);
             let id = sim
                 .spawn_injected(
@@ -2984,6 +3191,8 @@ mod tests {
         let plan = &crate::body::SILVERFISH;
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是几何与体积账，不是生态。
+        sim.set_food_growth(false);
         let id = sim
             .spawn_injected(
                 &mut w,
@@ -3041,44 +3250,42 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // 藻席与嗅觉
+    // 浮游藻
     // -----------------------------------------------------------------------
 
-    /// 藻长在**水里**、带着能量（鱼才愿意吃）。
+    /// 藻是**生物**：播种之后世界里多出若干个单格生产者。
     #[test]
-    fn algae_grow_in_the_water_and_carry_energy() {
+    fn plankton_is_seeded_as_single_cell_producers() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
-        let before = sim.audit(&w).injected;
-
-        // 两层都要推进：`tick_organics` 按 `world.tick()` 取模决定扫不扫，
-        // 而推进 tick 的是**材质层**（`MaterialSim::step`）。只跑生命层的话
-        // tick 永远是 0，于是"每 25 tick 一次"变成"每 tick 一次"——
-        // 这个坑在测试里比在游戏里更容易踩到。
         let mut material = crate::sim::MaterialSim::new();
         for _ in 0..600 {
             sim.step(&mut w);
             material.step(&mut w);
         }
 
-        let algae = w.count_of(MaterialKind::Algae);
-        assert!(algae > 10, "水里应当长出藻，实际 {algae} 格");
-        // 每一格藻都是新注入的能量，账上必须看得到。
         assert!(
-            sim.audit(&w).injected > before,
-            "藻的能量必须记进注入，否则守恒断言会报'多了 N 点'"
+            sim.stats().plankton > 5,
+            "水里应当长出藻，实际 {} 个",
+            sim.stats().plankton
         );
-        assert!(sim.audit(&w).is_balanced(), "长藻不能破坏能量账");
+        // 每一个藻都必须是**一格生产者**——那是它的定义，不是巧合。
+        for org in sim.organisms() {
+            if org.is_plankton() {
+                assert_eq!(org.cells.len(), 1);
+                assert_eq!(org.cells[0].kind, CellType::Producer);
+            }
+        }
+        assert!(sim.audit(&w).is_balanced(), "播种不能破坏能量账");
     }
 
-    /// 藻**只长在水里**：空气里一格都不该有。
+    /// 藻**只出现在水里**。
     ///
-    /// 这条比"长在某个特定位置"更重要：藻是可移动的，所以它最终停在哪
-    /// 由水流决定，断言"必须贴着海底"会随实现变化而失效。而"绝不在空气里"
-    /// 是**不变量**——它保证藻不会飘到天上，变成一个谁也吃不到、
-    /// 还把能量锁死的状态。
+    /// 这条是"藻不再是材质"之后仍然要守的不变量：播种只在 `Water` 格上做，
+    /// 而藻自己不动，所以它不可能跑到空气里。如果哪天它跑出去了，
+    /// 说明有人给了它一条不该有的移动通路。
     #[test]
-    fn algae_never_grow_in_the_air() {
+    fn plankton_never_ends_up_in_the_air() {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         let mut material = crate::sim::MaterialSim::new();
@@ -3087,82 +3294,75 @@ mod tests {
             material.step(&mut w);
         }
 
-        let (ww, h) = (w.width(), w.height());
         let mut found = 0;
-        for y in 0..h {
-            for x in 0..ww {
-                let (xs, ys) = (x as isize, y as isize);
-                if w.get(xs, ys) != MaterialKind::Algae {
-                    continue;
-                }
-                found += 1;
-                // 四邻里至少得有一格是水或藻：藻是悬浮**在水里**的。
-                //
-                // 判据不能写成"上下左右全是水"：藻会一路被水顶到最上面那一行，
-                // 于是它上面是空气、旁边是别的藻——那完全正常。
-                // 真正要排除的是"四周全是空气"，也就是飘到天上了。
-                let in_water = [(1, 0), (-1, 0), (0, 1), (0, -1)].iter().any(|&(dx, dy)| {
-                    matches!(
-                        w.get(xs + dx, ys + dy),
-                        MaterialKind::Water | MaterialKind::Algae
-                    )
-                });
-                assert!(in_water, "({x}, {y}) 的藻四周没有水——它飘出水面了");
+        for org in sim.organisms() {
+            if !org.is_plankton() {
+                continue;
             }
+            found += 1;
+            let (x, y) = org.anchor;
+            // **不能断言"锚点那格现在是水"**：藻的身体占住了那一格，
+            // 材质已经变成 `Empty`（水被借走了）。要验的是"它借的是一格水"，
+            // 而那记在 `Cell::wet` 上。
+            assert!(
+                org.cells[0].wet,
+                "藻在 ({x}, {y}) 出生时没占到水——它不该长在那儿"
+            );
         }
         assert!(found > 0, "六百 tick 之后应当有藻");
     }
 
-    /// 鱼**能游进**藻里，而且那格藻被挤到别处，不是被销毁。
+    /// 鱼**吃**藻：能量从藻转到鱼，藻消失，而且不留尸体。
     ///
-    /// 这一条是"藻不能当墙"的验收：如果藻是固体，鱼会被挡住；如果藻是
-    /// 液体但占格时被直接清掉，能量账会差一截（藻的能量记在 `flags` 里）。
+    /// 这是"藻是生物"之后最要紧的一条：它把 `eat_remains`（吃材质）
+    /// 和"吃活的东西"分开了。藻被吃掉不留尸体——留的话，一条鱼吃藻
+    /// 会在原地吐出一具 1 格尸体，尸体烂成水，等于"吃藻会造水"。
     #[test]
-    fn a_fish_swims_into_algae_and_pushes_it_aside() {
+    fn a_fish_eats_a_plankton_cell() {
         let mut w = pool();
-        // 在鱼正前方放一格藻。
-        w.set(24, 40, MaterialKind::Algae);
-        w.set_flags(24, 40, FOOD_ENERGY as u8);
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
-        // 只往右游、**不吃**：`forward_genome` 的 `OUT_EAT` 是开的，
-        // 用它的话测到的会是"鱼把藻吃了"，而不是"鱼把藻挤开了"。
-        let mut grazer = Genome::blank();
-        grazer.weights[Genome::b_o(OUT_RIGHT)] = 2.0;
-        let mut fish = Organism::new(
+        // 鱼在 (20,40)，嘴朝右；藻放在 (22,40) —— 嘴的右邻。
+        let mut alga = Organism::new(
             0,
-            (20, 40),
-            vec![
-                Cell::new(CellType::Mover, (0, 0)),
-                Cell::new(CellType::Mouth, (1, 0)),
-            ],
-            grazer,
+            (22, 40),
+            vec![Cell::new(CellType::Producer, (0, 0))],
+            plankton_genome(),
         );
-        fish.energy = 500;
-        let id = sim.spawn_injected(&mut w, fish).unwrap();
-        // 快照放在投放**之后**：投放会把鱼的能量记成注入，
-        // 放在之前比出来的差值里会混进那 500 点。
-        let before = sim.audit(&w);
+        alga.energy = 80;
+        let prey = sim.spawn_injected(&mut w, alga).unwrap();
 
-        for _ in 0..6 {
+        let mut fish = LifeSim::simple_fish((20, 40), forward_genome(), 500);
+        fish.facing = crate::life::Facing::RIGHT;
+        let id = sim.spawn_injected(&mut w, fish).unwrap();
+        let before = sim.audit(&w);
+        let fish_before = sim.organism(id).unwrap().energy;
+
+        for _ in 0..4 {
             sim.step(&mut w);
         }
 
-        let x = sim.organism(id).unwrap().anchor.0;
-        assert!(x > 21, "鱼应当游过那一格藻，实际停在 x={x}");
-        // 藻还在世界里，只是被挤开了——能量一格不少。
-        assert_eq!(w.count_of(MaterialKind::Algae), 1, "藻被销毁了");
-        // 比的是**相对量**：手工塞进世界的那格藻不在 `LifeSim::new` 的
-        // 初始账里（它只把 worldgen 的碎屑折成注入），所以绝对值本来就差 120。
-        // 这一条要验的是"挤开动作本身没有增减能量"，相对比较才是对的判据。
-        let after = sim.audit(&w);
-        assert_eq!(
-            after.accounted(),
-            before.accounted(),
-            "挤开不该改变能量：{} → {}",
-            before.accounted(),
-            after.accounted()
+        assert!(
+            sim.organism(prey).is_none(),
+            "藻应当被吃掉（它只有一格，吃完就没了）"
         );
+        let fish_after = sim.organism(id).unwrap().energy;
+        assert!(
+            fish_after > fish_before - 20,
+            "吃掉藻之后能量应当补回来：{fish_before} → {fish_after}"
+        );
+        // 不留尸体：世界里的尸体数不该因为"吃了一顿"而增加。
+        assert_eq!(
+            w.count_of(MaterialKind::Corpse),
+            0,
+            "藻被吞下去了，不该留下尸体"
+        );
+        let after = sim.audit(&w);
+        assert!(after.is_balanced(), "差额 {}", after.leak());
+        // 不能断言 `after <= before`：这 4 tick 里鱼的生产者细胞在晒光，
+        // 注入是正常增长。要验的是"吃藻没有额外造能量"，而守恒断言
+        // （`is_balanced`）已经覆盖了那一条。
+        assert!(after.injected >= before.injected, "光注入不该倒退");
     }
 
     /// 嗅觉：闻得到水后面的食物，闻不到石头后面的。
@@ -3170,7 +3370,7 @@ mod tests {
     fn smell_goes_through_water_but_not_through_stone() {
         let mut w = pool();
         w.set(20, 45, MaterialKind::Remains);
-        w.set_flags(20, 45, FOOD_ENERGY as u8);
+        w.set_flags(20, 45, crate::life::REMAINS_ENERGY as u8);
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
         let id = sim.spawn_injected(&mut w, swimmer((20, 40), 400)).unwrap();
@@ -3233,22 +3433,21 @@ mod tests {
     /// 单元测试里用 `pool()` 是平底，真实地貌有沙层、有起伏的海床、
     /// 还有岛坡。条件写得太紧（比如只认石头）时，平底能过长、真地貌不长。
     #[test]
-    fn algae_grow_in_a_generated_sea() {
+    fn plankton_seeds_in_a_generated_sea() {
         let mut w = World::new(128, 128).unwrap();
         crate::worldgen::sea_and_islands(&mut w, &mut Rng::new(7));
         let mut sim = LifeSim::new(&mut w);
         let mut material = crate::sim::MaterialSim::new();
-        let before = sim.food_cells(&w);
 
         for _ in 0..2000 {
             sim.step(&mut w);
             material.step(&mut w);
         }
 
-        let after = sim.food_cells(&w);
         assert!(
-            after > before + 20,
-            "真实的海里应当长出藻：{before} → {after}"
+            sim.stats().plankton > 10,
+            "真实的海里应当长出藻，实际 {} 个",
+            sim.stats().plankton
         );
         assert!(sim.audit(&w).is_balanced());
     }
@@ -3265,6 +3464,8 @@ mod tests {
         w.set(30, 40, MaterialKind::Corpse);
         w.set_flags(30, 40, 60);
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是尸体腐烂，藻的尸体会混进 `count_of(Corpse)`。
+        sim.set_food_growth(false);
         let injected = sim.audit(&w).injected;
         assert_eq!(injected, 60, "尸体的能量要算进初始注入");
 
@@ -3318,6 +3519,7 @@ mod tests {
         w.fill_rect(36, 40, 24, 1, MaterialKind::Corpse); // 24 格湿尸体
 
         let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
         let mut material = crate::sim::MaterialSim::new();
         for _ in 0..600 {
             sim.step(&mut w);
@@ -3345,6 +3547,8 @@ mod tests {
         assert_eq!(w.count_of(MaterialKind::Corpse), 60);
 
         let mut sim = LifeSim::new(&mut w);
+        // 关掉播种：这条测的是尸体腐烂，藻的尸体会混进 `count_of(Corpse)`。
+        sim.set_food_growth(false);
         let mut material = crate::sim::MaterialSim::new();
         for _ in 0..6000 {
             sim.step(&mut w);
@@ -3521,8 +3725,8 @@ mod tests {
             let mut w = pool();
             if food {
                 // 正下方 22 格：基础半径 20 够不着，加一只眼刚好够。
-                w.set(20, 52, MaterialKind::Algae);
-                w.set_flags(20, 52, FOOD_ENERGY as u8);
+                w.set(20, 52, MaterialKind::Remains);
+                w.set_flags(20, 52, crate::life::REMAINS_ENERGY as u8);
             }
             let mut sim = LifeSim::new(&mut w);
             sim.set_food_growth(false);

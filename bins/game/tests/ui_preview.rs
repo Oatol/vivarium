@@ -40,7 +40,6 @@ fn demo_snapshot() -> Snapshot {
     census[vivarium_core::MaterialKind::Gas.as_u8() as usize] = 412;
     census[vivarium_core::MaterialKind::Remains.as_u8() as usize] = 2_791;
     census[vivarium_core::MaterialKind::Corpse.as_u8() as usize] = 812;
-    census[vivarium_core::MaterialKind::Algae.as_u8() as usize] = 318;
 
     let mut cells = [0usize; vivarium_core::CellType::COUNT];
     cells[vivarium_core::CellType::Producer.as_u8() as usize] = 5;
