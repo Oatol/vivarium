@@ -533,8 +533,25 @@ fn ui_preview_png() {
     //
     //    这条是布局的核心不变量：世界是主角，界面只是框。被面板盖住
     //    不会报任何错，画面却会变成"一堆面板"。
-    let centre = px(W / 2, (top + (H - con - pal)) / 2);
-    assert_ne!(centre, panel, "中央被面板盖住了：{}", hex(centre));
+    //
+    //    判据不能取**单个**像素：悬停读数框就画在世界中央，而它的底色
+    //    正好也是面板色。实测 `PALETTE_H` 差 4px（世界区跟着挪 2px）
+    //    就能让同一个点从"通过"变成"失败"——这不是布局坏了，是判据太窄。
+    //    改成扫一整条竖线，要求绝大部分不是面板色。
+    let world_h = H - con - pal;
+    let mut panel_like = 0u32;
+    let mut total = 0u32;
+    for y in (top + 2)..(world_h - 2) {
+        let c = px(W / 2, y);
+        if (0..3).all(|i| c[i].abs_diff(panel[i]) <= 1) {
+            panel_like += 1;
+        }
+        total += 1;
+    }
+    assert!(
+        panel_like * 10 < total,
+        "中央被面板盖住了：竖线 {total} 个像素里有 {panel_like} 个是面板色"
+    );
 
     // 3. 调色板里每种材质 / 细胞的色块都要**真的画出来**。
     //

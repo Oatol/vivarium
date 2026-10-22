@@ -676,7 +676,7 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
             // 而后者才是新手要学的部分。放在色块下面单独一行，
             // 因为描述有三四十个字，挤在色块之间会把布局撑破。
             ui.add_space(1.0);
-            ui.horizontal(|ui| {
+            let desc = ui.horizontal(|ui| {
                 let (name, text) = match peek {
                     Some(kind) => (cell_label(kind), kind.describe()),
                     None => (material_label(state.material), state.material.describe()),
@@ -689,6 +689,35 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                 );
             });
             hairline_top(ui);
+
+            // 内容比面板高会怎样？**不会报错，会被下面的控制台盖住。**
+            // 面板是固定高度的，溢出的那半行正好落在控制台的背景上——
+            // 看起来像"控制台压住了描述"，而真正的原因是这里多了一行。
+            // 所以让它在测试里立刻炸，而不是等人用眼睛发现。
+            //
+            // 判据只能取**描述行自己的矩形**：
+            // - `ui.min_rect()` 不行——它会被 `max_rect` 夹住（实测内容 67、
+            //   面板 66，两者高度都报 66），永远测不出溢出；
+            // - `ui.cursor()` 也不行——它含 `item_spacing.y`，正常布局下就已经
+            //   越过面板底 1px，判据会永远红。
+            // 而 `desc.response.rect` 就是那一行实际占的地方，没有夹、没有间距。
+            debug_assert!(
+                desc.response.rect.bottom() <= ui.max_rect().bottom() + 0.5,
+                "描述行底部 {:.1} 越过面板底部 {:.1}：它会被下面的控制台盖住",
+                desc.response.rect.bottom(),
+                ui.max_rect().bottom()
+            );
+            // 调高度时的量尺：`VIVARIUM_LAYOUT=1` 打印"描述行还剩多少余量"。
+            // 和 `VIVARIUM_HOVER` 一个思路——布局类问题只看代码猜不准，
+            // 但也不该为此改一次代码量一次。
+            if std::env::var("VIVARIUM_LAYOUT").is_ok() {
+                println!(
+                    "调色板 描述底 {:.1} / 面板底 {:.1} / 余量 {:.1}",
+                    desc.response.rect.bottom(),
+                    ui.max_rect().bottom(),
+                    ui.max_rect().bottom() - desc.response.rect.bottom()
+                );
+            }
         });
 }
 
@@ -696,8 +725,9 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
 ///
 /// **高度必须和色块一样**（`SWATCH + 16`），而且要自己画、自己垂直居中。
 /// 用 `ui.label` 会有个很隐蔽的副作用：`ui.horizontal` 的垂直居中按
-/// **当前行高**算，而行高在 `vsep`（`PALETTE_H - 16`）那里被撑高了——
-/// 于是分隔线之后的"细胞图例"会沉到行的底部，和色块下面的标签挤在一起。
+/// **当前行高**算，而行高会被同一行里最高的元素撑高——于是分隔线之后的
+/// "细胞图例"会沉到行的底部，和色块下面的标签挤在一起。
+/// 所以 `caption` 和 `vsep` 都得钉死在 `SWATCH + 16`。
 fn caption(ui: &mut Ui, text: &str) {
     let font = egui::FontId::new(theme::TITLE_SIZE, egui::FontFamily::Proportional);
     let galley = ui
@@ -712,9 +742,15 @@ fn caption(ui: &mut Ui, text: &str) {
     );
 }
 
+/// 调色板里的竖直分隔线。
+///
+/// 高度**必须等于这一行**（`SWATCH + 16`，和 `caption` 同高），不能写
+/// `PALETTE_H - 16`。写面板高度会把这一个元素撑到几乎整个面板，
+/// `ui.horizontal` 的行高跟着涨到 72，于是**下一行**（描述）被推出面板，
+/// 落在下面控制台的背景上——看起来像"控制台压住了描述"。
 fn vsep(ui: &mut Ui) {
     let (r, _) = ui.allocate_exact_size(
-        egui::vec2(1.0, theme::PALETTE_H - 16.0),
+        egui::vec2(1.0, theme::SWATCH + 16.0),
         egui::Sense::hover(),
     );
     ui.painter().line_segment(
