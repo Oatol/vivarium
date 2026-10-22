@@ -366,7 +366,7 @@ fn main() -> ExitCode {
             let s = sim.stats();
             let l = life.stats();
             println!(
-                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  体型 {:>2}-{:<2}  飘 {:>2}  杀手 {:>2}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
+                "  [{:>8}/{}]  hash {:#018x}  活跃块 {:>3}/{}  移动 {:>6}  反应 {:>5}  生物 {:>3}  体型 {:>2}-{:<2}  飘 {:>2}  杀手 {:>2}  落 {:>3}  能量 {:>6}  代数 {:>3}(均 {:.1})  |  {}",
                 i + 1,
                 args.ticks,
                 world.hash(),
@@ -379,6 +379,7 @@ fn main() -> ExitCode {
                 l.max_cells,
                 l.stranded,
                 l.killers,
+                l.fell,
                 l.energy,
                 l.max_generation,
                 l.avg_generation,
@@ -458,6 +459,7 @@ fn main() -> ExitCode {
     let mt = life.moved_total();
     let total: u64 = mt.iter().sum();
     if total > 0 {
+        println!("  重力累计下落 {} 次", life.fell_total());
         println!(
             "移动累计  左 {} 右 {} 上 {} 下 {}  （垂直占 {:.1}%）",
             mt[0],

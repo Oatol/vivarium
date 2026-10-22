@@ -446,6 +446,13 @@ pub struct LifeStats {
     pub eaten: u32,
     /// 本 tick 发生的捕食次数（一枚杀手细胞咬到一口算一次）。
     pub bitten: u32,
+    /// 本 tick 有多少个体**因为重力下落**了一格。
+    ///
+    /// 和 `moved` 分开：混在一起会把"垂直移动占比"污染成
+    /// "有多少东西正在往下掉"，而那是两件完全不同的事。
+    /// 正常状态下它应当接近 0——只有被放在半空、或者被水挤出水面的
+    /// 个体才会掉。
+    pub fell: u32,
     /// 本 tick 四个方向的移动次数：`[左, 右, 上, 下]`。
     ///
     /// 这个数组是"二维移动到底有没有发生"的唯一直接证据。
@@ -509,6 +516,22 @@ pub struct LifeStats {
     pub stranded: usize,
 }
 
+/// 一次位移是**主动游动**还是**被重力拉下来**。
+///
+/// 两者的差别不只是"扣不扣能量"，还有一条更关键的：**水陆判据只拦前者**。
+///
+/// 没有这个区分时，玩家把鱼放在半空，它会**原地冻结**——因为
+/// `touches_water` 要求身体在水里，而任何一步移动都在空气里，于是
+/// 每个方向都被拒绝。表现是"放下去之后它一动不动，像被钉住了"，
+/// 而那不是物理，是判据用错了地方。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MoveKind {
+    /// 主动游动：要花能量，且必须留在水里。
+    Swim,
+    /// 被重力拉着下落：不花能量，不受水陆判据约束。
+    Fall,
+}
+
 /// 生命层调度器。
 #[derive(Debug)]
 pub struct LifeSim {
@@ -528,6 +551,8 @@ pub struct LifeSim {
     /// 大部分 tick 在转身、被挡、或者刚出生）。累计值才能回答
     /// "垂直方向到底有没有在用"。
     moved_total: [u64; 4],
+    /// 累计下落次数。
+    fell_total: u64,
 }
 
 impl Default for LifeSim {
@@ -545,6 +570,7 @@ impl Default for LifeSim {
             stats: LifeStats::default(),
             food_growth: true,
             moved_total: [0; 4],
+            fell_total: 0,
         }
     }
 }
@@ -583,6 +609,7 @@ impl LifeSim {
             stats: LifeStats::default(),
             food_growth: true,
             moved_total: [0; 4],
+            fell_total: 0,
         }
     }
 
@@ -801,6 +828,13 @@ impl LifeSim {
 
         // 1b) 尸体腐烂 + 藻的生长。第二条能量注入通道，见 `tick_organics`。
         self.tick_organics(world);
+
+        // 1c) 重力：不在水里的先掉下来。
+        //
+        // 放在行为**之前**：一条刚被放进空气的鱼，这一 tick 先被拉下来一格，
+        // 落水之后同一 tick 就能正常游。反过来（先行为）它会被水陆判据
+        // 拦住一整轮，白等一 tick。
+        self.apply_gravity(world);
 
         // 2) 行为。
         self.act(world);
@@ -1268,6 +1302,44 @@ impl LifeSim {
     /// 顺序按编号（= 加入顺序），不按位置。位置顺序会让"谁先动"取决于地图，
     /// 而地图每 tick 都在变，于是同一个种子跑两遍结果不同。编号顺序是稳定的，
     /// 而且它天然表达"老个体先动"。
+    /// 重力：**不在水里的身体会往下掉**。
+    ///
+    /// ## 为什么必须有这一条
+    ///
+    /// 玩家把鱼放在半空时，它会原地冻结——因为 `touches_water` 拦住了
+    /// 所有主动移动（任何一步都在空气里）。那不是物理，是判据用错了地方：
+    /// 水陆判据回答的是"它能不能**游**"，不是"它能不能**存在**"。
+    ///
+    /// ## 为什么掉一格，不加速
+    ///
+    /// 真正的自由落体是加速的。但在这个世界里一格就是一次位置更新，
+    /// 512 格高的世界里从水面掉到海床也只要几百 tick——加上加速度
+    /// 反而会让"看着它掉下去"变成"一眨眼就没了"。而且每 tick 一格
+    /// 不会穿模：每一格都单独验通行性。
+    ///
+    /// ## 落在固体上会怎样
+    ///
+    /// 停住，然后**搁浅**。它仍然不在水里，所以既不能游也不能再生，
+    /// 但维持成本照扣——于是它会在原地饿死、变成尸体。那正是
+    /// "鱼离开水会死"该有的样子，比"悬在空中冻结"诚实得多。
+    fn apply_gravity(&mut self, world: &mut World) {
+        for i in 0..self.organisms.len() {
+            let cells: Vec<(i32, i32)> = self.organisms[i].footprint().collect();
+            let width = self.organisms[i].width;
+            if Self::touches_water(world, width, &cells) {
+                continue;
+            }
+            // 往下掉一格。`MoveKind::Fall` 会跳过水陆判据、也不扣能量。
+            self.try_move(world, i, 0, 1, MoveKind::Fall);
+        }
+    }
+
+    /// 累计下落次数。这是"重力有没有在工作"的直接证据。
+    #[inline]
+    pub fn fell_total(&self) -> u64 {
+        self.fell_total
+    }
+
     fn act(&mut self, world: &mut World) {
         for org in &mut self.organisms {
             org.acted = false;
@@ -1310,7 +1382,7 @@ impl LifeSim {
         if let Some((dx, dy)) = pick_direction(&out) {
             let speed = self.organisms[i].speed();
             for _ in 0..speed {
-                if !self.try_move(world, i, dx, dy) {
+                if !self.try_move(world, i, dx, dy, MoveKind::Swim) {
                     break;
                 }
             }
@@ -1524,7 +1596,7 @@ impl LifeSim {
     /// 分两步：**先把所有目标格验完，再动手**。半步移动会留下一个撕裂的身体，
     /// 而占格表里那些格子从此再也没人认领——那是一种"世界慢慢漏掉细胞"的 bug，
     /// 从现象上完全看不出是移动写错了。
-    fn try_move(&mut self, world: &mut World, i: usize, dx: i32, dy: i32) -> bool {
+    fn try_move(&mut self, world: &mut World, i: usize, dx: i32, dy: i32, kind: MoveKind) -> bool {
         let org = &self.organisms[i];
         let body = org.cells.len();
         // 成本由 `Organism::move_cost` 统一算：**速度每加一档，每 tick 的
@@ -1532,7 +1604,13 @@ impl LifeSim {
         //
         // 早先的写法是 `质量 / 速度`，也就是总成本不随速度涨——那样"多长
         // 移动细胞"是纯赚，体型只能朝一个方向进化。现在快慢各有代价。
-        let cost = org.move_cost();
+        // 主动游动要花钱；**下落不花**——重力做功不是鱼在使劲。
+        // 让下落扣能量会得到一个荒谬的结果：一条掉进水里的鱼因为
+        // "下落太贵"而卡在半空。
+        let cost = match kind {
+            MoveKind::Swim => org.move_cost(),
+            MoveKind::Fall => 0,
+        };
         if org.energy < cost {
             return false;
         }
@@ -1596,7 +1674,9 @@ impl LifeSim {
         //
         // 新位置内部的邻格不用担心：它们也在 `targets` 里，
         // `is_body` 会把它们排除掉，所以不会把厚身体的占比拉低。
-        if !Self::touches_water(world, org.width, &targets) {
+        // 水陆判据只拦**主动移动**。下落必须放行——否则一条被放在半空的鱼
+        // 永远掉不下去，而那正是"原地冻结"的成因。
+        if kind == MoveKind::Swim && !Self::touches_water(world, org.width, &targets) {
             return false;
         }
 
@@ -1651,16 +1731,23 @@ impl LifeSim {
         }
         // 移动消耗的能量变成热离开生物可用池，必须记账。
         self.ledger.dissipated += cost as u64;
-        // 方向计数：`[左, 右, 上, 下]`。
-        let dir = match (dx.signum(), dy.signum()) {
-            (-1, _) => 0,
-            (1, _) => 1,
-            (_, -1) => 2,
-            (_, 1) => 3,
-            _ => 1,
-        };
-        self.stats.moved[dir] += 1;
-        self.moved_total[dir] += 1;
+        if kind == MoveKind::Fall {
+            // 下落单独计数：混进 `moved` 会把"垂直移动占比"这个指标污染成
+            // "有多少东西正在往下掉"，而那是两件完全不同的事。
+            self.stats.fell += 1;
+            self.fell_total += 1;
+        } else {
+            // 方向计数：`[左, 右, 上, 下]`。
+            let dir = match (dx.signum(), dy.signum()) {
+                (-1, _) => 0,
+                (1, _) => 1,
+                (_, -1) => 2,
+                (_, 1) => 3,
+                _ => 1,
+            };
+            self.stats.moved[dir] += 1;
+            self.moved_total[dir] += 1;
+        }
         true
     }
 
@@ -3559,6 +3646,128 @@ mod tests {
             sim.step(&mut w);
         }
         assert_eq!(sim.stats().bitten, 0, "银鱼没有杀手细胞，不该咬到任何东西");
+    }
+
+    // -----------------------------------------------------------------------
+    // 重力
+    // -----------------------------------------------------------------------
+
+    /// 放在半空的身体会**掉下来**，而不是原地冻结。
+    ///
+    /// 这条是玩家报的第三个 bug：把鱼放在看得见的地方（水面附近），
+    /// 而水面附近往往是空气——于是它一动不动，像被钉住了。
+    /// 根因是水陆判据拦住了**所有**移动，包括"被重力拉下去"。
+    #[test]
+    fn a_body_dropped_in_midair_falls() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // pool() 的水在 y=30..59，这条鱼放在 y=12 的空气里。
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 12), Genome::blank(), 500))
+            .unwrap();
+        assert_eq!(sim.organism(id).unwrap().anchor.1, 12);
+
+        for _ in 0..10 {
+            sim.step(&mut w);
+        }
+
+        let y = sim.organism(id).unwrap().anchor.1;
+        assert!(y > 15, "放在半空的身体应当往下掉，实际只到 y={y}");
+        assert!(sim.fell_total() > 0, "下落要被数出来，否则看不出重力在工作");
+    }
+
+    /// 掉进水里就停，然后开始正常游。
+    ///
+    /// 这是上一条的另一半：只做"下落"不做"停"，鱼会一路穿过水面掉到海床。
+    #[test]
+    fn a_body_stops_falling_once_it_is_in_the_water() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 12), Genome::blank(), 500))
+            .unwrap();
+
+        // 掉 80 tick 足够穿过水面并沉进去。
+        for _ in 0..80 {
+            sim.step(&mut w);
+        }
+
+        let org = sim.organism(id).unwrap();
+        let cells: Vec<(i32, i32)> = org.footprint().collect();
+        assert!(
+            LifeSim::touches_water(&w, org.width, &cells),
+            "掉进水里之后应当算'在水里'，锚点在 y={}",
+            org.anchor.1
+        );
+        // 而且不再继续往下掉（水面 30、海床 60，它该停在水体里）。
+        assert!(
+            org.anchor.1 < 58,
+            "它不该一路穿过整个水体掉到海床上，实际 y={}",
+            org.anchor.1
+        );
+    }
+
+    /// 下落**不花能量**——重力不是鱼在使劲。
+    ///
+    /// 反过来说：如果下落扣能量，一条掉进深水的鱼会因为"下落太贵"
+    /// 而卡在半空，而那正是这条规则要修的那个 bug 的另一个版本。
+    #[test]
+    fn falling_costs_no_energy() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 12), Genome::blank(), 500))
+            .unwrap();
+        // 把能量设成刚好 0：连一格都游不动，但重力照样该把它拉下来。
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+        let drained = sim.organisms[i].energy;
+        sim.organisms[i].energy = 0;
+        sim.ledger.dissipated += drained as u64;
+
+        for _ in 0..5 {
+            sim.step(&mut w);
+        }
+
+        let y = sim.organism(id).unwrap().anchor.1;
+        assert!(y > 12, "没有能量也该被重力拉下来，实际 y={y}");
+    }
+
+    /// 落在陆地上的身体**搁浅**：动不了，而且会饿死。
+    ///
+    /// 这是"鱼离开水会死"该有的样子——比"悬在空中冻结"诚实。
+    #[test]
+    fn a_body_stranded_on_land_starves() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 石头上方一格（pool 的石头从 y=60 开始，水面在 30）。
+        // 先把水抽干，做成"一块露出水面的陆地"。
+        w.fill_rect(0, 30, 64, 30, MaterialKind::Empty);
+        // 能量给足：这条测的是"搁浅"，不是"多久饿死"。40 点撑不到
+        // 它掉下去就先饿死了，而那会让断言看起来像"下落没生效"。
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((20, 55), Genome::blank(), 300))
+            .unwrap();
+
+        // 它该停在石头上面（y≈57，身体三格），而不是穿进石头。
+        for _ in 0..20 {
+            sim.step(&mut w);
+        }
+        let y = sim.organism(id).unwrap().anchor.1;
+        assert!(y < 60, "不该穿进石头，实际 y={y}");
+        assert!(y >= 58, "它该一路掉到石头上面，实际 y={y}");
+
+        // 维持成本照扣，于是它会饿死（300 点 ÷ 约 9/tick ≈ 33 tick）。
+        for _ in 0..400 {
+            sim.step(&mut w);
+            if sim.organism(id).is_none() {
+                break;
+            }
+        }
+        assert!(sim.organism(id).is_none(), "搁浅的鱼应当饿死");
     }
 
     // -----------------------------------------------------------------------
