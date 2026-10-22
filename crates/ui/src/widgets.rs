@@ -297,8 +297,37 @@ pub fn swatch(
     hint: Option<&str>,
     selected: bool,
 ) -> Response {
+    chip(ui, color, label, hint, selected, true)
+}
+
+/// 图例色块：长得像色块，但**不能点**，悬停也不变色。
+///
+/// 这个区分是必须的。第一版把底部那排细胞做成了 `swatch`
+/// （`Sense::click()` + 悬停白边），于是它和上面那排材质按钮长得一模一样，
+/// 点下去却什么也不发生——玩家的第一个问题就是"这一排是干什么用的"。
+///
+/// **一个控件如果长得可以点，就必须能点。** 做不到，就把它画成不可点的样子。
+pub fn legend_chip(ui: &mut Ui, color: Color32, label: &str) -> Response {
+    chip(ui, color, label, None, false, false)
+}
+
+fn chip(
+    ui: &mut Ui,
+    color: Color32,
+    label: &str,
+    hint: Option<&str>,
+    selected: bool,
+    interactive: bool,
+) -> Response {
     let size = Vec2::new(theme::SWATCH + 10.0, theme::SWATCH + 16.0);
-    let (rect, resp) = ui.allocate_exact_size(size, Sense::click());
+    let sense = if interactive {
+        Sense::click()
+    } else {
+        Sense::hover()
+    };
+    let (rect, resp) = ui.allocate_exact_size(size, sense);
+    // 只有可点的东西才在悬停时发亮。图例跟着发亮，等于在骗人去点它。
+    let lit = interactive && resp.hovered();
 
     let chip = Rect::from_min_size(
         egui::pos2(rect.left() + 5.0, rect.top()),
@@ -327,10 +356,13 @@ pub fn swatch(
 
     let border = if selected {
         theme::WARN
-    } else if resp.hovered() {
+    } else if lit {
         Color32::WHITE
-    } else {
+    } else if interactive {
         theme::LINE_STRONG
+    } else {
+        // 图例用更暗的框：它只是"这个颜色是什么"，不是"点这里"。
+        theme::LINE
     };
     p.rect_stroke(
         chip,
@@ -343,7 +375,7 @@ pub fn swatch(
     // 会显得松松垮垮。
     let ink = if selected {
         theme::WARN
-    } else if resp.hovered() {
+    } else if lit {
         Color32::WHITE
     } else {
         theme::TEXT_DIM
@@ -357,8 +389,8 @@ pub fn swatch(
     );
 
     match hint {
-        Some(h) => resp.on_hover_text(h),
-        None => resp,
+        Some(h) if interactive => resp.on_hover_text(h),
+        _ => resp,
     }
 }
 

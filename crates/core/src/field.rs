@@ -442,16 +442,7 @@ impl AirField {
         self.scan(world);
         let n = self.temp.len();
 
-        // 1) 注入。火按"这一格里有几格在烧"成比例地加热，
-        //    所以一小簇火和一格火在滤镜上是不一样的。
-        for i in 0..n {
-            if self.fire[i] > 0 {
-                let add = FIRE_HEAT * f32::from(self.fire[i]) / (AIR_CELL * AIR_CELL) as f32;
-                self.temp[i] = (self.temp[i] + add).min(FIRE_TEMP);
-            }
-        }
-
-        // 2) 扩散。Jacobi 迭代：读旧表、写新表，再交换。
+        // 1) 扩散。Jacobi 迭代：读旧表、写新表，再交换。
         //    原地写（Gauss-Seidel）会引入方向偏置——热量朝扫描方向跑得更快，
         //    而那个偏置在温度滤镜上是**看得见的斜向拖尾**。
         for _ in 0..DIFFUSE_STEPS {
@@ -480,10 +471,34 @@ impl AirField {
             std::mem::swap(&mut self.temp, &mut self.next);
         }
 
-        // 3) 冷却。向环境温度回归，**永远**有一条出路——
+        // 2) 冷却。向环境温度回归，**永远**有一条出路——
         //    这是"封闭世界不能有吸收态"（SPEC §2.2）在热场上的版本。
         for t in self.temp.iter_mut() {
             *t += (AMBIENT_TEMP - *t) * COOLING;
+        }
+
+        // 3) 注入。火把这一格加热到「火焰温度 × 覆盖度」，**用 `max` 而不是累加**。
+        //
+        // 放在扩散和冷却**之后**，是这一版的三处修正之一。三件事都是
+        // 玩家一句"火的温度只有 22 °C"逼出来的：
+        //
+        // - **摊薄是错的**。旧实现按覆盖度线性加（`320 × 1/16 = 20`），
+        //   一格火只把粗格加热 20 度，读数 40 °C。而"这个粗格里有火"和
+        //   "这个粗格平均多少度"是两件事：1/16 是 900 度的火焰、
+        //   15/16 是 20 度的水，平均值没有意义。下限取 `FIRE_HEAT`。
+        // - **累加追不上扩散**。每 8 tick 加一次、同时被扩散拿走一半，
+        //   永远到不了火焰温度。改成 `max` 之后火灭之前温度是稳的。
+        // - **顺序**。注入放在扩散之前，刚设好的 900 度会被本 tick 的
+        //   扩散立刻摊掉一半（实测满格火只剩 623）。放到最后，
+        //   读到的就是火焰温度本身；热量从下一 tick 开始往外流。
+        for i in 0..n {
+            if self.fire[i] > 0 {
+                let coverage = f32::from(self.fire[i]) / (AIR_CELL * AIR_CELL) as f32;
+                let target = FIRE_HEAT + (FIRE_TEMP - FIRE_HEAT) * coverage;
+                if self.temp[i] < target {
+                    self.temp[i] = target;
+                }
+            }
         }
         self.revision = self.revision.wrapping_add(1);
     }
@@ -794,6 +809,38 @@ mod tests {
             "灯拿走之后水下应当回到黑暗，实测 {}",
             f.light_at(32.0, 50.0)
         );
+    }
+
+    /// 一格火也必须烫——玩家报过"火的温度只有 22 °C"。
+    ///
+    /// 旧实现按覆盖度**线性摊薄**：一格 4×4 里只有 1 格在烧，
+    /// 加热量是 `FIRE_HEAT × 1/16 = 20`，读数 40 °C。
+    /// 而"这个粗格里有火"和"这个粗格平均多少度"是两件事——
+    /// 1/16 是 900 度的火焰、15/16 是 20 度的水，平均值没有意义。
+    #[test]
+    fn even_a_single_fire_pixel_is_hot() {
+        let mut world = pool(64, 64, 0);
+        world.set(31, 31, MaterialKind::Fire);
+        let mut f = AirField::new(&world);
+        f.update_temp(&world);
+        let t = f.temp_at(31.0, 31.0);
+        assert!(t > 300.0, "一格火应当把粗格烧到几百度，实测 {t}");
+        assert!(t <= FIRE_TEMP, "不能超过火焰温度，实测 {t}");
+    }
+
+    /// 一整格都在烧，就该到火焰温度。
+    #[test]
+    fn a_full_block_of_fire_reaches_the_flame_temperature() {
+        let mut world = pool(64, 64, 0);
+        for y in 32..36 {
+            for x in 32..36 {
+                world.set(x, y, MaterialKind::Fire);
+            }
+        }
+        let mut f = AirField::new(&world);
+        f.update_temp(&world);
+        let t = f.temp_at(33.0, 33.0);
+        assert!((t - FIRE_TEMP).abs() < 1.0, "满格火应当到 {FIRE_TEMP}，实测 {t}");
     }
 
     #[test]

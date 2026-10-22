@@ -362,6 +362,13 @@ struct Game {
     cursor: Option<(f64, f64)>,
     /// 左键按着，而且当前工具会落笔。
     painting: bool,
+    /// 这一帧改过世界，所以空气场要在画之前重算一遍。
+    ///
+    /// 场是按 `tick % INTERVAL` 刷的，而**暂停时 tick 不走**。玩家画了一把火、
+    /// 把指针放上去，读数是 22 °C——不是温度算错了，是场还停在画之前。
+    /// 同理"放了灯却没亮"。所以任何改动世界的操作都置这个标记，
+    /// 在渲染前统一刷一次（1.6 ms，只在真的画了东西的那一帧付）。
+    field_dirty: bool,
     /// 本次落笔一共抹掉了几个生物。**松开时才写进控制台**——
     /// 拖着一路擦过鱼群会在一次拖动里触发几十次，逐次打印会把控制台刷满。
     erased: usize,
@@ -435,6 +442,7 @@ impl Game {
             pending_body: None,
             cursor: None,
             painting: false,
+            field_dirty: false,
             erased: 0,
             last_paint: None,
             pan_anchor: None,
@@ -800,6 +808,7 @@ impl Game {
     fn stamp(&mut self, x: i32, y: i32, kind: MaterialKind) {
         let r = self.ui.state.brush as i32;
         stamp_circle(&mut self.world, x, y, r, kind);
+        self.field_dirty = true;
     }
 
     /// 生物橡皮：把圆里的**有机体**整个抹掉。
@@ -829,6 +838,8 @@ impl Game {
         }
         let removed = self.life.remove_organisms(&mut self.world, &victims);
         self.erased += removed;
+        // 身体借走的水还回来了，材质变了——场要重算。
+        self.field_dirty |= removed > 0;
     }
 
     /// 油漆桶：把和 `(x, y)` 连成一片的同种材质换成当前材质。
@@ -840,6 +851,7 @@ impl Game {
             _ => self.ui.state.material,
         };
         let (filled, capped) = flood_fill_region(&mut self.world, x, y, kind, FILL_CAP);
+        self.field_dirty |= filled > 0;
         let tick = self.world.tick();
         if capped {
             self.ui.log(
@@ -915,6 +927,7 @@ impl Game {
             }
         }
         println!("点火：岛峰 x={peak} 附近放了 {lit} 格火");
+        self.field_dirty |= lit > 0;
     }
 
     /// 在水面附近放一批鱼。
@@ -992,6 +1005,13 @@ impl Game {
         }
 
         // --- 画 -----------------------------------------------------------
+        //
+        // 画笔改过世界就先刷一次场。**不能等 `% INTERVAL`**：暂停时 tick 不走，
+        // 玩家画了一把火、把指针放上去，读数是 22 °C——看起来完全像温度算错了。
+        if self.field_dirty {
+            self.life.refresh_field(&self.world);
+            self.field_dirty = false;
+        }
         //
         // 场要**先**传上去：着色器在材质 / 温度 / 光照 / 物种四种滤镜里
         // 都可能读它，而上传是按版本号跳过的，没变就什么都不做。

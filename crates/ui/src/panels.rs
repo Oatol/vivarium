@@ -390,13 +390,19 @@ fn top_bar(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     if resp.clicked() {
                         want_view = Some(mode);
                     }
-                    resp.on_hover_text(format!("{}\n\n（V 键循环切换）", mode.describe()));
+                    // **不给 tooltip。** 顶栏在最上面，提示只能往下弹，
+                    // 正好压在世界上——切滤镜的时候那行字会盖住你要看的东西，
+                    // 而切滤镜恰恰是最需要看世界的时刻。说明改写进控制台。
                 }
                 if let Some(mode) = want_view {
                     state.view = mode;
                     state.emit(Command::SetViewMode(mode));
                     let tick = snap.tick;
-                    state.log(tick, Level::Info, format!("视图：{}", mode.describe()));
+                    state.log(
+                        tick,
+                        Level::Info,
+                        format!("视图 · {}：{}（V 键循环）", mode.label(), mode.describe()),
+                    );
                 }
 
                 // 右侧：帧率与成本。用 `right_to_left` 让它们贴右。
@@ -582,6 +588,9 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
             },
         ))
         .show(ui, |ui| {
+            // 悬停在哪一个细胞图例上。下面那行描述优先说它——
+            // 图例如果连说明都没有，就只是一排好看的色块。
+            let mut peek: Option<CellType> = None;
             ui.horizontal(|ui| {
                 ui.spacing_mut().item_spacing.x = 1.0;
 
@@ -627,19 +636,18 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                 //
                 // 但"往世界里放细胞"不该做成画笔：细胞属于某个有机体，
                 // 单独丢一格进去是一个没有身体的怪东西。投放请用「放鱼」。
-                caption(ui, "细胞");
+                //
+                // 它得**看起来**不可点（`legend_chip`：无点击、悬停不发亮、
+                // 边框更暗），否则玩家一定会去点它，然后发现什么都没发生。
+                // 悬停时把它的说明写到下面那行描述里——图例不能只是好看。
+                caption(ui, "细胞图例");
                 for kind in CellType::ALL {
                     let [r, g, b] = palette::cell_rgb(kind);
-                    let resp = widgets::swatch(
-                        ui,
-                        Color32::from_rgb(r, g, b),
-                        cell_label(kind),
-                        Some(cell_hint(kind)),
-                        false,
-                    );
-                    // 悬停才提示，点击什么也不做——用 `on_hover_text` 已经给了提示，
-                    // 这里只要把它标成"非交互"就够了。
-                    let _ = resp;
+                    let resp =
+                        widgets::legend_chip(ui, Color32::from_rgb(r, g, b), cell_label(kind));
+                    if resp.hovered() {
+                        peek = Some(kind);
+                    }
                 }
 
                 // --- 右侧：笔刷 ---
@@ -661,13 +669,13 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
             // 因为描述有三四十个字，挤在色块之间会把布局撑破。
             ui.add_space(1.0);
             ui.horizontal(|ui| {
+                let (name, text) = match peek {
+                    Some(kind) => (cell_label(kind), kind.describe()),
+                    None => (material_label(state.material), state.material.describe()),
+                };
+                ui.label(egui::RichText::new(name).size(9.5).color(theme::TEXT));
                 ui.label(
-                    egui::RichText::new(material_label(state.material))
-                        .size(9.5)
-                        .color(theme::TEXT),
-                );
-                ui.label(
-                    egui::RichText::new(state.material.describe())
+                    egui::RichText::new(text)
                         .size(9.5)
                         .color(theme::TEXT_DIM),
                 );
@@ -677,14 +685,23 @@ fn palette(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
 }
 
 /// 调色板里的小标题。
+///
+/// **高度必须和色块一样**（`SWATCH + 16`），而且要自己画、自己垂直居中。
+/// 用 `ui.label` 会有个很隐蔽的副作用：`ui.horizontal` 的垂直居中按
+/// **当前行高**算，而行高在 `vsep`（`PALETTE_H - 16`）那里被撑高了——
+/// 于是分隔线之后的"细胞图例"会沉到行的底部，和色块下面的标签挤在一起。
 fn caption(ui: &mut Ui, text: &str) {
-    ui.add_space(4.0);
-    ui.label(
-        egui::RichText::new(text)
-            .size(theme::TITLE_SIZE)
-            .color(theme::TEXT_FAINT),
+    let font = egui::FontId::new(theme::TITLE_SIZE, egui::FontFamily::Proportional);
+    let galley = ui
+        .painter()
+        .layout_no_wrap(text.to_owned(), font, theme::TEXT_FAINT);
+    let size = egui::vec2(galley.size().x + 8.0, theme::SWATCH + 16.0);
+    let (rect, _) = ui.allocate_exact_size(size, egui::Sense::hover());
+    ui.painter().galley(
+        egui::pos2(rect.left() + 4.0, rect.center().y - galley.size().y * 0.5),
+        galley,
+        theme::TEXT_FAINT,
     );
-    ui.add_space(4.0);
 }
 
 fn vsep(ui: &mut Ui) {
@@ -729,17 +746,9 @@ fn cell_label(kind: CellType) -> &'static str {
     }
 }
 
-fn cell_hint(kind: CellType) -> &'static str {
-    match kind {
-        CellType::Mouth => "嘴：吃掉邻格的食物与细胞",
-        CellType::Producer => "生产者：把光转成能量，唯一的环境入口",
-        CellType::Mover => "移动：每 4 格买 1 格速度",
-        CellType::Eye => "眼：每只加 4 格嗅觉半径",
-        CellType::Killer => "杀手：咬邻格的别的生物",
-        CellType::Armor => "装甲：每格挡掉 8 点伤害",
-        CellType::Builder => "构造器：把材质转成结构（未实现）",
-    }
-}
+// 细胞的说明只有一份：`CellType::describe()`（住在核心里）。
+// 这里曾经复制过一份，然后 Builder 在 v0.23 真的起作用了，而副本还写着
+// "未实现"——**两份文案必然漂移**，所以副本已经删掉。
 
 // ---------------------------------------------------------------------------
 // 右栏：检查器
