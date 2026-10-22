@@ -94,4 +94,4 @@ Set-Content -Path (Join-Path $dist 'VERSION.txt') -Value $info -Encoding UTF8
 Write-Host ''
 Write-Host $info -ForegroundColor DarkGray
 Write-Host ''
-Write-Step '完成。双击 dist\vivarium.exe 即可运行（按 L 放鱼）'
+Write-Step '完成。双击 dist\vivarium.exe 即可运行（按 G 开「世界」窗口）'
