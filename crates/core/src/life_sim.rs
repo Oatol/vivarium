@@ -29,6 +29,7 @@
 //! 但这条必须写在这里，免得以后有人拿"守恒测试没过"当谜题查一整天。
 
 use crate::body::{BodyPlan, PLANS};
+use crate::field::AirField;
 use crate::grn::Grn;
 use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
@@ -100,11 +101,13 @@ pub const MUTATION_RATE: f32 = 0.05;
 
 /// `IN_LIGHT` 的衰减尺度：水面下多少格降到 0。
 ///
-/// 取 180 是因为这个世界最深处（海床线 337 - 水面 153）约 184 格，
-/// 于是"海底"的光接近 0、"水面"的光是 1。**它必须与世界尺寸无关**——
-/// 早先的公式是 `1 - y / 世界高`，同一个设定点在 64² 和 512² 里
-/// 对应完全不同的深度，行为也就完全不同。
-pub const LIGHT_DEPTH: i32 = 180;
+/// **这个数字现在是光场的物理参数，不再是感知的换算系数。**
+/// 早先它只活在 `sense` 里（"头顶往上数多少格到水面"），
+/// 有了真正的光场之后，它变成 [`crate::field::SUN_ATTEN`] 的别名——
+/// 同一个数只能有一个来源，否则"光场里 180 格全黑、而鱼觉得自己还在 0.4 的光里"
+/// 这种不一致会一直存在，且没有任何测试会发现它。
+pub const LIGHT_DEPTH: i32 = crate::field::SUN_ATTEN as i32;
+
 
 /// 手工基因组瞄准的**等光线**：`IN_LIGHT` 的设定点。
 ///
@@ -170,29 +173,25 @@ pub const MOVE_THRESHOLD: f32 = 0.15;
 /// 所以用顺序 RNG，种子固定即可保证确定性。
 const LIFE_SEED: u64 = 0x5EED_1F3E;
 
-/// 光照被上方生物遮挡的检查深度（格）。
-///
-/// 这一条是种群的**负反馈**：鱼都挤在水面附近时，上面那层会挡住下面那层的光，
-/// 产出下降，繁殖自然放缓。没有它，浅水里的能量收入是恒定的，
-/// 种群就会指数爆炸——实测 256² 里 400 tick 从 4 条涨到 480 条。
-pub const SUN_SHADE_DEPTH: i32 = 12;
+// 这里原本还有四个常数：`SUN_SHADE_DEPTH` / `SUN_SHADE_RADIUS` /
+// `SHADE_SATURATION` / `MAX_SHADE`，它们实现的是"上方的生物挡住下方的光"。
+//
+// 那是**光场还不存在时的替代品**：既然没有真正的光，就用"附近有多少格身体"
+// 硬凑一个遮挡系数。有了 `field::AirField` 之后它必须被删掉，理由有三条：
+//
+// 1. 它和真实光场算的是同一件事，两份规则迟早不一致；
+// 2. 用户明确要求"生物本身先不遮挡"——遮挡只在材质层算；
+// 3. 它是个**隐形的全局负反馈**：调它的时候你不知道自己是在改物理还是在改平衡。
+//
+// 种群限制现在来自几何：生产者必须待在透光层，而透光层的格子是有限的。
 
-/// 遮挡的横向半径。
+/// 一个粗格里至少有多少比例是水，生产者才算"泡在水里"。
 ///
-/// **不能只查正上方**：手工鱼是水平游的，它们会排成一排而不是叠罗汉。
-/// 只查正上方的遮挡对这种队形完全无效（实测种群卡在 9 条，能量却条条顶格）。
-/// 查一个小方柱之后，"这一片水域有多少生物"才真的影响光照。
-pub const SUN_SHADE_RADIUS: i32 = 3;
-
-/// 多少格生物才算把光挡掉一半。
-///
-/// 12 太狠了：一条鱼繁殖后子代就贴在旁边（3 格），遮挡率立刻 25%，
-/// 亲代剩下的 200 点能量撑不过十几 tick，于是"生完就死"。
-/// 24 让一个中等鱼群只损失三四成光，亲代有机会缓过来。
-const SHADE_SATURATION: f32 = 24.0;
-
-/// 最多被遮挡掉多少光。留一点保底，免得一层鱼把下面彻底闷死。
-const MAX_SHADE: f32 = 0.85;
+/// 0.35 而不是 1.0：一条三格的身体就占掉粗格 16 格里的 3 格，
+/// 剩下 13 格是水（0.81）。要求满格水等于要求"身体不在这个粗格里"，
+/// 那这条规则就永远不会触发。而 0.35 让"半截露出水面的身体"仍然算湿——
+/// 贴着水面游的鱼不该因为头顶出水就断粮。
+pub const SUBMERGED_MIN: f32 = 0.35;
 
 /// 繁殖时的领地半径（切比雪夫距离）。
 pub const CROWD_RADIUS: i32 = 4;
@@ -313,23 +312,17 @@ pub const PREDATION_BITE: u32 = 30;
 /// 于是"要不要长装甲"第一次是个真问题。
 pub const ARMOR_ABSORB: u32 = 8;
 
-/// 环境容纳量：全世界生产者细胞数的软上限。
-///
-/// 这是**第三道、也是最后一道负反馈**，前两道（局部遮挡、领地）都是"位置相关"的，
-/// 一旦鱼水平散开就都失效了。
-///
-/// 为什么需要它：把左右边界改成环绕之后，鱼不再堆在右墙，于是局部遮挡和领地
-/// 都不再触发——实测 512² 从 8 条一路涨到 **1737 条**，残骸堆满 26% 的世界，
-/// 5.5 ms/tick。那个"240 条的平衡"其实是几何假象，不是生态。
-///
-/// 物理含义是"水体里的营养总量是有限的"：生产者越多，每个分到的越少。
-/// 双曲衰减 `1 / (1 + P/CAP)` 比线性截断温和——永远不会突然归零，
-/// 只会越来越薄，所以种群会平滑地停在平衡点附近而不是硬撞天花板。
-///
-/// 推导平衡点：单条鱼净收益 = `PRODUCER_YIELD × 光 × comp − 维持成本`。
-/// 令其为零、取浅水光 ≈ 0.8、维持 15，得 `P ≈ 0.28 × CAP`。
-/// CAP = 800 对应 **≈ 220 条**，与实测的 240 吻合。
-pub const CARRYING_CAPACITY: f32 = 2400.0;
+// 这里原本还有一个 `CARRYING_CAPACITY`：全世界生产者细胞数的软上限，
+// 用来给光照乘一个 `1 / (1 + P / CAP)` 的竞争系数。
+//
+// 它被删掉了，因为它是**一道和物理无关的人造闸门**：那个 2400 是怎么定的？
+// 是"这样种群会停在 240 条左右"。也就是说，它把"世界能养活多少生物"
+// 直接写成了一个常数——而这恰恰是该由世界自己算出来的东西。
+//
+// 现在这个数由光场回答：生产者必须待在透光层，透光层的格子有限，
+// 于是种群停在"把透光层占满"的位置。想改平衡，改地貌或者改光，
+// 而不是改一个数字。
+
 
 /// 生成失败的原因。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -542,6 +535,13 @@ pub struct LifeSim {
     /// 中途删元素会让后面的索引全部错位——某条鱼被跳过、另一条被处理两次。
     /// 那种 bug 在画面上看不出来，只会让"为什么这条鱼不动"变成谜。
     eaten_plankton: Vec<OrganismId>,
+    /// 粗粒度的光场与温度场。
+    ///
+    /// 住在生命层，而不是外面那个主循环里：生产者产能**必须**读它，
+    /// 而渲染器和界面只需要只读的一份（[`LifeSim::field`]）。
+    /// 如果它住在主循环，`step` 就要多一个参数——而那个签名会被
+    /// 几百个测试调用，改动成本远大于收益。
+    field: AirField,
 }
 
 impl Default for LifeSim {
@@ -562,6 +562,8 @@ impl Default for LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
+            // 空场：0×0，所有查询都返回默认值。`new` 会按真实尺寸重建。
+            field: AirField::default(),
         }
     }
 }
@@ -591,6 +593,10 @@ impl LifeSim {
             };
             ledger.injected += energy;
         }
+        let mut field = AirField::new(world);
+        // 立刻算一遍光场：不然第一个 tick 之前整个世界都是黑的，
+        // 而"开局那一瞬间的截图"恰恰是最常被拿来看的。
+        field.refresh(world);
         Self {
             organisms: Vec::new(),
             next_id: 1,
@@ -603,7 +609,29 @@ impl LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
+            field,
         }
+    }
+
+    /// 光场与温度场（只读）。渲染器和界面从这里取。
+    #[inline]
+    pub fn field(&self) -> &AirField {
+        &self.field
+    }
+
+    /// 光场与温度场（可变）。放灯、删灯、以及"暂停时也要刷新"走这里。
+    #[inline]
+    pub fn field_mut(&mut self) -> &mut AirField {
+        &mut self.field
+    }
+
+    /// 立刻重算光场和温度场。
+    ///
+    /// 用在"时钟不走但世界变了"的时刻：暂停时放了一盏灯、或者用橡皮
+    /// 在海底挖开一个洞。按 `% INTERVAL` 的判据在这种情况下永远不会触发，
+    /// 而用户会盯着一个没反应的世界。
+    pub fn refresh_field(&mut self, world: &World) {
+        self.field.refresh(world);
     }
 
     /// 打开/关闭藻席生长。
@@ -938,6 +966,41 @@ impl LifeSim {
     /// 都记进耗散。用 `flags` 存能量而不是另开一张表：材质层交换格子时
     /// 会连 `flags` 一起搬，于是残骸沉降、被水冲走，能量都跟着走——
     /// 这一点是免费的。
+    /// 把一批有机体**整个**从世界里拿走，并归还它们借过的水。
+    ///
+    /// 这不是"杀死"：不产生尸体、不记账、不留能量。它对应的是玩家手里的
+    /// **生物橡皮**——一个编辑动作，不是一次生态事件。
+    ///
+    /// ## 为什么不能复用 `bury`
+    ///
+    /// `bury` 是死亡路径：它会写尸体、把剩余能量记进耗散。橡皮抹掉的东西
+    /// 从来没死过，凭空多出一具带能量的尸体会让能量账凭空多出几万点
+    /// （`injected` 里没有这一份），守恒断言立刻报错。
+    ///
+    /// 归还水则是必须的：身体占住的每一格都是从水里借的（`Cell::wet`），
+    /// 不还的话每抹一条鱼就从世界里挖掉几格水，而玩家会一直抹。
+    ///
+    /// 返回真正被移除的个数。
+    pub fn remove_organisms(&mut self, world: &mut World, ids: &[OrganismId]) -> usize {
+        // 先把要删的**分出来**再处理：`retain` 的闭包拿不到 `&mut World`，
+        // 而归还水要写世界。
+        let (doomed, kept): (Vec<Organism>, Vec<Organism>) = std::mem::take(&mut self.organisms)
+            .into_iter()
+            .partition(|o| ids.contains(&o.id));
+        self.organisms = kept;
+        for org in &doomed {
+            for cell in &org.cells {
+                let (x, y) = org.cell_at(cell);
+                let (x, y) = (x as isize, y as isize);
+                world.vacate(x, y);
+                if cell.wet {
+                    world.set(x, y, MaterialKind::Water);
+                }
+            }
+        }
+        doomed.len()
+    }
+
     fn bury(&mut self, world: &mut World, org: &Organism) {
         let n = org.cells.len().max(1) as u32;
         // 每格分不到 4 点能量的尸体视为"已经被自己烧光了"：flags 直接写 0。
@@ -1039,26 +1102,38 @@ impl LifeSim {
         }
     }
 
-    /// 生产者按光照产能量。
+    /// 生产者按**所在位置的光照**产能量。
     ///
-    /// 光从世界顶端射入，随深度线性衰减到 0。这条梯度是"生产者必须待在浅水、
-    /// 而浅水正是掠食者猎场"的物理来源（SPEC §2.0）——
-    /// 如果光照处处相同，生物就没有理由浮上来，也就没有垂直方向的生态位。
+    /// 这是世界里唯一一条"环境 → 生物"的能量入口（SPEC §3.3）。
+    /// 光的分布由 [`crate::field::AirField`] 算：太阳从顶上照下来，
+    /// 在水里按 `SUN_ATTEN` 衰减，被石头和沙挡住，点光源从自己那儿往外照。
     ///
-    /// 还要再乘一个**遮挡系数**：上方每一格被别的生物占住，就挡掉一部分光。
-    /// 这一条是种群的负反馈，没有它浅水的能量收入恒定，种群指数爆炸
-    /// （实测 256² 里 400 tick 从 4 条涨到 480 条，还在涨）。
+    /// ## 为什么把"竞争系数"删了
+    ///
+    /// 旧版乘了一个 `1 / (1 + 生产者总数 / CARRYING_CAPACITY)`。那是光场
+    /// 还不存在时的替代品：既然没有真正的光，"生产者太多就把光分薄了"
+    /// 只能靠一个全局常数硬凑。现在光场是真的了，这条就成了**双重计费**——
+    /// 而且那个 2400 是个没有物理来源的数字（它是"这样种群会停在 240 条"倒推的）。
+    ///
+    /// 现在的负反馈是**几何**的：生产者必须待在透光层，透光层的格子有限，
+    /// 而一格只能站一个细胞。种群会停在"把透光层占满"的位置，
+    /// 想改平衡就去改地貌或改光，而不是改一个常数。
+    ///
+    /// ## 温度也进来
+    ///
+    /// 产率再乘一个 [`crate::field::photosynthesis`] 的温度响应。
+    /// 没有这一条，温度场就只是一张好看的图——而"好看但没用"的场
+    /// 迟早会因为没人维护而悄悄烂掉。
     fn inject_sunlight(&mut self, world: &mut World) {
-        let height = world.height().max(1) as f32;
-
-        // 环境容纳量：生产者越多，每个分到的光越少。
-        // 算一次总数就够了——它是全局量，不随位置变。
-        let total_producers: u32 = self
-            .organisms
-            .iter()
-            .map(|o| o.count(CellType::Producer) as u32)
-            .sum();
-        let competition = 1.0 / (1.0 + total_producers as f32 / CARRYING_CAPACITY);
+        // 光场是纯函数，低频重算就够；温度是状态，按自己的间隔积分。
+        // 两者共用同一次世界扫描（见 `AirField::scan`）。
+        let tick = world.tick();
+        if tick % crate::field::LIGHT_INTERVAL == 0 {
+            self.field.update_light(world);
+        }
+        if tick % crate::field::TEMP_INTERVAL == 0 {
+            self.field.update_temp(world);
+        }
 
         let mut injected = 0u64;
         for org in &mut self.organisms {
@@ -1066,24 +1141,24 @@ impl LifeSim {
             if producers == 0 {
                 continue;
             }
-            let (ax, ay) = org.anchor;
-            let depth = (ay.max(0) as f32 / height).clamp(0.0, 1.0);
-
-            // 这一小片水域里有多少格被**别人**占着。自己的格子不算——
-            // 否则一条鱼只要生产者长在自己头顶就永远在自我遮挡。
-            let mut blocked = 0i32;
-            for dy in 1..=SUN_SHADE_DEPTH {
-                for dx in -SUN_SHADE_RADIUS..=SUN_SHADE_RADIUS {
-                    let owner = world.owner((ax + dx) as isize, (ay - dy) as isize);
-                    if owner.is_some() && owner.organism != org.id {
-                        blocked += 1;
-                    }
-                }
+            let (ax, ay) = (org.anchor.0 as f32, org.anchor.1 as f32);
+            // **光合作用需要水。**
+            //
+            // 这一条看着像常识，但它是必需的：没有它，一条被扔在岸上的鱼
+            // 会顶着满格阳光疯狂产能量，"搁浅会死"在物理上就不成立了。
+            // 而"离开水会死"是用户明确要的行为，不能因为光场变真了就丢掉。
+            //
+            // 判据用粗格的水占比而不是逐格材质：身体格自己的材质是 `Empty`，
+            // 问"这一格是不是水"永远得到否。
+            if self.field.water_frac(ax, ay) < SUBMERGED_MIN {
+                continue;
             }
-            let shade = (blocked as f32 / SHADE_SATURATION).min(MAX_SHADE);
-
-            let light = (1.0 - depth) * (1.0 - shade) * competition;
-            let gain = (PRODUCER_YIELD as f32 * light) as u32 * producers as u32;
+            let light = self.field.light_at(ax, ay);
+            if light <= 0.0 {
+                continue;
+            }
+            let warmth = crate::field::photosynthesis(self.field.temp_at(ax, ay));
+            let gain = (PRODUCER_YIELD as f32 * light * warmth) as u32 * producers as u32;
             if gain == 0 {
                 continue;
             }
@@ -1142,17 +1217,21 @@ impl LifeSim {
                 }
                 rotted += world.flags(xs, ys) as u64;
                 rotted_cells += 1;
-                // 泡在水里的尸体烂掉之后**变回水**——那一格水是身体出生时
-                // 借走的，身体彻底消失了就该还回来。露在空气里的变成空位。
-                world.set(
-                    xs,
-                    ys,
-                    if wet {
-                        MaterialKind::Water
-                    } else {
-                        MaterialKind::Empty
-                    },
-                );
+                // 尸体烂掉之后**永远变回水**，不看出现在哪儿。
+                //
+                // 为什么不能按"现在泡不泡在水里"决定：**每一格尸体都对应一格
+                // 借来的水**（`bury` 只给 `Cell::wet` 的细胞留尸体）。而"现在泡在
+                // 水里吗"是腐烂那一刻的状态，不是出生那一刻的状态——一条贴着
+                // 水面出生的鱼死后，尸体在 y=水面那一行，上方是空气，
+                // `underwater` 判它"干的"，于是烂成空位，那一格水就**永久消失**了。
+                //
+                // 实测：600 tick 的繁殖压力测试里，第 423 tick 水位少了 1 格，
+                // 而能量账一分不差、生物数还在涨——从任何别的指标上都看不出来。
+                // 这正是"事后按当前状态倒推当初发生了什么"那一类错误。
+                //
+                // 代价是"水面之上的尸体会烂出一格水然后落下来"——那不是 bug，
+                // 那是体积守恒本身：水不会凭空消失，只会换个地方待着。
+                world.set(xs, ys, MaterialKind::Water);
             }
         }
 
@@ -1522,22 +1601,17 @@ impl LifeSim {
         inp[IN_FACING_X] = org.facing.x as f32;
         inp[IN_FACING_Y] = org.facing.y as f32;
 
-        // 光照：**到水面的距离**，不是"到世界顶的距离"。
+        // 光照：**直接读光场**。
         //
-        // 早先写的是 `1 - y / height`，那把**世界尺寸编进了信号**：同一个
-        // 基因组在 64² 的小池子里和水面 512 格深的海里表现完全不同。
-        // 实测的后果很具体——64² 的测试池里水面在 y=30，`1 - 30/64 = 0.53`，
-        // 而设定点是 0.60，于是鱼永远觉得"这儿太暗"，一直想上浮，
-        // 上浮到水面又被水陆判据拦住，**卡在那里一格不动**。
+        // 这里原本是"从身体顶端往上数，到第一个非水格有多远 / LIGHT_DEPTH"。
+        // 那是个**代理量**：光场还不存在时，深度是唯一能代表光的几何量。
+        // 现在光场是真的了，代理量必须换成真值，否则两件事会分家——
+        // 比如一条鱼站在岛的阴影里，代理量说它"贴着水面所以很亮"，
+        // 而它其实一分光都拿不到。这种不一致不会有任何报错，
+        // 只会表现为"某些鱼莫名其妙饿死"。
         //
-        // 改成"头顶往上数，到第一个非水格（也就是水面）有多远"之后，
-        // 信号与世界大小无关，设定点也才真的是"水面下多少格"。
-        //
-        // 只看水，不算遮挡：算遮挡要扫整列，而 `inject_sunlight` 已经
-        // 做过一次了。鱼要学会的是"往浅处游"，不是精确估计自己拿到多少能量。
-        // 起点必须是**身体的顶**，不是锚点：锚点上方那一格通常是身体自己
-        // （材质是 `Empty`），从那儿开始扫会立刻 break，于是 `IN_LIGHT`
-        // 恒为 1.0——鱼永远觉得"我在水面"，垂直行为整个失效。
+        // 取**身体顶端**而不是锚点：光从上面来，从头顶那一格进入身体。
+        // 一条贴着海床、但头顶伸出十几格的生物，读到的仍然是它头顶的光。
         let (ax, ay) = (org.anchor.0, org.anchor.1);
         let top = org
             .cells
@@ -1545,16 +1619,7 @@ impl LifeSim {
             .map(|c| ay + c.offset.1 as i32)
             .min()
             .unwrap_or(ay);
-        let mut depth = 0i32;
-        let mut ny = top - 1;
-        while ny >= 0 && depth < LIGHT_DEPTH {
-            if !matches!(world.get(ax as isize, ny as isize), MaterialKind::Water) {
-                break;
-            }
-            depth += 1;
-            ny -= 1;
-        }
-        inp[IN_LIGHT] = (1.0 - depth as f32 / LIGHT_DEPTH as f32).clamp(0.0, 1.0);
+        inp[IN_LIGHT] = self.field.light_at(ax as f32, top as f32).clamp(0.0, 1.0);
 
         // 嗅觉：四向射线。撞到固体就断（墙后面闻不到），找到含能量的食物
         // 就按 1/距离 累加一个方向分量。
@@ -2578,6 +2643,19 @@ mod tests {
         w
     }
 
+    /// 深池：64 宽、256 高，水面在 y=8，底下 248 格全是水。
+    ///
+    /// `pool()` 只有 30 格深，而阳光的衰减尺度是 180 格——在 30 格深的水里
+    /// 光还有 0.83，"深水"根本不存在。这不是 bug，是新光场**正确**了：
+    /// 30 格深的池子确实很亮。所以"深水饿死"这一类测试必须换一个真的够深的世界，
+    /// 否则它测到的是"旧公式碰巧给出的小数字"。
+    fn deep_pool() -> World {
+        let mut w = World::new(64, 256).unwrap();
+        w.fill_rect(0, 252, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 8, 64, 244, MaterialKind::Water);
+        w
+    }
+
     /// 「水 + 活细胞 + 残骸」是一个守恒量。
     ///
     /// 身体出生时**借走**它占住的那一格水（见 [`LifeSim::spawn`]），
@@ -2622,11 +2700,12 @@ mod tests {
 
     #[test]
     fn starvation_turns_the_body_into_remains() {
-        let mut w = pool();
+        let mut w = deep_pool();
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
         // 生产者放进深水（光很弱）+ 没有嘴 = 必然饿死。
-        let org = LifeSim::simple_fish((20, 50), Genome::blank(), 6);
+        // 200 格深：阳光在 180 格处归零，这一格是**真的**黑的。
+        let org = LifeSim::simple_fish((20, 200), Genome::blank(), 6);
         let id = sim.spawn_injected(&mut w, org).unwrap();
         let spots: Vec<_> = sim.organism(id).unwrap().footprint().collect();
 
@@ -2650,12 +2729,12 @@ mod tests {
 
     #[test]
     fn energy_is_conserved_through_life_and_death() {
-        let mut w = pool();
+        let mut w = deep_pool();
         let mut sim = LifeSim::new(&mut w);
         // 这条测的是能量账，不是藻席。海底长出来的藻会把"残骸格数"搅乱，
         // 所以关掉它——不是因为它不可信，是因为它属于另一个测试。
         sim.set_food_growth(false);
-        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 45), Genome::blank(), 120))
+        sim.spawn_injected(&mut w, LifeSim::simple_fish((20, 200), Genome::blank(), 120))
             .unwrap();
 
         for _ in 0..500 {
@@ -2740,14 +2819,16 @@ mod tests {
 
     #[test]
     fn sunlight_feeds_producers_only_in_shallow_water() {
-        let mut w = pool();
+        // 必须用**深**池：光衰减尺度是 180 格，30 格深的池子里上下几乎一样亮。
+        // 而且要放在水里——水面之上没有水，光合作用直接不启动。
+        let mut w = deep_pool();
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
         let shallow = sim
-            .spawn_injected(&mut w, LifeSim::simple_fish((10, 2), Genome::blank(), 100))
+            .spawn_injected(&mut w, LifeSim::simple_fish((10, 12), Genome::blank(), 100))
             .unwrap();
         let deep = sim
-            .spawn_injected(&mut w, LifeSim::simple_fish((40, 58), Genome::blank(), 100))
+            .spawn_injected(&mut w, LifeSim::simple_fish((40, 200), Genome::blank(), 100))
             .unwrap();
 
         sim.step(&mut w);
@@ -3810,17 +3891,22 @@ mod tests {
     /// 装甲挡住一部分咬——这是装甲细胞存在的理由。
     #[test]
     fn armor_cells_absorb_part_of_the_bite() {
-        let (mut w, mut sim, _hunter, soft) = hunter_and_prey(&crate::body::SILVERFISH);
-        for _ in 0..5 {
-            sim.step(&mut w);
+        // 只跑 `predate`，不跑整步：整步里猎物会晒到太阳、游走、被追丢，
+        // 而这条测试要量的是**一口咬下去掉了多少**。掺进产能之后
+        // `1000 - energy` 甚至会变成负数（它靠光合作用把血赚回来了）。
+        let (w, mut sim, _hunter, soft) = hunter_and_prey(&crate::body::SILVERFISH);
+        let soft_before = sim.organism(soft).unwrap().energy;
+        for _ in 0..10 {
+            sim.predate(&w);
         }
-        let soft_loss = 1000 - sim.organism(soft).map_or(0, |o| o.energy);
+        let soft_loss = soft_before as i64 - sim.organism(soft).map_or(0, |o| o.energy) as i64;
 
-        let (mut w2, mut sim2, _hunter2, hard) = hunter_and_prey(&crate::body::LEAFBACK);
-        for _ in 0..5 {
-            sim2.step(&mut w2);
+        let (w2, mut sim2, _hunter2, hard) = hunter_and_prey(&crate::body::LEAFBACK);
+        let hard_before = sim2.organism(hard).unwrap().energy;
+        for _ in 0..10 {
+            sim2.predate(&w2);
         }
-        let hard_loss = 1000 - sim2.organism(hard).map_or(0, |o| o.energy);
+        let hard_loss = hard_before as i64 - sim2.organism(hard).map_or(0, |o| o.energy) as i64;
 
         assert!(
             hard_loss * 2 < soft_loss,
@@ -3931,12 +4017,19 @@ mod tests {
         sim.organisms[i].energy = 0;
         sim.ledger.dissipated += drained as u64;
 
+        // 只跑重力，不跑整步。
+        //
+        // 整步里这条鱼会被代谢判定饿死——它在水面之上的空气里，
+        // 光合作用不启动（见 `SUBMERGED_MIN`），于是第一个 tick 就没了。
+        // 而这条测试要问的是"下落花不花能量"，那是一个**纯粹的力学问题**，
+        // 掺进代谢只会让它变得依赖别的规则。
         for _ in 0..5 {
-            sim.step(&mut w);
+            sim.apply_gravity(&mut w);
         }
 
         let y = sim.organism(id).unwrap().anchor.1;
         assert!(y > 12, "没有能量也该被重力拉下来，实际 y={y}");
+        assert_eq!(sim.organism(id).unwrap().energy, 0, "下落不该花能量");
     }
 
     /// 落在陆地上的身体**搁浅**：动不了，而且会饿死。
@@ -4036,16 +4129,14 @@ mod tests {
     /// 而不是一句写在文档里的愿望。
     #[test]
     fn the_same_fish_starves_in_deep_water() {
-        let mut w = World::new(64, 64).unwrap();
-        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        w.fill_rect(0, 8, 64, 52, MaterialKind::Water);
+        let mut w = deep_pool();
 
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
         let id = sim
             .spawn_injected(
                 &mut w,
-                LifeSim::simple_fish((10, 56), breeder_genome(), 200),
+                LifeSim::simple_fish((10, 200), breeder_genome(), 200),
             )
             .unwrap();
 

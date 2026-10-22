@@ -253,6 +253,10 @@ impl Egui {
                 self.state.cell = c;
                 true
             }
+            Command::SetViewMode(v) => {
+                self.state.view = v;
+                true
+            }
             Command::RunFor(_) => false,
             // 工坊的三条命令都要写世界 / 写磁盘，界面自己做不了。
             Command::PlaceBody(_) => false,

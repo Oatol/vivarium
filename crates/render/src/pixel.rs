@@ -29,7 +29,7 @@
 //! 正好等于 wgpu 的 `COPY_BYTES_PER_ROW_ALIGNMENT`。
 //! 块上传天然满足行对齐，不需要手动补 padding。下面有一条编译期断言盯着这件事。
 
-use vivarium_core::{CellOwner, MaterialCell, World, CHUNK_SIZE};
+use vivarium_core::{field, AirField, CellOwner, MaterialCell, ViewMode, World, CHUNK_SIZE};
 
 use crate::{palette, RenderError, Renderer};
 
@@ -128,7 +128,7 @@ struct Letterbox {
 /// "一格长什么样"就只有 shader 一个地方在回答——不会出现
 /// "CPU 算的颜色和 shader 算的不一致"这种最难查的一类 bug。
 ///
-/// 布局必须与 `blit.wgsl` 里的 `Scene` 逐字节一致：304 字节，
+/// 布局必须与 `blit.wgsl` 里的 `Scene` 逐字节一致：432 字节，
 /// 每个 vec4 落在 16 的倍数上。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
@@ -138,7 +138,8 @@ struct SceneUniforms {
     view: [f32; 4],
     world: [f32; 2],
     px_per_cell: f32,
-    _pad: f32,
+    /// 显示滤镜（[`ViewMode::as_u32`]）。0 材质 / 1 温度 / 2 光照 / 3 物种。
+    view_mode: u32,
     palette: [[f32; 4]; palette::PALETTE_LEN],
 }
 
@@ -149,6 +150,7 @@ impl SceneUniforms {
         viewport: Viewport,
         content: Option<[f32; 4]>,
         srgb_output: bool,
+        view_mode: ViewMode,
     ) -> Self {
         let lb = letterbox(world, target, content);
         let vp = viewport.clamped(world);
@@ -160,7 +162,7 @@ impl SceneUniforms {
             view: [vp.center.0 - vw * 0.5, vp.center.1 - vh * 0.5, vw, vh],
             world: [world.0 as f32, world.1 as f32],
             px_per_cell,
-            _pad: 0.0,
+            view_mode: view_mode.as_u32(),
             palette: palette::scene_palette(srgb_output),
         }
     }
@@ -476,6 +478,12 @@ struct Blitter {
 
     texture: Option<wgpu::Texture>,
     view: Option<wgpu::TextureView>,
+    /// 场纹理：`Rg32Float`，尺寸是**粗网格**（世界 / `AIR_CELL`）。
+    field_texture: Option<wgpu::Texture>,
+    field_view: Option<wgpu::TextureView>,
+    field_size: (u32, u32),
+    /// 上一次上传的场版本号。相同就跳过上传。
+    field_revision: u64,
     bind_group: Option<wgpu::BindGroup>,
     uploader: Option<PixelUploader>,
     world_size: (u32, u32),
@@ -485,6 +493,8 @@ struct Blitter {
     /// 界面层每帧把它算出来交进来（中央那块矩形）。渲染器不猜——
     /// 猜出来的值一旦和面板尺寸对不上，"点哪儿是哪格"就会整体偏。
     content: Option<[f32; 4]>,
+    /// 当前显示滤镜。
+    view_mode: ViewMode,
     stats: PixelStats,
 }
 
@@ -532,6 +542,22 @@ impl Blitter {
                         // 整数纹理不能被采样器过滤，只能 textureLoad。
                         // 这正好是我们要的：最近邻、不插值、格边界绝对清晰。
                         sample_type: wgpu::TextureSampleType::Uint,
+                        view_dimension: wgpu::TextureViewDimension::D2,
+                        multisampled: false,
+                    },
+                    count: None,
+                },
+                wgpu::BindGroupLayoutEntry {
+                    binding: 2,
+                    visibility: wgpu::ShaderStages::FRAGMENT,
+                    ty: wgpu::BindingType::Texture {
+                        // 场纹理：r = 光照，g = 温度（0..1）。
+                        //
+                        // `filterable: false` 是因为 `Rg32Float` 在核心 WebGPU 里
+                        // 不可过滤。这不是限制：着色器自己用四次 `textureLoad`
+                        // 做双线性插值，比采样器更可控，而且粗网格的插值
+                        // 本来就该由我们自己定义。
+                        sample_type: wgpu::TextureSampleType::Float { filterable: false },
                         view_dimension: wgpu::TextureViewDimension::D2,
                         multisampled: false,
                     },
@@ -596,11 +622,16 @@ impl Blitter {
             uniforms,
             texture: None,
             view: None,
+            field_texture: None,
+            field_view: None,
+            field_size: (0, 0),
+            field_revision: u64::MAX,
             bind_group: None,
             uploader: None,
             world_size: (0, 0),
             viewport: Viewport::default(),
             content: None,
+            view_mode: ViewMode::Material,
             stats: PixelStats::default(),
         }
     }
@@ -643,21 +674,6 @@ impl Blitter {
         });
         let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
 
-        let bind_group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("vivarium-blit-bind-group"),
-            layout: &self.bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: self.uniforms.as_entire_binding(),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::TextureView(&view),
-                },
-            ],
-        });
-
         self.uploader = Some(PixelUploader::new(world));
         // 换世界时相机回到中心。尺寸变了还留着旧中心，会直接飘到世界外。
         // 只在尺寸**真的变了**时重置：调用方可能刚设过相机，
@@ -667,8 +683,130 @@ impl Blitter {
         }
         self.texture = Some(texture);
         self.view = Some(view);
-        self.bind_group = Some(bind_group);
         self.world_size = size;
+        // 场纹理只在**粗网格尺寸真的变了**时重建。
+        //
+        // 早先这里无条件把 `field_size` 清成 (0,0)，后果很隐蔽：
+        // `upload_field` 通常比 `upload` 先跑（主循环要先传场再画），
+        // 于是场被传进纹理 A、`ensure_world` 又建了纹理 B 并绑上它，
+        // 而 B 的内容是**未定义的显存**——画面上四个滤镜都成了同一片怪色，
+        // 不报错、不警告。
+        self.ensure_field_texture(field_dims(world));
+        // 无条件重建绑定组：世界纹理刚换过，而 `ensure_field_texture`
+        // 在尺寸没变时是直接返回的——它不会顺手把绑定组补上。
+        self.rebuild_bind_group();
+        Ok(())
+    }
+
+    /// 确保场纹理存在且尺寸正确。
+    fn ensure_field_texture(&mut self, size: (u32, u32)) {
+        if self.field_texture.is_some() && self.field_size == size {
+            return;
+        }
+        let texture = self.device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("vivarium-field"),
+            size: wgpu::Extent3d {
+                width: size.0.max(1),
+                height: size.1.max(1),
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rg32Float,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        self.field_view = Some(texture.create_view(&wgpu::TextureViewDescriptor::default()));
+        self.field_texture = Some(texture);
+        self.field_size = size;
+        // 新纹理的内容是未定义的，必须重新传一次。
+        self.field_revision = u64::MAX;
+        self.rebuild_bind_group();
+    }
+
+    /// 重建绑定组。世界纹理或场纹理任何一个换了都要走一遍。
+    fn rebuild_bind_group(&mut self) {
+        let (Some(world_view), Some(field_view)) = (self.view.as_ref(), self.field_view.as_ref())
+        else {
+            return;
+        };
+        self.bind_group = Some(self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("vivarium-blit-bind-group"),
+            layout: &self.bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(world_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(field_view),
+                },
+            ],
+        }));
+    }
+
+    /// 把场推上 GPU。版本号没变就什么都不做。
+    ///
+    /// 为什么按版本号而不是每帧都传：场每 8 tick 才算一次，而界面是 60 fps。
+    /// 每帧传 128×128×8 字节 = 128 KB 看起来不多，但那是每秒 7.7 MB 的
+    /// 无谓带宽，而且它会把"场到底有没有更新"这件事藏起来。
+    fn upload_field(&mut self, field: &AirField) -> Result<(), RenderError> {
+        let size = (field.cols() as u32, field.rows() as u32);
+        if size.0 == 0 || size.1 == 0 {
+            return Ok(());
+        }
+        self.ensure_field_texture(size);
+        if self.field_revision == field.revision() {
+            return Ok(());
+        }
+        let Some(texture) = self.field_texture.as_ref() else {
+            return Ok(());
+        };
+
+        // 每行必须补齐到 256 字节：`write_texture` 的硬要求，
+        // 而 128 列 × 8 字节 = 1024 刚好够、16 列 × 8 = 128 就不够。
+        // 不补齐在 64² 的世界里会直接 panic。
+        let row_bytes = size.0 as usize * 8;
+        let padded = row_bytes.div_ceil(256) * 256;
+        let mut bytes = vec![0u8; padded * size.1 as usize];
+        for y in 0..size.1 as usize {
+            for x in 0..size.0 as usize {
+                let i = y * size.0 as usize + x;
+                let o = y * padded + x * 8;
+                let light = field.light().get(i).copied().unwrap_or(0.0);
+                let temp = field.temp().get(i).copied().unwrap_or(0.0);
+                bytes[o..o + 4].copy_from_slice(&light.clamp(0.0, 1.0).to_le_bytes());
+                let t = (temp / field::TEMP_DISPLAY_MAX).clamp(0.0, 1.0);
+                bytes[o + 4..o + 8].copy_from_slice(&t.to_le_bytes());
+            }
+        }
+
+        self.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(padded as u32),
+                rows_per_image: Some(size.1),
+            },
+            wgpu::Extent3d {
+                width: size.0,
+                height: size.1,
+                depth_or_array_layers: 1,
+            },
+        );
+        self.field_revision = field.revision();
         Ok(())
     }
 
@@ -738,6 +876,7 @@ impl Blitter {
             self.viewport,
             self.content,
             self.output_format.is_srgb(),
+            self.view_mode,
         );
         self.queue
             .write_buffer(&self.uniforms, 0, bytemuck::bytes_of(&uniforms));
@@ -766,6 +905,17 @@ impl Blitter {
         pass.set_bind_group(0, bind_group, &[]);
         pass.draw(0..6, 0..1);
     }
+}
+
+/// 场纹理的粗网格尺寸（列, 行）。
+///
+/// 独立成函数而不是内联：渲染器算一次、测试断言一次，两处必须一致。
+fn field_dims(world: &World) -> (u32, u32) {
+    let cell = vivarium_core::AIR_CELL;
+    (
+        world.width().div_ceil(cell) as u32,
+        world.height().div_ceil(cell) as u32,
+    )
 }
 
 /// 把一个 64×64 块写进世界纹理。
@@ -971,6 +1121,27 @@ impl PixelRenderer {
     /// 而那看起来像是拾取算法写错了。
     pub fn set_content_rect(&mut self, rect: Option<(f32, f32, f32, f32)>) {
         self.blitter.content = rect.map(|(x0, y0, x1, y1)| [x0, y0, x1, y1]);
+    }
+
+    /// 切换显示滤镜。
+    pub fn set_view_mode(&mut self, mode: ViewMode) {
+        self.blitter.view_mode = mode;
+    }
+
+    /// 当前显示滤镜。
+    pub const fn view_mode(&self) -> ViewMode {
+        self.blitter.view_mode
+    }
+
+    /// 把光场 / 温度场推上 GPU。
+    ///
+    /// 由调用方在 `render_with` **之前**调。做成独立的一步而不是塞进
+    /// `render_with` 的参数里，是因为场住在生命层：`render_with` 只认识
+    /// `&World`，让它去认识 `&AirField` 就把渲染层和生命层绑死了。
+    pub fn upload_field(&mut self, field: &AirField) {
+        if let Err(e) = self.blitter.upload_field(field) {
+            eprintln!("场上传失败：{e}");
+        }
     }
 
     /// 以**屏幕上某一点**为锚点缩放。
@@ -2282,5 +2453,144 @@ mod tests {
             life.audit(&world)
         );
         write_png("render-preview-life.png", &with_fish);
+    }
+
+    /// 四个显示滤镜各导一张 PNG，并钉住它们**必须互不相同**。
+    ///
+    /// 这条测试真正防的是"滤镜接上了但没生效"：`view_mode` 传进 uniform
+    /// 之后如果哪个环节（打包、binding、着色器的分支）掉了，画面会
+    /// 静静地退化成材质视图——不报错、不警告，看起来"只是没反应"。
+    ///
+    /// 跑法：
+    /// ```text
+    /// cargo test -p vivarium-render --lib -- --ignored --nocapture view_filter_preview_png
+    /// ```
+    #[test]
+    #[ignore = "会写文件；需要人眼看时手动跑"]
+    fn view_filter_preview_png() {
+        let _gpu = gpu_lock();
+        let Some((device, queue)) = headless_device() else {
+            eprintln!("跳过：本机没有可用的 wgpu 适配器");
+            return;
+        };
+
+        let target_format = wgpu::TextureFormat::Rgba8UnormSrgb;
+        let mut blitter = Blitter::new(device.clone(), queue.clone(), target_format);
+
+        let mut world = World::new(PREVIEW_WORLD, PREVIEW_WORLD).unwrap();
+        let mut rng = Rng::new(2026_1016);
+        let layout = seed_preview_world(&mut world, &mut rng);
+
+        let target = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("filter-target"),
+            size: wgpu::Extent3d {
+                width: PREVIEW_W,
+                height: PREVIEW_H,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: target_format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+            view_formats: &[],
+        });
+        let target_view = target.create_view(&wgpu::TextureViewDescriptor::default());
+
+        // 让世界跑一会儿，再放鱼 + 点一把火 + 放一盏灯——
+        // 四个滤镜各自都需要"有东西可看"：温度滤镜要有热点，
+        // 光照滤镜要有明暗梯度，物种滤镜要有生物。
+        let mut sim = MaterialSim::new();
+        let mut life = LifeSim::new(&mut world);
+        let ids = stock_surface(&mut world, &mut life, 60, 300, false);
+        assert!(!ids.is_empty(), "水面附近应当放得下鱼");
+        // 海床上放一盏灯：光照滤镜里应当出现一个明显的亮斑。
+        life.field_mut()
+            .add_source(layout.seabed as i32 - 6, layout.waterline as i32 + 60);
+        for _ in 0..240 {
+            life.step(&mut world);
+            sim.step(&mut world);
+        }
+
+        let bpr = (PREVIEW_W * 4) as usize;
+        let scale = PREVIEW_H as f32 / PREVIEW_WORLD as f32;
+        let sx = |wx: usize| 80 + (wx as f32 * scale) as usize;
+        let sy = |wy: usize| (wy as f32 * scale) as usize;
+        let at = |px: &[u8], x: usize, y: usize| -> [u8; 4] {
+            let o = y * bpr + x * 4;
+            [px[o], px[o + 1], px[o + 2], px[o + 3]]
+        };
+        let luma = |c: [u8; 4]| u32::from(c[0]) + u32::from(c[1]) + u32::from(c[2]);
+
+        let ocean_x = (0..PREVIEW_WORLD)
+            .find(|&x| layout.surface[x] > layout.waterline as isize + 24)
+            .expect("世界里的应当至少有一列是海");
+
+        let mut shots: Vec<(ViewMode, Vec<u8>)> = Vec::new();
+        for mode in ViewMode::ALL {
+            blitter.view_mode = mode;
+            blitter
+                .upload_field(life.field())
+                .expect("场上传不该失败");
+            let (px, _) = blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
+            shots.push((mode, px));
+        }
+        for (mode, px) in &shots {
+            let name = match mode {
+                ViewMode::Material => "view-material.png",
+                ViewMode::Temperature => "view-temperature.png",
+                ViewMode::Light => "view-light.png",
+                ViewMode::Species => "view-species.png",
+            };
+            write_png(name, px);
+        }
+
+        // --- 光照滤镜：天空亮、深海暗 -----------------------------------
+        //
+        // 索引照 `ViewMode::ALL` 的顺序：0 材质 / 1 温度 / 2 光照 / 3 物种。
+        // 写错一位的症状是"断言全过但看的是另一张图"——而两张图都很像"一片蓝"。
+        let light = &shots[2].1;
+        let sky = at(light, sx(ocean_x), sy(layout.waterline - 12));
+        // 150 格深：光只剩 `1 - 150/180 ≈ 0.17`，色带上接近黑。
+        let deep = at(light, sx(ocean_x), sy(layout.waterline + 150));
+        assert!(
+            luma(sky) > luma(deep) * 2,
+            "光照滤镜里天空应当明显比深海亮：{sky:?} vs {deep:?}"
+        );
+        assert!(luma(deep) < 200, "一百五十格深的海水应当几乎是黑的：{deep:?}");
+
+        // --- 温度滤镜：整屏都该是"冷"的（环境 20°C）--------------------
+        let temp = &shots[1].1;
+        let sea = at(temp, sx(ocean_x), sy(layout.waterline + 40));
+        assert!(
+            u32::from(sea[2]) > u32::from(sea[0]),
+            "20°C 的环境应当是偏蓝的：{sea:?}"
+        );
+
+        // --- 物种滤镜：材质压成暗剪影 -----------------------------------
+        let species = &shots[3].1;
+        let bed = at(species, sx(ocean_x), sy(layout.seabed + 8));
+        let [sr, sg, sb] = palette::rgb(MaterialKind::Stone);
+        assert!(
+            luma(bed) * 2 < luma([sr, sg, sb, 255]),
+            "物种滤镜里的石头应当比材质视图暗得多：{bed:?}"
+        );
+
+        // --- 四张图必须互不相同 -----------------------------------------
+        //
+        // 这是这条测试的核心判据。少了它，"滤镜接上了但没生效"会
+        // 安安静静地退化成材质视图，而画面上看起来只是"点了没反应"。
+        for i in 0..shots.len() {
+            for j in (i + 1)..shots.len() {
+                assert_ne!(
+                    shots[i].1, shots[j].1,
+                    "{:?} 和 {:?} 画出来一模一样——滤镜没生效",
+                    shots[i].0, shots[j].0
+                );
+            }
+        }
+        eprintln!(
+            "四张滤镜图已写出：天空 {sky:?} / 深海 {deep:?} / 海水温度色 {sea:?}"
+        );
     }
 }

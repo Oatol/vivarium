@@ -15,7 +15,7 @@
 
 use std::collections::VecDeque;
 
-use vivarium_core::{CellType, MaterialKind, OrganismId, TimeScale};
+use vivarium_core::{CellType, FieldStats, MaterialKind, OrganismId, TimeScale, ViewMode};
 
 // ---------------------------------------------------------------------------
 // 工具
@@ -24,6 +24,15 @@ use vivarium_core::{CellType, MaterialKind, OrganismId, TimeScale};
 /// 左栏的工具。
 ///
 /// 这一组照着 TPT 的工具栏定：画、擦、填、吸、看。
+///
+/// ## 为什么橡皮有两把
+///
+/// 世界里同时住着两套东西：**材质**（石头、沙、水）和**生物**（细胞）。
+/// 一个"擦"字说不清擦的是哪个——想清掉一片石头，结果把游过去的鱼一起
+/// 抹掉了；想清掉一群藻，结果把海底挖了个洞。
+///
+/// 两把分开之后每条规则只有一句话：**生物橡皮只动占格表，物质橡皮只动材质**。
+/// 而"一格非材质即细胞"这条地基也因此没被破坏——它们各自只碰自己那一半。
 ///
 /// ## 为什么没有矩形和直线
 ///
@@ -35,34 +44,55 @@ pub enum Tool {
     /// 画：把当前材质涂成一片圆。
     #[default]
     Brush,
-    /// 擦：把格子清成空。
-    Eraser,
+    /// 生物橡皮：抹掉范围内的**有机体**，材质一个格子都不动。
+    EraseLife,
+    /// 物质橡皮：把范围内的**材质**清成空，有机体不受影响。
+    EraseMatter,
     /// 油漆桶：把连成一片的同种材质换掉。
     Fill,
     /// 取样：点哪儿就把那格的材质设为当前材质。
     Pick,
     /// 检查器：点生物看它的内部。
     Inspect,
+    /// 点光源：左键放一盏灯，点在已有的灯上则把它拿走。
+    Lamp,
 }
 
 impl Tool {
     /// 全部工具，按左栏从上到下的顺序。
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Brush,
-        Self::Eraser,
+        Self::EraseLife,
+        Self::EraseMatter,
         Self::Fill,
         Self::Pick,
         Self::Inspect,
+        Self::Lamp,
     ];
 
     /// 界面标签。
     pub const fn label(self) -> &'static str {
         match self {
             Self::Brush => "画笔",
-            Self::Eraser => "橡皮",
+            Self::EraseLife => "擦生物",
+            Self::EraseMatter => "擦物质",
             Self::Fill => "填充",
             Self::Pick => "取样",
             Self::Inspect => "检查",
+            Self::Lamp => "光源",
+        }
+    }
+
+    /// 悬停时的一句话说明。
+    pub const fn describe(self) -> &'static str {
+        match self {
+            Self::Brush => "把当前材质涂成一片圆。",
+            Self::EraseLife => "抹掉范围内的生物。材质一格不动。",
+            Self::EraseMatter => "把范围内的材质清成空位。生物不受影响——它们会失去水，然后掉下去。",
+            Self::Fill => "把连成一片的同种材质一次换掉。",
+            Self::Pick => "点一格，把它那格的材质设为当前材质。",
+            Self::Inspect => "点一个生物，在右边看它的身体、神经网络和行为。",
+            Self::Lamp => "左键放一盏点光源；点在已有的灯上就把它拿走。光只被材质挡住。",
         }
     }
 
@@ -70,10 +100,12 @@ impl Tool {
     pub const fn hotkey(self) -> char {
         match self {
             Self::Brush => 'B',
-            Self::Eraser => 'E',
+            Self::EraseLife => 'X',
+            Self::EraseMatter => 'E',
             Self::Fill => 'F',
             Self::Pick => 'I',
             Self::Inspect => 'Q',
+            Self::Lamp => 'P',
         }
     }
 
@@ -81,8 +113,11 @@ impl Tool {
     ///
     /// 检查与取样只读。主循环用它决定"按住左键拖动时要不要连续落笔"——
     /// 检查工具如果也落笔，用户想点开一条鱼看看，会顺手把它周围的水涂掉。
+    ///
+    /// 光源**不算落笔**：拖着鼠标画一道会一口气放下几十盏灯，
+    /// 而灯是稀疏的、每盏都要算进光场，"拖一下就放了一排"不是任何人的本意。
     pub const fn paints(self) -> bool {
-        matches!(self, Self::Brush | Self::Eraser | Self::Fill)
+        matches!(self, Self::Brush | Self::EraseLife | Self::EraseMatter | Self::Fill)
     }
 }
 
@@ -210,6 +245,14 @@ pub struct Snapshot {
     /// 各材质的格数，下标是 `MaterialKind::as_u8`。
     pub census: [usize; MaterialKind::COUNT],
 
+    /// 光场与温度场的统计。
+    pub field: FieldStats,
+
+    /// 鼠标下面那一格的属性。指针不在世界上就是 `None`。
+    ///
+    /// 由主循环填：界面拿不到 `&World`，也不该拿。
+    pub hover: Option<CellInfo>,
+
     /// 种群曲线（归一化到 0..1，最新在最后）。
     pub history: Vec<f32>,
 
@@ -236,8 +279,67 @@ impl Default for Snapshot {
             stranded: 0,
             food: 0,
             census: [0; MaterialKind::COUNT],
+            field: FieldStats::default(),
+            hover: None,
             history: Vec::new(),
             selected: None,
+        }
+    }
+}
+
+/// 鼠标下面那一格的属性。
+///
+/// 这就是"每个像素都能储存并显示相关的属性"里**显示**的那一半：
+/// 存的部分在别处（材质在 `MaterialCell`、细胞在 `Organism`、
+/// 温度与光照在 `AirField`），这里只是把四处的东西拼成一份可以
+/// 直接画的快照。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CellInfo {
+    /// 格坐标。
+    pub x: i32,
+    /// 格坐标。
+    pub y: i32,
+    /// 材质。
+    pub material: MaterialKind,
+    /// 这一格如果是生物的一部分，它的摘要。
+    pub organism: Option<HoverOrganism>,
+    /// 光照（0..1）。
+    pub light: f32,
+    /// 温度（°C）。
+    pub temp: f32,
+    /// 这一格离水面多少格（负数是水面之上）。
+    ///
+    /// 单独给出来是因为"光有多亮"和"我在多深"是两个问题：
+    /// 站在岛的阴影里，深度很浅而光是 0。
+    pub depth: i32,
+}
+
+/// 悬停时看到的生物摘要。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HoverOrganism {
+    /// 编号。
+    pub id: OrganismId,
+    /// 细胞数。
+    pub cells: usize,
+    /// 世系深度。
+    pub generation: u32,
+    /// 能量 / 上限。
+    pub energy: (u32, u32),
+    /// 生产者细胞数（决定它能晒多少能量）。
+    pub producers: usize,
+    /// 这一格是哪种细胞。
+    pub cell: CellType,
+}
+
+impl Default for HoverOrganism {
+    fn default() -> Self {
+        Self {
+            id: 0,
+            cells: 0,
+            generation: 0,
+            energy: (0, 0),
+            producers: 0,
+            cell: CellType::Producer,
         }
     }
 }
@@ -330,6 +432,8 @@ pub enum Command {
     SetMaterial(MaterialKind),
     /// 设定要投放的细胞类型。
     SetCell(CellType),
+    /// 切换显示滤镜（材质 / 温度 / 光照 / 物种）。
+    SetViewMode(ViewMode),
     /// 让世界跑一批 tick 再停下（"快进 N 步"）。
     RunFor(u32),
     /// 把工坊里画好的身体放到世界的鼠标位置。
@@ -506,6 +610,8 @@ pub struct UiState {
     pub material: MaterialKind,
     /// 当前细胞类型。
     pub cell: CellType,
+    /// 当前显示滤镜。
+    pub view: ViewMode,
     /// 选中的个体。主循环据此填 `Snapshot::selected`。
     pub selected: Option<OrganismId>,
     /// 面板可见性。
@@ -533,6 +639,7 @@ impl Default for UiState {
             brush: 2,
             material: MaterialKind::Water,
             cell: CellType::Producer,
+            view: ViewMode::Material,
             selected: None,
             show_inspector: true,
             show_console: true,

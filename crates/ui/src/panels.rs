@@ -35,9 +35,9 @@
 
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, Panel, ScrollArea, Stroke, Ui};
 
-use vivarium_core::{palette, CellType, MaterialKind, TimeScale};
+use vivarium_core::{palette, CellType, MaterialKind, TimeScale, ViewMode};
 
-use crate::state::{Command, Level, SelectedOrganism, Snapshot, Tool, UiState};
+use crate::state::{CellInfo, Command, Level, SelectedOrganism, Snapshot, Tool, UiState};
 use crate::theme;
 use crate::widgets::{self, BtnState, Icon};
 
@@ -65,7 +65,143 @@ pub fn draw(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) -> egui::Rect {
     }
     let central = ui.available_rect_before_wrap();
     brush_cursor(ui, state, snap, central);
+    hover_readout(ui, state, snap, central);
     central
+}
+
+/// 指针下面那一格的属性：材质、物种、温度、光照、坐标。
+///
+/// ## 为什么是浮在指针旁边的框，而不是检查器里的一行
+///
+/// 因为"看一格"是一个**移动中的**动作：鼠标划过一片海，你想知道
+/// 这一格和上一格差多少。把读数放在右侧面板里，视线要来回跳四千像素，
+/// 跳一次就忘了上一次的数。
+///
+/// ## 为什么贴右上角而不是正右下
+///
+/// 正右下方会盖住"接下来要看的下一格"——鼠标往右下走的时候，
+/// 框永远压着它。贴右上，指针前进的方向始终是空的。
+fn hover_readout(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::Rect) {
+    let Some(info) = snap.hover.as_ref() else {
+        return;
+    };
+    let Some(pos) = ui.ctx().pointer_latest_pos() else {
+        return;
+    };
+    if !central.contains(pos) {
+        return;
+    }
+    // 缩放工具在"点哪儿是哪格"上已经够忙了，读数只在没在落笔时出现，
+    // 免得画一笔的时候旁边一直有个框跟着抖。
+    if state.tool.paints() && ui.ctx().input(|i| i.pointer.primary_down()) {
+        return;
+    }
+
+    let lines = cell_lines(info);
+    let font = egui::FontId::new(9.5, egui::FontFamily::Proportional);
+    let mut width: f32 = 96.0;
+    let mut galleys = Vec::with_capacity(lines.len());
+    for (text, color) in &lines {
+        let g = ui
+            .painter()
+            .layout_no_wrap(text.clone(), font.clone(), *color);
+        width = width.max(g.size().x + 14.0);
+        galleys.push(g);
+    }
+    let line_h = 13.0;
+    let height = line_h * galleys.len() as f32 + 8.0;
+
+    // 贴指针的右上角；贴近屏幕右边时翻到左边。
+    let anchor = egui::pos2(pos.x + 18.0, pos.y - height - 8.0);
+    let anchor = if anchor.x + width > central.right() {
+        egui::pos2(pos.x - 18.0 - width, anchor.y)
+    } else {
+        anchor
+    };
+    let anchor = egui::pos2(
+        anchor.x.max(central.left()),
+        anchor.y.max(central.top()),
+    );
+    let rect = egui::Rect::from_min_size(anchor, egui::vec2(width, height));
+
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::ZERO, theme::PANEL);
+    p.rect_stroke(
+        rect,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, theme::LINE_STRONG),
+        egui::StrokeKind::Inside,
+    );
+    for (i, g) in galleys.into_iter().enumerate() {
+        p.galley(
+            egui::pos2(rect.left() + 6.0, rect.top() + 4.0 + i as f32 * line_h),
+            g,
+            theme::TEXT,
+        );
+    }
+}
+
+/// 读数的内容。颜色分开给，因为"这是材质"和"这是生物"得一眼分得开。
+fn cell_lines(info: &CellInfo) -> Vec<(String, Color32)> {
+    let mut out = Vec::with_capacity(8);
+    out.push((
+        format!("({}, {})  ·  深 {} 格", info.x, info.y, info.depth),
+        theme::TEXT_FAINT,
+    ));
+    match &info.organism {
+        Some(o) => out.push((
+            format!(
+                "#{} {} · {} 格 · {} 代",
+                o.id,
+                cell_label(o.cell),
+                o.cells,
+                o.generation
+            ),
+            theme::ACCENT,
+        )),
+        None => out.push((material_label(info.material).to_owned(), theme::TEXT)),
+    }
+    if let Some(o) = &info.organism {
+        out.push((
+            format!("能量 {}/{} · 生产者 {}", o.energy.0, o.energy.1, o.producers),
+            theme::TEXT_DIM,
+        ));
+    } else {
+        out.push((info.material.describe().to_owned(), theme::TEXT_DIM));
+    }
+    out.push((
+        format!("光照 {:.2}", info.light),
+        light_color(info.light),
+    ));
+    out.push((format!("温度 {:.0}°C", info.temp), temp_color(info.temp)));
+    out
+}
+
+/// 光照值 → 一个小色块用的颜色。和滤镜的色带同一个意图，只是简化了。
+fn light_color(light: f32) -> Color32 {
+    let t = light.clamp(0.0, 1.0);
+    let v = (40.0 + 215.0 * t) as u8;
+    Color32::from_rgb(v / 3, v, (v as f32 * 0.9) as u8)
+}
+
+/// 温度 → 颜色。蓝冷红热，20°C 附近是中性灰蓝。
+fn temp_color(temp: f32) -> Color32 {
+    let t = (temp / 600.0).clamp(0.0, 1.0);
+    if t < 0.5 {
+        let k = t / 0.5;
+        Color32::from_rgb(
+            (60.0 + 100.0 * k) as u8,
+            (140.0 + 100.0 * k) as u8,
+            (230.0 - 40.0 * k) as u8,
+        )
+    } else {
+        let k = (t - 0.5) / 0.5;
+        Color32::from_rgb(
+            (160.0 + 95.0 * k) as u8,
+            (240.0 - 200.0 * k) as u8,
+            (190.0 - 190.0 * k) as u8,
+        )
+    }
 }
 
 /// 画笔预览：在指针位置画一个圈，半径就是笔刷半径。
@@ -228,6 +364,41 @@ fn top_bar(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     state.emit(Command::Step);
                 }
 
+                ui.add_space(8.0);
+                sep(ui);
+                ui.add_space(4.0);
+
+                // 显示滤镜。照着 TPT 的 `DisplayMode` 那一排开关：
+                // 同一份世界数据，换一种"看的方式"。
+                //
+                // 做成**单选**而不是复选：材质 / 温度 / 光照 / 物种 是四张
+                // 互斥的图，叠在一起谁也看不清。TPT 的复选是因为它有
+                // 气压、速度、涡度这些**可以叠加**的空气通道，而我们没有。
+                ui.label(
+                    egui::RichText::new("视图")
+                        .size(theme::TITLE_SIZE)
+                        .color(theme::TEXT_FAINT),
+                );
+                let mut want_view: Option<ViewMode> = None;
+                for mode in ViewMode::ALL {
+                    let on = state.view == mode;
+                    let resp = widgets::flat_button(
+                        ui,
+                        mode.label(),
+                        if on { BtnState::Selected } else { BtnState::Normal },
+                    );
+                    if resp.clicked() {
+                        want_view = Some(mode);
+                    }
+                    resp.on_hover_text(format!("{}\n\n（V 键循环切换）", mode.describe()));
+                }
+                if let Some(mode) = want_view {
+                    state.view = mode;
+                    state.emit(Command::SetViewMode(mode));
+                    let tick = snap.tick;
+                    state.log(tick, Level::Info, format!("视图：{}", mode.describe()));
+                }
+
                 // 右侧：帧率与成本。用 `right_to_left` 让它们贴右。
                 ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                     ui.label(
@@ -324,12 +495,14 @@ fn tool_strip(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
             for tool in Tool::ALL {
                 let icon = match tool {
                     Tool::Brush => Icon::Brush,
-                    Tool::Eraser => Icon::Eraser,
+                    Tool::EraseLife => Icon::EraseLife,
+                    Tool::EraseMatter => Icon::Eraser,
                     Tool::Fill => Icon::Fill,
                     Tool::Pick => Icon::Pick,
                     Tool::Inspect => Icon::Inspect,
+                    Tool::Lamp => Icon::Lamp,
                 };
-                let tip = format!("{}（{}）", tool.label(), tool.hotkey());
+                let tip = format!("{}（{}）— {}", tool.label(), tool.hotkey(), tool.describe());
                 if widgets::icon_button(ui, icon, state.tool == tool, &tip).clicked() {
                     state.tool = tool;
                     state.emit(Command::SetTool(tool));
@@ -1053,4 +1226,79 @@ fn console(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
                 });
             hairline_top(ui);
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::HoverOrganism;
+
+    fn cell() -> CellInfo {
+        CellInfo {
+            x: 214,
+            y: 137,
+            material: MaterialKind::Water,
+            organism: None,
+            light: 0.71,
+            temp: 20.3,
+            depth: 42,
+        }
+    }
+
+    /// 读数必须真的说出"这里是哪儿、是什么、多亮、多热"。
+    ///
+    /// 这条守的是**四类信息各自都有来源**：坐标来自拾取、材质来自材质表、
+    /// 光照和温度来自空气场。少了任何一条，读数就退化成"这里有个东西"。
+    #[test]
+    fn the_readout_names_the_cell() {
+        let lines = cell_lines(&cell());
+        assert_eq!(lines.len(), 5, "五行：坐标 / 材质 / 描述 / 光照 / 温度");
+        let text: Vec<&str> = lines.iter().map(|(s, _)| s.as_str()).collect();
+        assert_eq!(text[0], "(214, 137)  ·  深 42 格");
+        assert_eq!(text[1], "水");
+        assert!(text[3].starts_with("光照 0.71"), "{}", text[3]);
+        assert_eq!(text[4], "温度 20°C");
+        // 材质那一行用的是它自己的说明，不是"水"这个名字重复一遍。
+        assert!(text[2].contains("往下流"), "{}", text[2]);
+    }
+
+    /// 指针下面是个生物时，第二、三行换成"个体"而不是"材质"。
+    ///
+    /// 这一条容易写错成"两个都显示"——但生物占住的那格**材质是水**
+    /// （借的），同时说"水"和"#312 叶背鱼"会让人以为那一格既是水又是鱼。
+    #[test]
+    fn the_readout_prefers_the_organism_over_the_material() {
+        let mut info = cell();
+        info.organism = Some(HoverOrganism {
+            id: 312,
+            cells: 12,
+            generation: 7,
+            energy: (412, 480),
+            producers: 6,
+            cell: CellType::Mover,
+        });
+        let lines = cell_lines(&info);
+        let text: Vec<&str> = lines.iter().map(|(s, _)| s.as_str()).collect();
+        assert!(text[1].starts_with("#312"), "{}", text[1]);
+        assert!(text[1].contains("12 格"), "{}", text[1]);
+        assert!(text[1].contains("7 代"), "{}", text[1]);
+        assert_eq!(text[2], "能量 412/480 · 生产者 6");
+        assert!(!text[1].contains('水'), "不能同时说是水又是鱼");
+    }
+
+    /// 光照越亮，读数里那一行越亮；温度越高越偏红。
+    ///
+    /// 颜色是读数的第二语言：扫一眼就知道"这格在暗处"，
+    /// 不用去读 `0.03` 那个数字。
+    #[test]
+    fn the_readout_colours_track_light_and_heat() {
+        let dark = light_color(0.0);
+        let bright = light_color(1.0);
+        assert!(bright.r() > dark.r() && bright.g() > dark.g());
+
+        let cold = temp_color(20.0);
+        let hot = temp_color(900.0);
+        assert!(hot.r() > cold.r(), "高温必须更红");
+        assert!(cold.b() > hot.b(), "低温必须更蓝");
+    }
 }

@@ -362,6 +362,9 @@ struct Game {
     cursor: Option<(f64, f64)>,
     /// 左键按着，而且当前工具会落笔。
     painting: bool,
+    /// 本次落笔一共抹掉了几个生物。**松开时才写进控制台**——
+    /// 拖着一路擦过鱼群会在一次拖动里触发几十次，逐次打印会把控制台刷满。
+    erased: usize,
     /// 上一次落笔的格子。用来把"这一帧的鼠标位置"和"上一帧的"连成一条线——
     /// 鼠标快的时候两帧之间能跨十几格，只在当前位置盖一个圆会画出虚线。
     last_paint: Option<(i32, i32)>,
@@ -432,6 +435,7 @@ impl Game {
             pending_body: None,
             cursor: None,
             painting: false,
+            erased: 0,
             last_paint: None,
             pan_anchor: None,
             scale: TimeScale::X1,
@@ -492,7 +496,24 @@ impl Game {
 
     fn on_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
         match key {
-            Key::Named(NamedKey::Escape) => event_loop.exit(),
+            // Esc 有两件事要做，**顺序不能反**。
+            //
+            // 正在连续放置身体时，Esc 的语义是"停手"——这是用户唯一会
+            // 主动按 Esc 的时刻。此时直接退出程序等于"我想停手，结果
+            // 把程序关了"，而那是最让人火大的一种交互。
+            // 没在放置时，Esc 仍然是退出。
+            Key::Named(NamedKey::Escape) => {
+                if self.pending_body.take().is_some() {
+                    let tick = self.world.tick();
+                    self.ui.log(
+                        tick,
+                        vivarium_ui::Level::Info,
+                        "停止放置（Esc）",
+                    );
+                } else {
+                    event_loop.exit();
+                }
+            }
             Key::Named(NamedKey::Space) => {
                 self.scale = if self.scale.is_paused() {
                     TimeScale::X1
@@ -512,16 +533,21 @@ impl Game {
                 // 工具：和 `Tool::hotkey` 一一对应。走界面那条命令，
                 // 免得"快捷键改了工具、左栏却没高亮"——那种不一致很难注意到。
                 "b" | "B" => self.pick_tool(vivarium_ui::state::Tool::Brush),
-                "e" | "E" => self.pick_tool(vivarium_ui::state::Tool::Eraser),
+                "x" | "X" => self.pick_tool(vivarium_ui::state::Tool::EraseLife),
+                "e" | "E" => self.pick_tool(vivarium_ui::state::Tool::EraseMatter),
                 "f" | "F" => self.pick_tool(vivarium_ui::state::Tool::Fill),
                 "i" | "I" => self.pick_tool(vivarium_ui::state::Tool::Pick),
                 "q" | "Q" => self.pick_tool(vivarium_ui::state::Tool::Inspect),
+                "p" | "P" => self.pick_tool(vivarium_ui::state::Tool::Lamp),
                 // W = 生物工坊。G 已经被"点火"占了，而且 G 这个键在
                 // 玩家的肌肉记忆里是"grid/生成"，不是"工坊"。
                 "w" | "W" => self.ui.state.workshop.open = !self.ui.state.workshop.open,
                 "g" | "G" => self.ignite_peak(),
                 "l" | "L" => self.release_fish(),
                 "r" | "R" => self.reseed(),
+                // V = 换滤镜。Tab 会被 egui 拿去走焦点，F1..F4 在很多
+                // 键盘上是媒体键，V 是这里唯一没被占的顺手的键。
+                "v" | "V" => self.cycle_view(),
                 // 缩放：`+` 和 `=` 都收，因为大多数键盘上 `+` 要按 shift。
                 "+" | "=" => self.renderer.zoom_by(1.5),
                 "-" | "_" => self.renderer.zoom_by(1.0 / 1.5),
@@ -533,6 +559,19 @@ impl Game {
             },
             _ => {}
         }
+    }
+
+    /// 换下一个显示滤镜。快捷键和顶栏那排按钮走同一条路。
+    fn cycle_view(&mut self) {
+        let next = self.ui.state.view.next();
+        self.ui.state.view = next;
+        self.renderer.set_view_mode(next);
+        let tick = self.world.tick();
+        self.ui.log(
+            tick,
+            vivarium_ui::Level::Info,
+            format!("视图：{}（{}）", next.label(), next.describe()),
+        );
     }
 
     /// 左键点在世界上。
@@ -605,14 +644,19 @@ impl Game {
         // 工坊的"放置"优先于一切：它是一次性的、明确的动作，
         // 而且工坊关掉之后工具还停在原来的位置——先处理它才不会
         // "点了放置、结果用画笔在海上涂了一笔"。
-        if let Some(cells) = self.pending_body.take() {
+        //
+        // **不 `take`**：放置是**连续**的。用户点"放置到世界"之后，
+        // 每点一下世界就再放一个，直到按 Esc 为止。这在布置一片海草床
+        // 或者一群同类鱼的时候是唯一说得通的交互——否则每放一条都要
+        // 回到工坊点一次"放置"。
+        if let Some(cells) = self.pending_body.clone() {
             self.place_body(cells);
             return;
         }
 
         let tool = self.ui.state.tool;
         match tool {
-            Tool::Brush | Tool::Eraser => {
+            Tool::Brush | Tool::EraseLife | Tool::EraseMatter => {
                 self.painting = true;
                 self.last_paint = None;
                 self.stroke_to_cursor();
@@ -635,13 +679,54 @@ impl Game {
                 }
             }
             Tool::Inspect => self.inspect_at_cursor(),
+            Tool::Lamp => self.toggle_lamp_at_cursor(),
         }
+    }
+
+    /// 光源工具：点在已有的灯上就把它拿走，否则放一盏新的。
+    ///
+    /// 用"同一个键既放又删"而不是分成两个工具：灯是一个**点**，
+    /// 而工具条上每多一个图标，别的图标就小一分。放和删针对的是同一个
+    /// 对象、同一个位置，合成一个动作（"切换这里有没有灯"）在语义上
+    /// 也比"两个工具各自只管一半"更准确。
+    fn toggle_lamp_at_cursor(&mut self) {
+        let Some((x, y)) = self.cell_under_cursor() else {
+            return;
+        };
+        let tick = self.world.tick();
+        // 搜索半径跟着笔刷走：灯在画面上是一个点，鼠标落点有半格误差，
+        // 而放大到 20 px/格 时"差半格"就是 10 个屏幕像素。
+        let r = self.ui.state.brush.max(2) as i32;
+        let removed = self.life.field_mut().remove_source_near(x, y, r);
+        let message = match removed {
+            Some(src) => format!("拿走了 ({}, {}) 的光源", src.x, src.y),
+            None => {
+                if self.life.field_mut().add_source(x, y) {
+                    format!("放下光源 ({x}, {y})")
+                } else {
+                    format!(
+                        "光源已达上限 {}，先拿走几盏",
+                        vivarium_core::field::SOURCE_CAP
+                    )
+                }
+            }
+        };
+        // 暂停时时钟不走，靠 `% INTERVAL` 的判据永远不会触发——
+        // 不手动刷一遍的话，用户会对着一个"放了灯却没亮"的世界发呆。
+        self.life.refresh_field(&self.world);
+        self.ui.log(tick, vivarium_ui::Level::Info, message);
     }
 
     /// 左键松开：结束连续落笔。
     fn on_release(&mut self) {
         self.painting = false;
         self.last_paint = None;
+        if self.erased > 0 {
+            let (tick, n) = (self.world.tick(), self.erased);
+            self.ui
+                .log(tick, vivarium_ui::Level::Info, format!("抹掉了 {n} 个生物"));
+            self.erased = 0;
+        }
     }
 
     /// 光标移动：拖拽平移，或者连续落笔。
@@ -688,12 +773,8 @@ impl Game {
             return;
         };
         let from = self.last_paint.unwrap_or((x, y));
-        let erase = self.ui.state.tool == vivarium_ui::state::Tool::Eraser;
-        let kind = if erase {
-            MaterialKind::Empty
-        } else {
-            self.ui.state.material
-        };
+        use vivarium_ui::state::Tool;
+        let tool = self.ui.state.tool;
 
         // 两点之间按格插值。步长取 1 格，保证不会漏格——
         // 笔刷半径大于 1 时其实可以稀疏些，但"可能漏格"是那种
@@ -703,7 +784,14 @@ impl Game {
             let t = i as f32 / steps as f32;
             let px = from.0 as f32 + (x - from.0) as f32 * t;
             let py = from.1 as f32 + (y - from.1) as f32 * t;
-            self.stamp(px.round() as i32, py.round() as i32, kind);
+            let (px, py) = (px.round() as i32, py.round() as i32);
+            match tool {
+                Tool::EraseLife => self.stamp_erase_life(px, py),
+                Tool::EraseMatter => {
+                    self.stamp(px, py, MaterialKind::Empty);
+                }
+                _ => self.stamp(px, py, self.ui.state.material),
+            }
         }
         self.last_paint = Some((x, y));
     }
@@ -714,10 +802,41 @@ impl Game {
         stamp_circle(&mut self.world, x, y, r, kind);
     }
 
+    /// 生物橡皮：把圆里的**有机体**整个抹掉。
+    ///
+    /// 抹掉一个个体是**整体**的，不是"抹掉圆里的那几格细胞"——
+    /// 半截身体不是生物，它既不能动也不能繁殖，只会占着格子烂不掉。
+    /// 所以判据是"这个个体的身体有没有任何一格落在圆里"。
+    ///
+    /// 水要还：身体占住的每一格都是从水里借的（`Cell::wet`）。
+    /// 不还的话，抹掉一条鱼就等于从世界里挖掉三格水——而玩家会一直抹。
+    fn stamp_erase_life(&mut self, x: i32, y: i32) {
+        let r = self.ui.state.brush as i32;
+        let r2 = r * r;
+        let mut victims: Vec<vivarium_core::OrganismId> = Vec::new();
+        for org in self.life.organisms() {
+            let hit = org.cells.iter().any(|c| {
+                let (cx, cy) = org.cell_at(c);
+                let (dx, dy) = (cx - x, cy - y);
+                dx * dx + dy * dy <= r2
+            });
+            if hit {
+                victims.push(org.id);
+            }
+        }
+        if victims.is_empty() {
+            return;
+        }
+        let removed = self.life.remove_organisms(&mut self.world, &victims);
+        self.erased += removed;
+    }
+
     /// 油漆桶：把和 `(x, y)` 连成一片的同种材质换成当前材质。
     fn flood_fill(&mut self, x: i32, y: i32) {
         let kind = match self.ui.state.tool {
-            vivarium_ui::state::Tool::Eraser => MaterialKind::Empty,
+            // 油漆桶只有"擦物质"这一种擦除语义：填充一整片生物没有意义，
+            // 而"把这片石头换成水"是它最常用的用法。
+            vivarium_ui::state::Tool::EraseMatter => MaterialKind::Empty,
             _ => self.ui.state.material,
         };
         let (filled, capped) = flood_fill_region(&mut self.world, x, y, kind, FILL_CAP);
@@ -827,6 +946,9 @@ impl Game {
         // 生命层也要重建：旧世界里的有机体都站在已经不存在的格子上，
         // 占格表还指着它们——不重建的话，新地形里会凭空多出一堆幽灵细胞。
         self.life = LifeSim::new(&mut self.world);
+        // 地形换了，光场也得跟着重算——`LifeSim::new` 已经刷过一次，
+        // 但那只覆盖了光；温度场是新初始化的，这里不用再动。
+        self.renderer.set_view_mode(self.ui.state.view);
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
@@ -871,6 +993,11 @@ impl Game {
 
         // --- 画 -----------------------------------------------------------
         //
+        // 场要**先**传上去：着色器在材质 / 温度 / 光照 / 物种四种滤镜里
+        // 都可能读它，而上传是按版本号跳过的，没变就什么都不做。
+        self.renderer.upload_field(self.life.field());
+        self.renderer.set_view_mode(self.ui.state.view);
+
         // device / queue 先克隆出来：`render_with` 要独占 `renderer`，
         // 而闭包里又要用 device/queue。wgpu 的这两样都是引用计数的句柄，
         // 克隆是廉价的。
@@ -933,9 +1060,69 @@ impl Game {
             stranded: life.stranded,
             food: self.life.food_cells(&self.world),
             census: self.world.census(),
+            field: self.life.field().stats(),
+            hover: self.hover_info(),
             history: self.history.clone(),
             selected: self.selected_view(),
         }
+    }
+
+    /// 光标下面那一格的属性。
+    ///
+    /// 每帧都算一遍，因为光标每帧都可能动。成本是常数：一次 `cell_at`
+    /// 加四次查表，和"扫一遍世界"完全不是一个量级。
+    fn hover_info(&self) -> Option<vivarium_ui::state::CellInfo> {
+        let (x, y) = self.cell_under_cursor()?;
+        let (xs, ys) = (x as isize, y as isize);
+        let material = self.world.get(xs, ys);
+
+        // 深度：先找这一列的**水面线**（最上面那一格水），再算 y - 水面线。
+        //
+        // 不能"往上数到第一个非水格就停"：站在岛上时往上数会先数到石头，
+        // 于是"离水面多高"变成了"头顶有几格石头"。按列找水面线对任何形状都成立。
+        //
+        // 单独算而不是从光照反推：站在岛的阴影里时"深度很浅而光为 0"，
+        // 这两个数必须分开显示，否则用户会以为光场算错了。
+        let waterline = (0..self.world.height() as i32)
+            .find(|yy| self.world.get(xs, *yy as isize) == MaterialKind::Water);
+        let depth = match waterline {
+            // 水面之上是负数，水面那一格是 0。
+            Some(wl) => y - wl,
+            // 整列没有水（纯陆地或纯天空），"深度"没有意义。
+            None => 0,
+        };
+
+        let owner = self.world.owner(xs, ys);
+        let organism = if owner.organism == 0 {
+            None
+        } else {
+            self.life.organism(owner.organism).map(|o| {
+                let cell = o
+                    .cells
+                    .iter()
+                    .find(|c| o.cell_at(c) == (x, y))
+                    .map(|c| c.kind)
+                    .unwrap_or(CellType::Producer);
+                vivarium_ui::state::HoverOrganism {
+                    id: o.id,
+                    cells: o.cells.len(),
+                    generation: o.generation,
+                    energy: (o.energy, o.max_energy()),
+                    producers: o.count(CellType::Producer),
+                    cell,
+                }
+            })
+        };
+
+        Some(vivarium_ui::state::CellInfo {
+            x,
+            y,
+            material,
+            organism,
+            light: self.life.field().light_at(x as f32, y as f32),
+            temp: self.life.field().temp_at(x as f32, y as f32),
+            depth,
+        })
     }
 
     /// 把"界面里选中的那个 id"翻译成一个值快照。

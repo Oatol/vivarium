@@ -22,7 +22,9 @@ struct Scene {
     world: vec2<f32>,
     // 一格在屏幕上占多少像素。用来算抗锯齿宽度。
     px_per_cell: f32,
-    _pad: f32,
+    // 显示滤镜：0 材质 / 1 温度 / 2 光照 / 3 物种。
+    // 必须与 `ViewMode::as_u32` 一致。
+    view_mode: u32,
     // 0..15 材质，16..22 细胞类型。只用 rgb，a 空着。
     //
     // 中间那一段空隙不是浪费：材质和细胞是两套编号，共用一个数组时必须
@@ -35,8 +37,19 @@ struct Scene {
 // 细胞类型在 `palette` 里的起始下标。必须与 `palette.rs` 的同名常数一致。
 const CELL_PALETTE_BASE: u32 = 16u;
 
+// 粗网格的边长。必须与 `field::AIR_CELL` 一致。
+const AIR_CELL: f32 = 4.0;
+
+// 滤镜编号。必须与 `ViewMode::as_u32` 一致。
+const VIEW_MATERIAL: u32 = 0u;
+const VIEW_TEMPERATURE: u32 = 1u;
+const VIEW_LIGHT: u32 = 2u;
+const VIEW_SPECIES: u32 = 3u;
+
 @group(0) @binding(0) var<uniform> u: Scene;
 @group(0) @binding(1) var world_tex: texture_2d<u32>;
+// 场纹理：r = 光照（0..1），g = 温度 / 1200（0..1）。尺寸是粗网格。
+@group(0) @binding(2) var field_tex: texture_2d<f32>;
 
 struct VsOut {
     @builtin(position) clip_pos: vec4<f32>,
@@ -91,6 +104,90 @@ fn same_organism(a: u32, org: u32) -> bool {
     return is_cell(a) && organism_of(a) == org;
 }
 
+// ---------------------------------------------------------------------------
+// 场：光照与温度
+// ---------------------------------------------------------------------------
+
+fn field_at(c: vec2<i32>) -> vec2<f32> {
+    let n = vec2<i32>(textureDimensions(field_tex, 0));
+    let p = clamp(c, vec2<i32>(0), n - vec2<i32>(1));
+    return textureLoad(field_tex, p, 0).rg;
+}
+
+// 双线性采样。场是**粗**的（4 格一格），不插值的话滤镜上是一层 4 像素的
+// 马赛克；而温度本来就该是连续的。四次 textureLoad 换掉一个采样器，
+// 顺带也不用管 `Rg32Float` 不可过滤这件事。
+fn field_smooth(world_pos: vec2<f32>) -> vec2<f32> {
+    let g = world_pos / AIR_CELL - vec2<f32>(0.5);
+    let base = vec2<i32>(floor(g));
+    let f = g - floor(g);
+    let a = field_at(base);
+    let b = field_at(base + vec2<i32>(1, 0));
+    let c = field_at(base + vec2<i32>(0, 1));
+    let d = field_at(base + vec2<i32>(1, 1));
+    return mix(mix(a, b, f.x), mix(c, d, f.x), f.y);
+}
+
+// 热色带。色标照搬 TPT 的 `heatTable`——那套颜色在深色底上已经被
+// 验证过二十年，而"从蓝到红"这种朴素渐变在中间段全是脏褐色。
+//
+// 返回值是**线性**的：色标本身是按 sRGB 写的，而着色器输出线性值。
+// 这里用 `c*c` 近似 sRGB 解码（真解码是 `pow(c, 2.4)`）。
+// 差多少：0.5 → 0.25 vs 0.218，肉眼在热力图上分辨不出来，
+// 而它省掉每个像素三次 `pow`——那是一整帧里最贵的一条指令。
+fn heat_ramp(t: f32) -> vec3<f32> {
+    let x = clamp(t, 0.0, 1.0);
+    var c: vec3<f32>;
+    if (x < 0.05) {
+        c = mix(vec3<f32>(0.169, 0.0, 1.0), vec3<f32>(0.0, 0.753, 1.0), x / 0.05);
+    } else if (x < 0.08) {
+        c = mix(vec3<f32>(0.0, 0.753, 1.0), vec3<f32>(0.0, 1.0, 0.922), (x - 0.05) / 0.03);
+    } else if (x < 0.19) {
+        c = mix(vec3<f32>(0.0, 1.0, 0.922), vec3<f32>(0.0, 1.0, 0.078), (x - 0.08) / 0.11);
+    } else if (x < 0.25) {
+        c = mix(vec3<f32>(0.0, 1.0, 0.078), vec3<f32>(0.294, 1.0, 0.0), (x - 0.19) / 0.06);
+    } else if (x < 0.37) {
+        c = mix(vec3<f32>(0.294, 1.0, 0.0), vec3<f32>(0.784, 1.0, 0.0), (x - 0.25) / 0.12);
+    } else if (x < 0.45) {
+        c = mix(vec3<f32>(0.784, 1.0, 0.0), vec3<f32>(1.0, 0.863, 0.0), (x - 0.37) / 0.08);
+    } else if (x < 0.71) {
+        c = mix(vec3<f32>(1.0, 0.863, 0.0), vec3<f32>(1.0, 0.0, 0.0), (x - 0.45) / 0.26);
+    } else {
+        c = mix(vec3<f32>(1.0, 0.0, 0.0), vec3<f32>(1.0, 0.0, 0.863), (x - 0.71) / 0.29);
+    }
+    return c * c;
+}
+
+// 光色带：黑 → 深蓝 → 青 → 暖白。同样返回线性值。
+fn light_ramp(l: f32) -> vec3<f32> {
+    let x = clamp(l, 0.0, 1.0);
+    var c: vec3<f32>;
+    if (x < 0.15) {
+        c = mix(vec3<f32>(0.0), vec3<f32>(0.03, 0.08, 0.24), x / 0.15);
+    } else if (x < 0.40) {
+        c = mix(vec3<f32>(0.03, 0.08, 0.24), vec3<f32>(0.08, 0.35, 0.55), (x - 0.15) / 0.25);
+    } else if (x < 0.70) {
+        c = mix(vec3<f32>(0.08, 0.35, 0.55), vec3<f32>(0.35, 0.75, 0.78), (x - 0.40) / 0.30);
+    } else {
+        c = mix(vec3<f32>(0.35, 0.75, 0.78), vec3<f32>(1.0, 1.0, 0.94), (x - 0.70) / 0.30);
+    }
+    return c * c;
+}
+
+fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
+    let k = vec3<f32>(5.0, 3.0, 1.0);
+    let p = abs(fract(vec3<f32>(h) + k / 6.0) * 6.0 - vec3<f32>(3.0));
+    return v * mix(vec3<f32>(1.0), clamp(p - vec3<f32>(1.0), vec3<f32>(0.0), vec3<f32>(1.0)), s);
+}
+
+// 物种色：黄金角散布色相，和 `palette::organism_rgb` 同一个公式。
+// 相邻编号的颜色差得最开，"两条鱼贴在一起"也能一眼分出是两条。
+fn species_color(id: u32) -> vec3<f32> {
+    let hue = f32((id * 137u) % 360u) / 360.0;
+    let c = hsv2rgb(hue, 0.70, 1.0);
+    return c * c;
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     let bg = u.palette[0].rgb;
@@ -103,6 +200,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     }
 
     let key = textureLoad(world_tex, coord, 0).r;
+
+    // --- 场滤镜：不看材质，整屏都是场 -----------------------------------
+    //
+    // 温度 / 光照两个滤镜**完全忽略**材质和细胞。这不是偷懒：它们的用途是
+    // "把一层不可见的数据变成可看的图"，掺进材质颜色就分不清"这一格是热的"
+    // 还是"这一格是沙子"。
+    if (u.view_mode == VIEW_TEMPERATURE) {
+        let f = field_smooth(world_pos);
+        return vec4<f32>(heat_ramp(f.y), 1.0);
+    }
+    if (u.view_mode == VIEW_LIGHT) {
+        let f = field_smooth(world_pos);
+        return vec4<f32>(light_ramp(f.x), 1.0);
+    }
+    // --- 物种滤镜：每个个体一个色相，材质压成暗剪影 ---------------------
+    if (u.view_mode == VIEW_SPECIES) {
+        if (!is_cell(key)) {
+            let id = key & 0xFFu;
+            // 材质压到 12%：地形还在，但绝不抢戏。
+            // 0 号是空位，压完几乎等于背景——这正是"没有东西"该有的样子。
+            return vec4<f32>(u.palette[id].rgb * 0.12, 1.0);
+        }
+        let c = species_color(organism_of(key)) * 0.92;
+        return vec4<f32>(c, 1.0);
+    }
 
     // 材质：直接查表。地形不需要形状，方块就是它该有的样子。
     // 水额外按深度压暗——一片纯色的蓝看不出这是"有深度的水"，

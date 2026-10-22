@@ -65,6 +65,30 @@ fn demo_snapshot() -> Snapshot {
         stranded: 4,
         food: 318,
         census,
+        field: vivarium_core::FieldStats {
+            sources: 3,
+            avg_light: 0.42,
+            max_light: 1.0,
+            temp_range: (18.0, 620.0),
+            avg_temp: 21.5,
+        },
+        // 悬停读数要能在预览图里看到，所以给一格"有生物"的数据。
+        hover: Some(vivarium_ui::state::CellInfo {
+            x: 271,
+            y: 168,
+            material: vivarium_core::MaterialKind::Empty,
+            organism: Some(vivarium_ui::state::HoverOrganism {
+                id: 4821,
+                cells: 10,
+                generation: 37,
+                energy: (612, 1400),
+                producers: 4,
+                cell: vivarium_core::CellType::Producer,
+            }),
+            light: 0.71,
+            temp: 22.0,
+            depth: 19,
+        }),
         history: (0..120)
             .map(|i| {
                 let t = i as f32 / 12.0;

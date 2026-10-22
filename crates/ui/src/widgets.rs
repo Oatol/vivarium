@@ -144,6 +144,10 @@ pub enum Icon {
     Brush,
     /// 橡皮：一个方块加斜杠。
     Eraser,
+    /// 生物橡皮：一个圆（细胞）加斜杠。
+    EraseLife,
+    /// 点光源：一个圆心加四道射线。
+    Lamp,
     /// 矩形：空心方框。
     Rect,
     /// 直线：对角线。
@@ -181,6 +185,26 @@ fn draw_icon(p: &egui::Painter, icon: Icon, r: Rect, ink: Color32, s: Stroke) {
                 StrokeKind::Inside,
             );
             p.line_segment([egui::pos2(l + 2.0, b), egui::pos2(rt - 2.0, cy - 3.0)], s);
+        }
+        Icon::EraseLife => {
+            // 一个圆（细胞）+ 一道斜杠。和物质橡皮的区别只在"擦的是什么"，
+            // 所以图标也只换那一个形状：方块 → 圆。
+            p.circle_stroke(egui::pos2(cx, cy + 1.0), (rt - l) * 0.30, s);
+            p.line_segment([egui::pos2(l + 1.0, b), egui::pos2(rt - 1.0, t)], s);
+        }
+        Icon::Lamp => {
+            // 圆心 + 四道短射线。不放满八道：工具条只有 20px，
+            // 八道射线在那个尺寸下会糊成一个太阳。
+            p.circle_filled(egui::pos2(cx, cy), 2.0, ink);
+            for (dx, dy) in [(0.0f32, -1.0f32), (0.0, 1.0), (-1.0, 0.0), (1.0, 0.0)] {
+                p.line_segment(
+                    [
+                        egui::pos2(cx + dx * 4.0, cy + dy * 4.0),
+                        egui::pos2(cx + dx * 7.0, cy + dy * 7.0),
+                    ],
+                    s,
+                );
+            }
         }
         Icon::Rect => {
             p.rect_stroke(

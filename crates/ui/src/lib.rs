@@ -140,7 +140,8 @@ impl Default for Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vivarium_core::CellType;
+    use crate::state::{CellInfo, HoverOrganism};
+    use vivarium_core::{CellType, MaterialKind, ViewMode};
 
     fn screen() -> egui::RawInput {
         egui::RawInput {
@@ -280,5 +281,85 @@ mod tests {
             "中央高度 {} 小于预期 {expect_h}",
             out.central.height()
         );
+    }
+
+    fn hover_cell() -> CellInfo {
+        CellInfo {
+            x: 214,
+            y: 137,
+            material: MaterialKind::Water,
+            organism: Some(HoverOrganism {
+                id: 312,
+                cells: 12,
+                generation: 7,
+                energy: (412, 480),
+                producers: 6,
+                cell: CellType::Producer,
+            }),
+            light: 0.71,
+            temp: 20.3,
+            depth: 42,
+        }
+    }
+
+    /// 悬停读数**只在有内容时画**，而且不能画到屏幕外。
+    ///
+    /// 两个方向都要守：没有 `hover` 时一个图元都不该多（否则它会在
+    /// 世界里一直挂着一个空框）；有 `hover` 时必须真的多出框和文字。
+    #[test]
+    fn the_hover_readout_draws_only_when_there_is_something_under_the_pointer() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let mut snap = Snapshot::default();
+        let pointer = egui::pos2(400.0, 300.0);
+        let input = || egui::RawInput {
+            events: vec![egui::Event::PointerMoved(pointer)],
+            ..screen()
+        };
+
+        let (_, mut full) = ui.show(&mut state, &snap, input());
+        let plain = full.shapes.len();
+        full.textures_delta.clear();
+
+        snap.hover = Some(hover_cell());
+        let (_, mut full) = ui.show(&mut state, &snap, input());
+        let hovered = full.shapes.len();
+        let widest = full
+            .shapes
+            .iter()
+            .map(|s| s.shape.visual_bounding_rect().max.x)
+            .fold(0.0_f32, f32::max);
+        full.textures_delta.clear();
+
+        assert!(
+            hovered > plain,
+            "悬停时应当多画一个框和五行字：{plain} → {hovered}"
+        );
+        assert!(widest <= 1100.5, "读数被画到了屏幕外：右边界 {widest}");
+    }
+
+    /// 换滤镜**不许动世界的矩形**。
+    ///
+    /// 滤镜只改 shader 里的分支，不该参与布局。要是哪天某个滤镜按钮
+    /// 换成了更宽的标签、把顶栏撑高一行，世界就会在切换滤镜时跳一下——
+    /// 而那种跳动看起来像"渲染抖动"，没人会想到是布局。
+    #[test]
+    fn switching_the_filter_does_not_move_the_world() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot::default();
+
+        let mut rects = Vec::new();
+        for mode in ViewMode::ALL {
+            state.view = mode;
+            let (out, mut full) = ui.show(&mut state, &snap, screen());
+            full.textures_delta.clear();
+            rects.push((mode.label(), out.central));
+        }
+
+        let first = rects[0].1;
+        for (label, rect) in &rects {
+            assert_eq!(*rect, first, "切到「{label}」之后世界矩形变了");
+        }
     }
 }

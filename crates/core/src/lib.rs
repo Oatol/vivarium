@@ -23,9 +23,11 @@
 //! 它管着材质规则、并行扫描顺序和生物的运动方式。
 
 pub mod body;
+pub mod field;
 pub mod grn;
 pub mod life;
 pub use body::{BodyPlan, PLANS};
+pub use field::{AirField, FieldStats, LightSource, ViewMode, AIR_CELL};
 pub use grn::Grn;
 pub use life::{CellType, OrganismId};
 pub mod life_sim;
