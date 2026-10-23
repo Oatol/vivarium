@@ -252,7 +252,7 @@ impl Grn {
     }
 
     /// 所有已经打开的规则槽。
-    fn open_slots(&self) -> Vec<(usize, usize, usize, usize)> {
+    pub fn open_slots(&self) -> Vec<(usize, usize, usize, usize)> {
         let mut out = Vec::new();
         for (depth, row) in self.rules.iter().enumerate() {
             for (kind, by_from) in row.iter().enumerate() {
