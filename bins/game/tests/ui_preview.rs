@@ -134,7 +134,7 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
     direct[12 * 6 + 2] = -3.0; // 光照 → 上（负向抑制）
     direct[8 * 6 + 4] = 2.0; // 能量 → 吃
 
-    let mut inputs = [0.0f32; 17];
+    let mut inputs = [0.0f32; vivarium_core::life::INPUTS];
     inputs[0] = 1.0; // 前方有食物
     inputs[8] = 0.62; // 能量
     inputs[9] = 0.06; // 年龄
@@ -142,6 +142,9 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
     inputs[12] = 0.70; // 光照
     inputs[13] = 0.35; // 食物在右前方
     inputs[14] = 0.55; // 偏下
+    // M2a 的递归状态：让截图里那 5 根新条也有东西可看。
+    inputs[18] = 0.8; // 上次向右
+    inputs[21] = 0.25; // 卡了 2 tick
 
     let outputs = [0.05f32, 0.71, -0.24, 0.42, 0.86, 0.12];
 

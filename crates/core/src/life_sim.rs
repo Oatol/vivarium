@@ -35,10 +35,12 @@ use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
     IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
-    IN_ORGANISM_DIR_X, IN_ORGANISM_DIR_Y, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT,
+    IN_ORGANISM_DIR_X, IN_ORGANISM_DIR_Y, IN_PREV_DOWN, IN_PREV_LEFT, IN_PREV_RIGHT, IN_PREV_UP,
+    IN_STUCK, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT,
     OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
+use crate::organelle::{ARMOR, CHLORO_SHIFT, DIGEST, STING};
 use crate::rng::Rng;
 use crate::world::World;
 
@@ -437,6 +439,14 @@ pub struct LifeStats {
     /// 健康的比例大致是"水平明显多于垂直，但垂直不为零"：
     /// 水平是巡航，垂直是觅食与趋光。**垂直恒为 0 就是有 bug**。
     pub moved: [u32; 4],
+    /// 本 tick 有多少次移动是**斜向**的（两个轴同时动）。
+    ///
+    /// 单独一个计数，因为 `moved` 只记"主导轴"：`(1, 1)` 会被记成"右"，
+    /// 于是"斜向到底有没有发生"从 `moved` 里完全看不出来。
+    ///
+    /// 这条是 M2a 那条"顺坡移动"的**唯一直接证据**——如果它恒为 0，
+    /// 说明斜向从来没被选中过，而"鱼能上岸"就只是个说法。
+    pub diagonal: u32,
     /// 最浅的那个个体的锚点 y（越小越靠近水面）。空种群时为 0。
     ///
     /// 和 `deepest` 一起看，才知道"鱼是在水里散开的，还是全挤在水面一层"。
@@ -948,6 +958,22 @@ impl LifeSim {
             } else {
                 org.energy -= upkeep;
                 dissipated += upkeep as u64;
+                // ---- L2 表观遗传：压力累积 ----
+                //
+                // "饿"的判据不是"付不起"，而是"付完之后剩不下多少"——
+                // 一个刚好够付的个体下一 tick 就要死，它这一 tick 就该紧张。
+                //
+                // 为什么要记这个数：它是"环境变差时种群自己加快变异"的载体
+                // （见 `reproduce`）。真实生物里这叫 stress-induced mutagenesis，
+                // 而它**不改变"遗传的是基因"这个前提**——`stress` 不进基因，
+                // 它只调子代的变异率。
+                if org.energy < upkeep * 4 {
+                    org.stress = org.stress.saturating_add(1);
+                } else {
+                    // 缓过来就慢慢松下来。衰减比累积慢，所以一次饥荒的
+                    // 影响会持续好几代——这正是"母体效应"该有的样子。
+                    org.stress = org.stress.saturating_sub(1);
+                }
             }
         }
         self.ledger.dissipated += dissipated;
@@ -1005,7 +1031,7 @@ impl LifeSim {
             killers += org
                 .cells
                 .iter()
-                .filter(|c| c.kind == CellType::Killer)
+                .filter(|c| c.organelles.has(STING))
                 .count();
             let fp: Vec<(i32, i32)> = org.footprint().collect();
             if !Self::touches_water(world, org.width, &fp) {
@@ -1134,11 +1160,11 @@ impl LifeSim {
         // 先收集再结算：结算要同时改两个有机体，边遍历边改借不过编译器。
         let mut bites: Vec<(OrganismId, OrganismId)> = Vec::new();
         for org in &self.organisms {
-            let mut killers = org.cells.iter().filter(|c| c.kind == CellType::Killer);
+            let mut killers = org.cells.iter().filter(|c| c.organelles.has(STING));
             if killers.next().is_none() {
                 continue;
             }
-            for cell in org.cells.iter().filter(|c| c.kind == CellType::Killer) {
+            for cell in org.cells.iter().filter(|c| c.organelles.has(STING)) {
                 let (kx, ky) = org.cell_at(cell);
                 for (dx, dy) in NEIGHBORS_4 {
                     let nx = org.wrap_x(kx + dx);
@@ -1161,7 +1187,7 @@ impl LifeSim {
             let armor = self.organisms[qi]
                 .cells
                 .iter()
-                .filter(|c| c.kind == CellType::Armor)
+                .filter(|c| c.organelles.has(ARMOR))
                 .count() as u32;
             let bite = PREDATION_BITE.saturating_sub(armor * ARMOR_ABSORB);
             let dealt = bite.min(self.organisms[qi].energy);
@@ -1217,7 +1243,11 @@ impl LifeSim {
 
         let mut injected = 0u64;
         for org in &mut self.organisms {
-            let producers = org.count(CellType::Producer);
+            let producers = org
+                .cells
+                .iter()
+                .filter(|c| c.organelles.level(CHLORO_SHIFT) > 0)
+                .count();
             if producers == 0 {
                 continue;
             }
@@ -1617,13 +1647,47 @@ impl LifeSim {
             }
         }
 
+        // 移动 + 撞墙 fallback + `stuck` 计数。
+        //
+        // ## 为什么要有 fallback
+        //
+        // 旧写法撞墙就 `break`——本 tick 剩下的位移全部作废，而且**不会
+        // 退而求其次试第二名的方向**。于是一条"向右"权重稍大的鱼撞上崖壁
+        // 之后，会一直向右、一直撞、一直向右。玩家看到的是"只朝一个方向游"。
+        //
+        // 现在：主方向失败时，如果它是斜向，就退到两个单向里各试一次。
+        // 15 行改动，把"撞墙即停"变成"沿岸蹭着走"。
+        let mut moved_any = false;
         if let Some((dx, dy)) = pick_direction(&out) {
             let speed = self.organisms[i].speed();
             for _ in 0..speed {
-                if !self.try_move(world, i, dx, dy, MoveKind::Swim) {
+                if self.try_move(world, i, dx, dy, MoveKind::Swim) {
+                    moved_any = true;
+                    continue;
+                }
+                let mut fell_back = false;
+                if dx != 0 && dy != 0 {
+                    for (ax, ay) in [(dx, 0), (0, dy)] {
+                        if self.try_move(world, i, ax, ay, MoveKind::Swim) {
+                            fell_back = true;
+                            moved_any = true;
+                            break;
+                        }
+                    }
+                }
+                if !fell_back {
                     break;
                 }
             }
+        }
+        // 一个 tick 里一格也没走成，就记一次"卡住"。
+        //
+        // 这是 `IN_STUCK` 的来源，也是"这个个体是不是卡住了"的直接证据——
+        // 画面上一条鱼在原地不动，和一条鱼在慢慢蠕动，看起来是同一件事。
+        if moved_any {
+            self.organisms[i].stuck = 0;
+        } else {
+            self.organisms[i].stuck = self.organisms[i].stuck.saturating_add(1);
         }
 
         if out[OUT_REPRODUCE] > 0.0 {
@@ -1757,6 +1821,22 @@ impl LifeSim {
         inp[IN_FOOD_DIR_Y] = smell_y.clamp(-1.0, 1.0);
         inp[IN_ORGANISM_DIR_X] = org_x.clamp(-1.0, 1.0);
         inp[IN_ORGANISM_DIR_Y] = org_y.clamp(-1.0, 1.0);
+
+        // ---- M2a：递归状态 ----
+        //
+        // 把上一 tick 的输出喂回来。这是**记忆**，不是学习：
+        // 遗传的仍然只有基因，一生的经历不进基因。
+        //
+        // 它买到的东西正好是原来缺的三样：惯性巡航（上一 tick 在向右 →
+        // 这一 tick 继续）、撞墙后转向（`IN_BLOCKED_*` × `IN_PREV_*`）、
+        // 以及节律（能表达"走两格停一格"这种模式，纯前馈网络表达不了）。
+        inp[IN_PREV_LEFT] = org.last_out[OUT_LEFT];
+        inp[IN_PREV_RIGHT] = org.last_out[OUT_RIGHT];
+        inp[IN_PREV_UP] = org.last_out[OUT_UP];
+        inp[IN_PREV_DOWN] = org.last_out[OUT_DOWN];
+        // 8 tick 封顶再归一化：超过 8 tick 的"卡住"没有更多信息，
+        // 而一个无上限的计数会让权重的量级随世界大小漂。
+        inp[IN_STUCK] = (org.stuck as f32 / 8.0).min(1.0);
         inp
     }
 
@@ -1817,7 +1897,7 @@ impl LifeSim {
     fn plankton_target(&self, world: &World, i: usize) -> Option<OrganismId> {
         let org = &self.organisms[i];
         for cell in &org.cells {
-            if cell.kind != CellType::Mouth {
+            if !cell.organelles.has(DIGEST) {
                 continue;
             }
             let (x, y) = org.cell_at(cell);
@@ -1904,7 +1984,7 @@ impl LifeSim {
     fn food_target(&self, world: &World, i: usize) -> Option<(isize, isize)> {
         let org = &self.organisms[i];
         for cell in &org.cells {
-            if cell.kind != CellType::Mouth {
+            if !cell.organelles.has(DIGEST) {
                 continue;
             }
             let (x, y) = org.cell_at(cell);
@@ -1998,6 +2078,25 @@ impl LifeSim {
             } else if !Self::passable(world, x, y) {
                 return false;
             }
+            // **斜向不能穿过对角缝。**
+            //
+            // 网格上斜着走，两个正交邻格可能都是墙，只有对角那一格是空的。
+            // 直接放行的话生物会"穿墙缝"——这是所有 8 向网格移动的经典 bug，
+            // 而且症状极具欺骗性：一条 1 格厚的墙看着完好，生物却过去了。
+            //
+            // 判据取"至少一个正交邻格能过"而不是"两个都能过"：
+            // 身体是软的，挤过半开的缝隙是合理的。代价是 1 格厚的墙
+            // 在拐角处有一个斜向漏洞——`diagonal_cannot_slip_through_a_wall`
+            // 那条测试钉的就是这个。
+            if dx != 0 && dy != 0 {
+                let a = (x - dx, y);
+                let b = (x, y - dy);
+                let a_ok = Self::passable(world, a.0, a.1) || old.contains(&a);
+                let b_ok = Self::passable(world, b.0, b.1) || old.contains(&b);
+                if !a_ok && !b_ok {
+                    return false;
+                }
+            }
         }
 
         // 身体不能整个离开水（SPEC §2.0：生物默认水生）。
@@ -2079,6 +2178,10 @@ impl LifeSim {
             self.stats.fell += 1;
             self.fell_total += 1;
         } else {
+            // 斜向单独记一笔：`moved` 只记主导轴，看不出来。
+            if dx != 0 && dy != 0 {
+                self.stats.diagonal += 1;
+            }
             // 方向计数：`[左, 右, 上, 下]`。
             let dir = match (dx.signum(), dy.signum()) {
                 (-1, _) => 0,
@@ -2146,7 +2249,13 @@ impl LifeSim {
         let facing = parent.facing;
         let generation = parent.generation + 1;
         let mut genome = parent.genome.clone();
-        genome.mutate(&mut self.rng, MUTATION_RATE, MUTATION_SIGMA);
+        // L2 表观遗传：压力大的亲代生出变异更大的子代。
+        //
+        // **上限 ×2** 是必须的。这是一个正反馈（越差越乱变 → 越乱变越差），
+        // 没有上限的话一次饥荒就能把整个种群推进"随机噪声"。
+        let stress = parent.stress.min(64) as f32 / 64.0;
+        let sigma = MUTATION_SIGMA * (1.0 + stress);
+        genome.mutate(&mut self.rng, MUTATION_RATE, sigma);
 
         let child = Organism {
             id: 0, // spawn 会分配
@@ -2166,6 +2275,10 @@ impl LifeSim {
             last_out: [0.0; OUTPUTS],
             energy_hist: [0; crate::life::ENERGY_HIST],
             hist_head: 0,
+            stuck: 0,
+            // 子代从 0 开始：压力是**这一生**的经历，不是继承来的。
+            // （母体效应体现在变异率上，已经作用在 `genome` 里了。）
+            stress: 0,
         };
 
         // 子代与亲代不能占同一批格子。候选位置在切比雪夫距离 6 以内，
@@ -2445,6 +2558,12 @@ fn pick_direction(out: &[f32; OUTPUTS]) -> Option<(i32, i32)> {
         (OUT_UP, 0, -1),
         (OUT_DOWN, 0, 1),
     ];
+    // **主方向仍然是 argmax**，和 M2a 之前一模一样。
+    //
+    // 这一点是刻意的：`handcrafted_fish_genome` 里那个 0.7 的巡航偏置、
+    // 那一堆 `connect(IN_BLOCKED_*, OUT_*, 10.0)` 都是按"四选一取最大"
+    // 调出来的。改成"水平垂直各自判阈值"会让它们全部失效，需要重新调参——
+    // 而那是 M2b 之后、身体描述稳定下来才该做的事。
     let mut best: Option<(f32, i32, i32)> = None;
     for (idx, dx, dy) in candidates {
         let v = out[idx];
@@ -2455,7 +2574,37 @@ fn pick_direction(out: &[f32; OUTPUTS]) -> Option<(i32, i32)> {
             best = Some((v, dx, dy));
         }
     }
-    best.map(|(_, dx, dy)| (dx, dy))
+    let (_, dx, dy) = best?;
+
+    // **次方向**：与主方向垂直的那一对里，如果也超过阈值，就斜着走。
+    //
+    // 于是"斜向"只在"垂直方向也足够强"时才发生——平地上巡航仍然是直线，
+    // 而在 45° 的坡上（水平一格 + 垂直一格正好是坡度 1），趋光信号会
+    // 自然地把次方向推过阈值，身体就顺着坡上去了。
+    //
+    // 这就是"顺坡移动不需要贴坡逻辑"的实现：**坡度 ≤ 1 + 允许斜向**。
+    let (ax, ay, second) = if dx != 0 {
+        let up = out[OUT_UP];
+        let down = out[OUT_DOWN];
+        if up >= down {
+            (0, -1, up)
+        } else {
+            (0, 1, down)
+        }
+    } else {
+        let left = out[OUT_LEFT];
+        let right = out[OUT_RIGHT];
+        if left >= right {
+            (-1, 0, left)
+        } else {
+            (1, 0, right)
+        }
+    };
+    if second > MOVE_THRESHOLD {
+        Some((dx + ax, dy + ay))
+    } else {
+        Some((dx, dy))
+    }
 }
 
 /// 手工基因组的"社交倾向"：**有没有牙决定往哪边走**。
@@ -2655,7 +2804,7 @@ pub fn stock_surface(
     // 倾向按**长出来的身体**决定，不按体型表：形态发生模式下
     // "这是不是捕食者"只有长完才知道。
     let tactic_of = |cells: &[Cell]| {
-        if cells.iter().any(|c| c.kind == CellType::Killer) {
+        if cells.iter().any(|c| c.organelles.has(STING)) {
             Tactic::Hunt
         } else {
             Tactic::Ignore
@@ -3181,7 +3330,122 @@ mod tests {
         out[OUT_UP] = MOVE_THRESHOLD + 0.01;
         assert_eq!(pick_direction(&out), Some((0, -1)));
         out[OUT_RIGHT] = 0.9;
-        assert_eq!(pick_direction(&out), Some((1, 0)), "更强的方向胜出");
+        // **M2a 之后这条断言变了**：垂直方向仍然超过阈值，于是斜着走。
+        // 主方向仍然是 argmax（`OUT_RIGHT` 赢了），但次方向够强就叠加。
+        assert_eq!(
+            pick_direction(&out),
+            Some((1, -1)),
+            "主方向 + 够强的次方向 = 斜向"
+        );
+        // 把垂直压回阈值以下，就回到纯水平巡航。
+        out[OUT_UP] = 0.0;
+        assert_eq!(pick_direction(&out), Some((1, 0)), "没有次方向时是纯水平");
+    }
+
+    #[test]
+    fn diagonal_needs_a_second_axis_that_is_also_strong() {
+        // 斜向不是白给的：次方向必须**自己也超过阈值**。
+        //
+        // 这条是"平地上巡航仍然是直线"的保证。如果斜向免费，所有生物都会
+        // 退化成纯对角运动（8 向里只剩 4 个），而那会让"水平游"这个动作消失。
+        let mut out = [0.0f32; OUTPUTS];
+        out[OUT_RIGHT] = 0.9;
+        out[OUT_DOWN] = MOVE_THRESHOLD * 0.5;
+        assert_eq!(pick_direction(&out), Some((1, 0)), "次方向太弱不该斜");
+        out[OUT_DOWN] = MOVE_THRESHOLD + 0.05;
+        assert_eq!(pick_direction(&out), Some((1, 1)), "次方向够强就斜");
+    }
+
+    #[test]
+    fn diagonal_cannot_slip_through_a_corner() {
+        // 一个"对角台阶"：目标格空着，但两个正交邻格都是墙。
+        //
+        //       x=30 31 32
+        // y=40   .   .  W      ← (32,40) 是墙
+        // y=41   .   W  .      ← (31,41) 是墙，(32,41) 空
+        //
+        // 身体在 (31,40)，斜向右下想去 (32,41)。如果放行，它会"穿墙缝"——
+        // 这是所有 8 向网格移动的经典 bug，症状极具欺骗性：墙看着完好，
+        // 生物却过去了。
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_all(MaterialKind::Water);
+        w.set(32, 40, MaterialKind::Stone);
+        w.set(31, 41, MaterialKind::Stone);
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let mut org = Organism::new(
+            0,
+            (31, 40),
+            vec![Cell::new(CellType::Mover, (0, 0))],
+            forward_genome(),
+        );
+        org.energy = 10_000;
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+
+        assert!(
+            !sim.try_move(&mut w, i, 1, 1, MoveKind::Swim),
+            "斜向穿过了对角缝"
+        );
+
+        // 对照：把 (31,41) 打开，同一个斜向就该成功。
+        // 没有这条对照，上面那句可能只是"斜向完全不能用"。
+        w.set(31, 41, MaterialKind::Water);
+        assert!(
+            sim.try_move(&mut w, i, 1, 1, MoveKind::Swim),
+            "对角缝打开之后斜向应当能过"
+        );
+    }
+
+    #[test]
+    fn a_caged_fish_accumulates_stuck() {
+        // `IN_STUCK` 的来源。没有它，"撞墙了"这件事对基因组是不可见的——
+        // 它只知道"前方被挡"，不知道"我已经卡了 6 个 tick"。
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_all(MaterialKind::Water);
+        // 把身体四周砌死，只留它自己那一格。
+        for (dx, dy) in [(1isize, 0isize), (-1, 0), (0, 1), (0, -1)] {
+            w.set(30 + dx, 40 + dy, MaterialKind::Stone);
+        }
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let mut org = Organism::new(
+            0,
+            (30, 40),
+            vec![Cell::new(CellType::Mover, (0, 0))],
+            forward_genome(),
+        );
+        org.energy = 10_000;
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+
+        for _ in 0..6 {
+            sim.step(&mut w);
+        }
+        let stuck = sim.organism(id).unwrap().stuck;
+        assert!(stuck >= 5, "被围住的鱼应当累计 stuck，实际 {stuck}");
+    }
+
+    #[test]
+    fn recursion_feeds_the_previous_output_back_in() {
+        // `IN_PREV_*` 必须是**上一 tick 的输出**，不是零。
+        // 这条钉的是"网络真的有记忆"——它是"撞墙后转向"能存在的前提。
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim.spawn_injected(&mut w, swimmer((10, 40), 5_000)).unwrap();
+
+        sim.step(&mut w);
+        let after_first = sim.organism(id).unwrap().last_out;
+        sim.step(&mut w);
+
+        let org = sim.organism(id).unwrap();
+        // 第二 tick 的输入里，`IN_PREV_*` 应当等于第一 tick 的输出。
+        assert_eq!(org.last_inputs[IN_PREV_LEFT], after_first[OUT_LEFT]);
+        assert_eq!(org.last_inputs[IN_PREV_RIGHT], after_first[OUT_RIGHT]);
+        assert_eq!(org.last_inputs[IN_PREV_UP], after_first[OUT_UP]);
+        assert_eq!(org.last_inputs[IN_PREV_DOWN], after_first[OUT_DOWN]);
     }
 
     #[test]

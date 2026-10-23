@@ -28,6 +28,7 @@
 
 use crate::grn::Grn;
 use crate::material::MaterialKind;
+use crate::organelle::{Organelles, CHLORO_SHIFT, EYE, FLAGELLUM_SHIFT};
 use crate::world::World;
 
 /// 有机体编号。0 是保留值（表示"没有主人"），见 [`crate::world::CellOwner`]。
@@ -201,8 +202,18 @@ impl CellType {
 /// 一个细胞。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Cell {
-    /// 细胞类型。
+    /// 细胞类型。**过渡期字段**（M2b 之后删掉）。
+    ///
+    /// M2a 阶段它是"权威"：所有现有的 `match kind` 都读它，所以行为零变化。
+    /// `organelles` 由 [`Cell::new`] 从它推导，两者永远一致。
+    /// M2b 把身体描述换成 `Segment` + `Gradient` 之后，这个字段消失，
+    /// `organelles` 变成唯一真相。
     pub kind: CellType,
+    /// 这一格带的细胞器。见 [`crate::organelle`]。
+    ///
+    /// 为什么要有它而 `kind` 不够：`kind` 是封闭枚举，表达不了
+    /// "叶绿体 + 气囊"这种组合，而组合正是新物种的来源。
+    pub organelles: Organelles,
     /// 相对锚点的偏移（格）。可以是负的——身体向上长就靠它。
     pub offset: (i16, i16),
     /// 这个细胞活了多少 tick。
@@ -224,10 +235,15 @@ pub struct Cell {
 
 impl Cell {
     /// 新建一个细胞。`wet` 由 `spawn` 按出生位置填。
+    ///
+    /// **`organelles` 从这里推导，不让调用方各写一份**——两份真相是这类
+    /// 过渡最典型的 bug 来源（改了 `kind` 忘了改 `organelles`，症状是
+    /// "这条鱼的能量账莫名其妙对不上"）。
     #[inline]
     pub const fn new(kind: CellType, offset: (i16, i16)) -> Self {
         Self {
             kind,
+            organelles: Organelles::from_cell_type(kind),
             offset,
             age: 0,
             wet: false,
@@ -244,7 +260,20 @@ impl Cell {
 /// 输入刻意做成"抽象感知"而不是逐格 one-hot：9 个邻格 × 5 类要 45 个输入，
 /// 权重表会膨胀到 640 个数字，手工设计一条鱼基本不可能。
 /// 这里只保留"前方有没有吃的/有没有挡路的/自己还剩多少力气"这类决策真正需要的信息。
-pub const INPUTS: usize = 17;
+///
+/// ## 为什么从 17 涨到 22（M2a）
+///
+/// 加了 5 路输入，全部是**状态**，不是新的感知：
+///
+/// | 输入 | 解决什么 |
+/// |---|---|
+/// | `IN_PREV_LEFT/RIGHT/UP/DOWN` | **记忆**。没有它，`think()` 是纯函数，同样的处境永远给同样的反应——一个"向右"权重稍大的个体永远向右、永远撞墙 |
+/// | `IN_STUCK` | "我卡住了"这件事第一次对基因组可见 |
+///
+/// 前四路喂回 [`Organism::last_out`]。严格说这不是"学习"，是**状态**——
+/// 但它买到的东西正好是原来缺的：惯性巡航、撞墙后转向、节律行为。
+/// 而且它**完全不破坏谱系**：遗传的仍然只有基因，一生的经历不进基因。
+pub const INPUTS: usize = 22;
 
 /// 隐藏层宽度。
 pub const HIDDEN: usize = 8;
@@ -328,6 +357,28 @@ pub const IN_FOOD_DIR_Y: usize = 14;
 pub const IN_ORGANISM_DIR_X: usize = 15;
 /// 输入下标：最近的别的生物在垂直方向的相对位置（−1..+1，+1 是下方）。
 pub const IN_ORGANISM_DIR_Y: usize = 16;
+
+// ---- M2a 新增：递归状态 ----
+
+/// 上一 tick 的"向左"输出，喂回来当输入。
+///
+/// 四路 `IN_PREV_*` 一起构成**短期记忆**：网络能表达"我上一 tick 在向右 →
+/// 这一 tick 继续向右"（惯性巡航），也能表达"我上一 tick 撞了 → 换个方向"
+/// （`IN_BLOCKED_*` 和 `IN_PREV_*` 相乘）。
+pub const IN_PREV_LEFT: usize = 17;
+/// 上一 tick 的"向右"输出。
+pub const IN_PREV_RIGHT: usize = 18;
+/// 上一 tick 的"向上"输出。
+pub const IN_PREV_UP: usize = 19;
+/// 上一 tick 的"向下"输出。
+pub const IN_PREV_DOWN: usize = 20;
+
+/// 连续几 tick 没有移动成功（归一化到 `0..1`，8 tick 封顶）。
+///
+/// 没有这一路，"撞墙了"这件事对基因组是不可见的——它只知道"前方被挡"，
+/// 而不知道"我已经卡了 6 个 tick"。有了它，`IN_STUCK` 高 + `IN_BLOCKED_LEFT`
+/// 就能组合出"放弃前进、掉头"。
+pub const IN_STUCK: usize = 21;
 
 /// 嗅觉射线的基础长度（格）：**没有眼**的身体能闻多远。
 ///
@@ -623,6 +674,23 @@ pub struct Organism {
     pub energy_hist: [u16; ENERGY_HIST],
     /// 环形缓冲的写入位置。
     pub hist_head: u8,
+    /// 连续几 tick 一次也没移动成功。
+    ///
+    /// 每成功移动一格就归零；一个 tick 里一步也没走成就 +1。
+    /// 它是 [`IN_STUCK`] 的来源，也是"这个个体是不是卡住了"的直接证据——
+    /// 画面上一条鱼在原地不动，和一条鱼在慢慢蠕动，看起来是同一件事。
+    pub stuck: u8,
+    /// 累积的压力（L2 表观遗传）。
+    ///
+    /// 能量剩不到 4 个维持成本时 +1，宽裕时 −1。**衰减比累积慢**，
+    /// 所以一次饥荒的影响会持续好几代。
+    ///
+    /// 它买的是"环境变差时种群自己加快变异"：繁殖时 `MUTATION_SIGMA`
+    /// 按它上调，上限 ×2。真实生物里这叫 stress-induced mutagenesis。
+    ///
+    /// **它不进基因。** 遗传的仍然只有 `genome`，`stress` 只影响子代
+    /// 被"搅乱"的程度——这是它和 Lamarck 式学习的分界线。
+    pub stress: u8,
 }
 
 impl Organism {
@@ -647,6 +715,8 @@ impl Organism {
             last_out: [0.0; OUTPUTS],
             energy_hist: [0; ENERGY_HIST],
             hist_head: 0,
+            stuck: 0,
+            stress: 0,
         }
     }
 
@@ -684,7 +754,7 @@ impl Organism {
 
     /// 每 tick 的维持成本总和。
     pub fn upkeep(&self) -> u32 {
-        let raw: u32 = self.cells.iter().map(|c| c.kind.upkeep()).sum();
+        let raw: u32 = self.cells.iter().map(|c| c.organelles.upkeep()).sum();
         // **建造细胞的工作是"维护结构"：它让整个身体的维持成本下降。**
         //
         // 每格乘 0.8，最多降到一半。为什么是乘性而不是"每格减固定值"：
@@ -806,7 +876,7 @@ impl Organism {
     /// 每 tick 跑一遍 `sense` + `think` 是纯浪费（几百个藻时是十倍的帧时间）。
     #[inline]
     pub fn is_plankton(&self) -> bool {
-        self.cells.len() == 1 && self.cells[0].kind == CellType::Producer
+        self.cells.len() == 1 && self.cells[0].organelles.level(CHLORO_SHIFT) > 0
     }
 
     /// 每 tick 最多走几格。
@@ -820,7 +890,15 @@ impl Organism {
     /// 什么时候值得快，由生态自己筛。
     #[inline]
     pub fn speed(&self) -> i32 {
-        let movers = self.count(CellType::Mover);
+        // 按**鞭毛的等级之和**算，不是按"有几个移动细胞"。
+        //
+        // M2a 阶段等级只会是 0 或 1，所以这和旧的 `count(Mover)` 完全等价；
+        // 等级 2 之后"一格顶两格"才真正生效。
+        let movers: usize = self
+            .cells
+            .iter()
+            .map(|c| c.organelles.level(FLAGELLUM_SHIFT) as usize)
+            .sum();
         let extra = movers / MOVERS_PER_EXTRA_STEP;
         (1 + extra as i32).min(MAX_STEPS)
     }
@@ -837,7 +915,11 @@ impl Organism {
     /// 现在它买的是"更早闻到食物"——在一片 512 宽的海里，闻得远就是活得久。
     #[inline]
     pub fn smell_radius(&self) -> i32 {
-        let eyes = self.count(CellType::Eye) as i32;
+        let eyes = self
+            .cells
+            .iter()
+            .filter(|c| c.organelles.has(EYE))
+            .count() as i32;
         (FOOD_SMELL_RADIUS + eyes * SMELL_PER_EYE).min(MAX_SMELL_RADIUS)
     }
 

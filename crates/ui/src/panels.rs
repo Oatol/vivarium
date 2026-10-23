@@ -985,7 +985,7 @@ fn census_row(ui: &mut Ui, kind: MaterialKind, count: usize) {
 /// 1. **它是什么**（编号、坐标、缩略图）——先认出来是谁；
 /// 2. **它过得怎么样**（能量、年龄、收支、走势）——再看状态；
 /// 3. **它长什么样**（细胞构成）——形状决定能力；
-/// 4. **它此刻在想什么**（17 路输入、6 路输出）——这一帧的决策；
+/// 4. **它此刻在想什么**（`INPUTS` 路输入、`OUTPUTS` 路输出）——这一帧的决策；
 /// 5. **它为什么这么想**（权重矩阵）——把"想"落到数字上。
 fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
     ui.add_space(2.0);
@@ -1135,7 +1135,7 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
     // 17 路画成一条竖带，不是 17 行横条：横条要吃掉 221px，
     // 而这里真正要看的是"哪几路在动"——那是一个整体形状。
     ui.add_space(4.0);
-    widgets::section(ui, "感知（17 路输入）");
+    widgets::section(ui, "感知（输入）");
     widgets::input_strip(ui, &sel.inputs, &INPUT_NAMES);
     // 把非零的那几路写成一行。竖带看得见"有没有"，这一行说得出"是什么"。
     let mut active: Vec<&str> = Vec::new();
@@ -1187,12 +1187,12 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
     widgets::weight_matrix(ui, INPUT_NAMES.len(), OUTPUT_NAMES.len(), &sel.direct);
 }
 
-/// 17 路输入的中文名，顺序与 `life::IN_*` 一致。
+/// 输入的中文名，顺序与 `life::IN_*` 一致。
 ///
 /// 单独一张表而不是给每个常量加名字：这些名字是**给人看的**，
 /// 而且必须能在 52px 里放下——核心里那些常量名（`IN_FOOD_DIR_X`）
 /// 是给代码看的，两者用途不同。
-const INPUT_NAMES: [&str; 17] = [
+const INPUT_NAMES: [&str; vivarium_core::life::INPUTS] = [
     "前有食物",
     "前被挡",
     "前有同类",
@@ -1210,6 +1210,13 @@ const INPUT_NAMES: [&str; 17] = [
     "食物 y",
     "生物 x",
     "生物 y",
+    // M2a 新增：递归状态。这五个和上面 17 个不是一类东西——
+    // 上面是"我看到了什么"，下面是"我刚才在干什么"。
+    "上次左",
+    "上次右",
+    "上次上",
+    "上次下",
+    "卡住",
 ];
 
 /// 6 路输出的中文名，顺序与 `life::OUT_*` 一致。

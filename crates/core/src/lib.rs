@@ -33,6 +33,7 @@ pub use grn::Grn;
 pub use life::{CellType, OrganismId};
 pub mod life_sim;
 pub mod material;
+pub mod organelle;
 pub mod palette;
 pub mod rng;
 pub mod save;

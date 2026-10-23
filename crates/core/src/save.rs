@@ -82,6 +82,7 @@ use crate::grn::{Grn, RuleTable, MAX_BODY_CELLS, MAX_DEPTH, NO_PARENT};
 use crate::life::{Cell, CellType, Facing, Genome, Organism, OrganismId, ENERGY_HIST, INPUTS, OUTPUTS};
 use crate::life_sim::{EnergyLedger, LifeSim};
 use crate::material::MaterialKind;
+use crate::organelle::Organelles;
 use crate::world::{MaterialCell, World, MAX_WORLD_SIDE};
 
 /// 文件魔数。
@@ -89,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 1;
+pub const VERSION: u16 = 2;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -358,12 +359,24 @@ fn put_organism(out: &mut Out, org: &Organism) {
     out.u32(org.generation);
     out.u16(org.cells.len() as u16);
     for c in &org.cells {
-        out.u8(c.kind.as_u8());
+        // v2：`kind: u8` 换成 `organelles: u16`。
+        //
+        // 为什么必须换而不是并存：并存就有两份真相，而"哪一份是权威"
+        // 会在 M2b 删掉 `kind` 的那一天变成一个必须重新回答的问题。
+        // 现在换掉，`primary_cell_type()` 负责给渲染和统计一个代表类型。
+        out.u16(c.organelles.0);
         out.i16(c.offset.0);
         out.i16(c.offset.1);
         out.u32(c.age);
         out.u8(u8::from(c.wet));
     }
+    // v2：`last_out` 从"检查器用的缓存"变成"网络的递归状态"（`IN_PREV_*` 读它），
+    // 所以必须存。不存的话读档后前几 tick 的行为和原件分叉。
+    for v in &org.last_out {
+        out.f32(*v);
+    }
+    out.u8(org.stuck);
+    out.u8(org.stress);
     put_genome(out, &org.genome);
     for v in &org.energy_hist {
         out.u16(*v);
@@ -602,13 +615,25 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
     }
     let mut cells = Vec::with_capacity(cell_count);
     for _ in 0..cell_count {
+        let organelles = Organelles(r.u16()?);
         cells.push(Cell {
-            kind: CellType::from_u8(r.u8()?),
+            // `kind` 是过渡期字段，由细胞器反推。因为 `from_cell_type`
+            // 是一对一的，往返精确——但**只有从 `Cell::new` 造出来的细胞**
+            // 才保证这一点。组合细胞（叶绿体 + 气囊）的代表类型是有损的，
+            // 那是 M2b 之后才需要考虑的事。
+            kind: organelles.primary_cell_type(),
+            organelles,
             offset: (r.i16()?, r.i16()?),
             age: r.u32()?,
             wet: r.u8()? != 0,
         });
     }
+    let mut last_out = [0.0f32; OUTPUTS];
+    for v in last_out.iter_mut() {
+        *v = r.f32()?;
+    }
+    let stuck = r.u8()?;
+    let stress = r.u8()?;
     let genome = read_genome(r)?;
     let mut energy_hist = [0u16; ENERGY_HIST];
     for v in energy_hist.iter_mut() {
@@ -629,9 +654,12 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
         // 一 tick 的临时量，见模块文档"不存什么"。
         acted: false,
         last_inputs: [0.0; INPUTS],
-        last_out: [0.0; OUTPUTS],
+        // `last_out` **不再是**临时量：它是 `IN_PREV_*` 的来源。
+        last_out,
         energy_hist,
         hist_head,
+        stuck,
+        stress,
     })
 }
 
@@ -886,6 +914,12 @@ mod tests {
             assert_eq!(a.generation, b.generation);
             assert_eq!(a.hist_head, b.hist_head);
             assert_eq!(a.energy_hist, b.energy_hist);
+            // v2：`last_out` 从"检查器用的缓存"变成"网络的递归状态"
+            // （`IN_PREV_*` 读它），所以必须原样回来——否则读档后
+            // 前几 tick 的行为和原件分叉。
+            assert_eq!(a.last_out, b.last_out, "递归状态丢了");
+            // v2：`stuck` 是 `IN_STUCK` 的来源，同样必须存。
+            assert_eq!(a.stuck, b.stuck, "卡住的计数丢了");
             assert_eq!(a.cells.len(), b.cells.len());
             for (ca, cb) in a.cells.iter().zip(&b.cells) {
                 assert_eq!(ca.kind, cb.kind);

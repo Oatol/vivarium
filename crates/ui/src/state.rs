@@ -387,14 +387,14 @@ pub struct SelectedOrganism {
     pub shape: Vec<(i16, i16, u8)>,
     /// 能量走势（0..1，右端是当前）。
     pub energy_trace: Vec<f32>,
-    /// 上一次决策：17 路输入。
-    pub inputs: [f32; 17],
+    /// 上一次决策的输入（`life::INPUTS` 路）。
+    pub inputs: [f32; vivarium_core::life::INPUTS],
     /// 上一次决策：6 路输出。
     pub outputs: [f32; 6],
-    /// 行为网络的**直连**权重矩阵（`17 × 6`，行优先）。
+    /// 行为网络的**直连**权重矩阵（`INPUTS × OUTPUTS`，行优先）。
     ///
     /// 只带直连这一层，不带隐藏层：直连是"看到什么就做什么"那一层，
-    /// 手工基因组里真正在干活的就是它。隐藏层有 17×8 + 8×6 个数，
+    /// 手工基因组里真正在干活的就是它。隐藏层有 `INPUTS×8 + 8×6` 个数，
     /// 画出来是一团噪声，而噪声不构成信息。
     pub direct: Vec<f32>,
 }
