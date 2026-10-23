@@ -22,7 +22,7 @@ use egui::{
     Align, Color32, CornerRadius, FontId, Layout, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
-use vivarium_core::{palette, CellType};
+use vivarium_core::{grn::MAX_BODY_CELLS, palette, CellType};
 
 use crate::state::{Snapshot, UiState, DRAFT_SIZE};
 use crate::theme;
@@ -305,8 +305,16 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
             hint_line(ui, "画布是空的", theme::TEXT_FAINT);
         } else if mouths == 0 {
             hint_line(ui, "没有嘴——它吃不了东西", theme::DANGER);
-        } else if n > 16 {
-            hint_line(ui, "超过 16 格，水里推不动", theme::DANGER);
+        } else if n > MAX_BODY_CELLS as usize {
+            // 这里原来写的是"超过 16 格，水里推不动"——**那句是假的**。
+            // 16 是 `passable()` 里的一条通行性判据（超过 16 格水变成固体），
+            // 被 UI 当成了一句物理说明。v0.26 拆掉了那道墙，
+            // 现在真正的上限是基因组能长多大：`grn::MAX_BODY_CELLS` = 24。
+            hint_line(
+                ui,
+                &format!("超过 {MAX_BODY_CELLS} 格，超出体型上限"),
+                theme::DANGER,
+            );
         } else if !has_anchor_neighbour(&cells) {
             hint_line(ui, "身体不连通", theme::WARN);
         } else {
@@ -324,7 +332,7 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
             }
         });
         ui.add_space(4.0);
-        let ready = n > 0 && mouths > 0 && n <= 16;
+        let ready = n > 0 && mouths > 0 && n <= MAX_BODY_CELLS as usize;
         if widgets::flat_button(ui, "放置到世界", BtnState::Normal).clicked() && ready {
             state.emit(Command::PlaceBody(cells.clone()));
             state.workshop.open = false;

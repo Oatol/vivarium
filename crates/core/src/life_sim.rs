@@ -79,19 +79,24 @@ pub const PRODUCER_YIELD: u32 = 24;
 // 身体一大，造子代的成本跟着涨，而天花板钉死在三格鱼的额度上，
 // 于是大身体永远攒不到繁殖门槛——**体型变大这件事在规则层面就被禁止了**。
 
-/// 能顶开水体的最大身体格数（SPEC §2.2）。
+/// 一次移动最多能顶开几格水。
 ///
-/// 超过这个规模就被水挡住。SPEC 的理由是"如果任何生物都能无代价顶开液体，
-/// 一个 1000 格的生物移动会推走 1000 格水，行为和性能都会崩"。
+/// ## 这个常量守的门已经不存在了（v0.26 记一笔）
 ///
-/// **8 是"最大体型三格"那个时代的上限**，现在必须放大：最大的手工体型是
-/// 14 格，上限卡在 8 意味着"设计一个更大的身体"在物理上根本做不到——
-/// 大生物会出生在一个水腔里，然后一格也走不动。这不是平衡问题，是硬故障。
+/// 它原来是 `SMALL_BODY_MAX = 16`，用途是 `passable()` 里的
+/// `Water => body <= SMALL_BODY_MAX`——**17 格以上的身体在水里，水是固体**。
 ///
-/// 取 16（14 格 + 2 格余量）而不是干脆取消：SPEC 担心的 1000 格极端情形
-/// 仍然被排除在外，而 `try_move` 的搬运代价是 O(格数²)，
-/// 16 格时是 256 次比较，可以忽略。
-pub const SMALL_BODY_MAX: usize = 16;
+/// 那条判据的理由是"1000 格的生物移动会推走 1000 格水，行为和性能都会崩"。
+/// 但身体格数上限是 [`crate::grn::MAX_BODY_CELLS`] = 24，
+/// 所以一次移动最多 swap 24 格水——**1000 格的情形根本不可能发生**。
+/// 那个数字守的是一道已经关掉的闸门，而它自己变成了一道新的墙：
+/// 大身体出生在水腔里，一格也走不动，然后掉到海底饿死。
+///
+/// 现在这个常量只剩**注释上的作用**：它把"一次移动最多顶开多少格水"这个
+/// 上界写死在这里，好让 `try_move` 的 O(格数²) 有一个明确的天花板
+/// （24² = 576 次整数比较，可以忽略）。**它不是通行判据，也不是玩法上限。**
+/// 真正的玩法上限是 [`crate::grn::MAX_BODY_CELLS`]。
+pub const MAX_DISPLACED: usize = crate::grn::MAX_BODY_CELLS as usize;
 
 /// 自然寿命上限（tick）。到点就死，不商量。
 pub const MAX_AGE: u32 = 20_000;
@@ -1634,7 +1639,6 @@ impl LifeSim {
     /// 把周围世界编码成网络输入。
     fn sense(&self, world: &World, i: usize) -> [f32; INPUTS] {
         let org = &self.organisms[i];
-        let body = org.cells.len();
         let mut inp = [0.0f32; INPUTS];
 
         let (fx, fy) = org.front();
@@ -1642,7 +1646,7 @@ impl LifeSim {
             world.get(fx as isize, fy as isize),
             MaterialKind::Remains | MaterialKind::Corpse
         ) as u8 as f32;
-        inp[IN_BLOCKED_AHEAD] = (!Self::passable(world, body, fx, fy)) as u8 as f32;
+        inp[IN_BLOCKED_AHEAD] = (!Self::passable(world, fx, fy)) as u8 as f32;
 
         let owner = world.owner(fx as isize, fy as isize);
         inp[IN_KIN_AHEAD] = (owner.is_some() && owner.organism != org.id) as u8 as f32;
@@ -1666,10 +1670,10 @@ impl LifeSim {
         let (rx, ry) = org.probe(1, 0);
         let (ux, uy) = org.probe(0, -1);
         let (dx_, dy_) = org.probe(0, 1);
-        inp[IN_BLOCKED_LEFT] = (!Self::passable(world, body, lx, ly)) as u8 as f32;
-        inp[IN_BLOCKED_RIGHT] = (!Self::passable(world, body, rx, ry)) as u8 as f32;
-        inp[IN_BLOCKED_UP] = (!Self::passable(world, body, ux, uy)) as u8 as f32;
-        inp[IN_SUPPORTED_BELOW] = (!Self::passable(world, body, dx_, dy_)) as u8 as f32;
+        inp[IN_BLOCKED_LEFT] = (!Self::passable(world, lx, ly)) as u8 as f32;
+        inp[IN_BLOCKED_RIGHT] = (!Self::passable(world, rx, ry)) as u8 as f32;
+        inp[IN_BLOCKED_UP] = (!Self::passable(world, ux, uy)) as u8 as f32;
+        inp[IN_SUPPORTED_BELOW] = (!Self::passable(world, dx_, dy_)) as u8 as f32;
 
         inp[IN_ENERGY] = org.energy as f32 / org.max_energy().max(1) as f32;
         inp[IN_AGE] = org.age as f32 / MAX_AGE as f32;
@@ -1756,11 +1760,30 @@ impl LifeSim {
         inp
     }
 
-    /// 这个身长的生物能不能进这一格（SPEC §2.2）。
+    /// 这一格能不能进（SPEC §2.2）。
     ///
-    /// 石 / 沙 / 残骸一律挡；水和气按体型放行；火在 M2 里也挡
+    /// 石 / 沙 / 残骸一律挡；水和气放行；火在 M2 里也挡
     /// （伤害规则推迟到有装甲细胞的时候一起做，免得先做一套没法验证的伤害）。
-    fn passable(world: &World, body: usize, x: i32, y: i32) -> bool {
+    ///
+    /// ## 水曾经是"大身体的墙"（v0.26 拆掉）
+    ///
+    /// 这里原来是 `MaterialKind::Water => body <= SMALL_BODY_MAX`，而那个常量是
+    /// **16**。也就是说 17 格以上的身体在水里，**水是固体**——不是"推不动"，是
+    /// "进不去"。症状是一条完整的链：通行判定全部失败 → `touches_water` 也失败
+    /// → 重力接管 → 一路掉到海底 → 搁浅 → 维持成本照扣 → 饿死。
+    /// 玩家看到的是"细胞数过多无法在水中浮起"，而真相是**一条性能约束被写成了
+    /// 世界法则**（和"世界尺寸必须是 64 的倍数"是同一类错误）。
+    ///
+    /// 那个常量给的理由是"1000 格的生物移动会推走 1000 格水，行为和性能都会崩"。
+    /// 这个担心**当时**成立，现在不成立：身体格数上限是
+    /// [`crate::grn::MAX_BODY_CELLS`] = 24，一次移动最多 swap 24 格水
+    /// （见 [`Self::body_displaces`]），是 O(n) 不是 O(n²)。
+    /// **那个数字守的是一道已经不存在的门。**
+    ///
+    /// 大身体"在水里更累"这件事由 `move_cost` 的质量项表达，不由通行性表达——
+    /// 前者是连续的代价，后者是一道墙。墙会让玩家看到"鱼掉到海底饿死"，
+    /// 代价会让玩家看到"大身体游得慢、吃得少、活得短"，后者才是生态。
+    fn passable(world: &World, x: i32, y: i32) -> bool {
         if !world.in_bounds(x as isize, y as isize) {
             return false;
         }
@@ -1769,7 +1792,8 @@ impl LifeSim {
         }
         match world.get(x as isize, y as isize) {
             MaterialKind::Empty | MaterialKind::Gas => true,
-            MaterialKind::Water => body <= SMALL_BODY_MAX,
+            // 水和身体同重：任何体型都能进。
+            MaterialKind::Water => true,
             // 藻是悬浮的食物，**不是障碍**：鱼要能游进去吃。
             _ => false,
         }
@@ -1906,6 +1930,17 @@ impl LifeSim {
     fn try_move(&mut self, world: &mut World, i: usize, dx: i32, dy: i32, kind: MoveKind) -> bool {
         let org = &self.organisms[i];
         let body = org.cells.len();
+        // 身体格数的上界在这里钉一次。
+        //
+        // `Grn::max_cells` 的 `clamp(1, 24)` 和存档的校验都盯着这条线，
+        // 但它们是两处独立的代码——只要有一处先改，症状就是"读档之后
+        // 这条鱼比存档时多了几格"，而画面上完全看不出来。
+        // 放在 `try_move` 里是因为它是**每次移动都要经过**的那条路，
+        // 而且是唯一一个 `body` 已经算好的地方。
+        debug_assert!(
+            body <= MAX_DISPLACED,
+            "身体 {body} 格超过上限 {MAX_DISPLACED}：`Grn::max_cells` 的 clamp 或存档校验漏了一处"
+        );
         // 成本由 `Organism::move_cost` 统一算：**速度每加一档，每 tick 的
         // 移动开销就往上跳一跳**（1.0 → 1.5 → 2.0 倍质量）。
         //
@@ -1960,7 +1995,7 @@ impl LifeSim {
                 if !old.iter().any(|&(ox, oy)| ox == x && oy == y) {
                     return false;
                 }
-            } else if !Self::passable(world, body, x, y) {
+            } else if !Self::passable(world, x, y) {
                 return false;
             }
         }
@@ -2070,7 +2105,7 @@ impl LifeSim {
         let idx = self.organisms.iter().position(|o| o.id == id)?;
         let parent = &self.organisms[idx];
         // 门槛按身体大小算：大身体造子代更贵，必须攒得更久。
-        // 固定 400 会让"变大"变成纯赚——见 `SMALL_BODY_MAX` 上面那段注释。
+        // 固定 400 会让"变大"变成纯赚——见 `life::MAX_ENERGY_PER_CELL` 那段注释。
         let birth_energy = parent.birth_energy();
         if parent.energy < parent.reproduction_energy() {
             return None;
@@ -3263,31 +3298,43 @@ mod tests {
     }
 
     #[test]
-    fn a_body_too_big_cannot_push_through_water() {
+    fn a_body_larger_than_sixteen_still_swims() {
+        // v0.26 拆掉"水是墙"之后的反向断言。
+        //
+        // 旧代码里 `passable()` 对水是 `body <= SMALL_BODY_MAX`（16），
+        // 所以 17 格以上的身体**进不了水**：出生时挤开的那一小块空腔之外
+        // 全是固体，它一格也走不动，然后被重力拉到海底饿死。
+        // 玩家看到的是"细胞数过多无法在水中浮起"。
+        //
+        // 现在这条测试盯三件事：它真的动了、身体没散、水没少。
+        // 第三条最容易漏——多格身体顶开水时的 `vacated` 配对写错，
+        // 水会一格一格地蒸发，而画面上什么都看不出来。
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         // 关掉藻：藻是可以穿过去的，长在这条鱼前面会让它走起来，
         // 于是测到的就不是"水挡住了大生物"。
         sim.set_food_growth(false);
 
-        // 造一条比 `SMALL_BODY_MAX` 更长的鱼，塞在水的正中间。
-        let cells: Vec<Cell> = (0..(SMALL_BODY_MAX as i16 + 2))
-            .map(|i| Cell::new(CellType::Mover, (i, 0)))
-            .collect();
+        // 18 格：比旧上限 16 多两格，正好是当年被挡住的那一类。
+        let cells: Vec<Cell> = (0..18).map(|i| Cell::new(CellType::Mover, (i, 0))).collect();
         let mut big = Organism::new(0, (10, 40), cells, forward_genome());
         // 18 个移动细胞每 tick 要 72 维持，给少了它会在跑满 10 tick 之前先饿死，
-        // 于是测试测到的是"饿死"而不是"被水挡住"。
-        big.energy = 5_000;
+        // 于是测到的是"饿死"而不是"能不能游"。
+        big.energy = 20_000;
 
-        // 出生时水被挤开，所以它现在悬在一个空腔里；
-        // 空腔之外全是水，它一格也走不动。
         let id = sim.spawn_injected(&mut w, big).unwrap();
         let start = sim.organism(id).unwrap().anchor;
+        let volume = water_volume(&w);
 
         for _ in 0..10 {
             sim.step(&mut w);
         }
-        assert_eq!(sim.organism(id).unwrap().anchor, start, "大生物被水挡住");
+
+        let org = sim.organism(id).expect("18 格的身体不该在这 10 tick 里死掉");
+        assert_ne!(org.anchor, start, "18 格的身体一格也没动——水又变成墙了");
+        assert_eq!(w.occupied_count(), 18, "身体散架了");
+        assert_eq!(water_volume(&w), volume, "水少了：顶开水的时候漏了");
+        assert!(sim.audit(&w).is_balanced(), "能量账不平");
     }
 
     // -----------------------------------------------------------------------

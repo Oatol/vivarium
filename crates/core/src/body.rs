@@ -250,8 +250,12 @@ pub const PLANS: &[BodyPlan] = &[SILVERFISH, LEAFBACK, WORM, JELLY, HUNTER];
 
 /// 最大的手工体型有多少格。
 ///
-/// [`crate::life_sim::SMALL_BODY_MAX`] 必须不小于它——否则"设计一个更大的身体"
-/// 这件事在物理上根本做不到，大生物会直接卡在水里。
+/// 它必须不大于 [`crate::grn::MAX_BODY_CELLS`]——那是**身体格数的硬上限**，
+/// 手工体型和形态发生长出来的身体共用同一条线。
+///
+/// 早先这里写的是"必须不大于 `SMALL_BODY_MAX`"，而那个常量是"一次移动能顶开
+/// 多少格水"——一条**通行性判据**被当成了体型上限，于是 17 格以上的身体
+/// 在水里根本动不了。v0.26 拆掉了。
 pub const MAX_PLAN_CELLS: usize = 14;
 
 #[cfg(test)]
