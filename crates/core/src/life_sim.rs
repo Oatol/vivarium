@@ -2814,6 +2814,24 @@ pub fn handcrafted_fish_genome(tactic: Tactic) -> Genome {
 /// 返回实际投放成功的编号。放不下的（水太浅、格子被占、身体超出边界）
 /// 会被跳过，而不是让整批失败——玩家按一下"放鱼"不该因为某一列地形不行
 /// 就全都不出现。
+/// 从这一列的**第一格水**开始，往下 `need` 格是不是全是水（气泡也算）。
+///
+/// 返回那一格水的 y。找不到返回 `None`。
+///
+/// 为什么不是"第一格水在哪"：新地形是一半陆地一半海，靠岸那一带只有
+/// 几格深，身体放下去下半截插进沙里，`spawn_injected` 直接 `Blocked`——
+/// 而调用方看到的是"要 24 条只放下 9 条"，一点线索都没有。
+fn water_top(world: &World, x: i32, need: i32) -> Option<i32> {
+    (0..world.height() as i32).find(|&y| {
+        (y..y + need).all(|yy| {
+            matches!(
+                world.get(x as isize, yy as isize),
+                MaterialKind::Water | MaterialKind::Gas
+            )
+        })
+    })
+}
+
 pub fn stock_surface(
     world: &mut World,
     sim: &mut LifeSim,
@@ -2826,7 +2844,6 @@ pub fn stock_surface(
         return ids;
     }
     let width = world.width();
-    let step = (width / count).max(1);
     // 倾向按**长出来的身体**决定，不按体型表：形态发生模式下
     // "这是不是捕食者"只有长完才知道。
     let tactic_of = |cells: &[Cell]| {
@@ -2836,6 +2853,19 @@ pub fn stock_surface(
             Tactic::Ignore
         }
     };
+
+    // 预扫一遍：哪些列的水柱够深。
+    //
+    // `MIN_STOCK_DEPTH` 取 6：最矮的手工体型是 2 格高，加两格余量。
+    // 用固定的下限而不是每具身体各算一遍，是因为这一步只为"有没有海"，
+    // 具体放不放得下由下面 `water_top(need)` 再验一次。
+    const MIN_STOCK_DEPTH: i32 = 6;
+    let candidates: Vec<i32> = (0..width as i32)
+        .filter(|&x| water_top(world, x, MIN_STOCK_DEPTH).is_some())
+        .collect();
+    if candidates.is_empty() {
+        return ids;
+    }
 
     for k in 0..count {
         let plan = &PLANS[k % PLANS.len()];
@@ -2887,39 +2917,9 @@ pub fn stock_surface(
         );
         genome.body = body;
 
-        // 身体在 x 方向的左右伸出量，用来把锚点夹在界内——
-        // 否则贴边的个体整个投放会失败，水面看起来"有一段没鱼"。
+        // 身体在 x 方向的左右伸出量，用来把锚点夹在界内。
         let reach_left = cells.iter().map(|c| -c.offset.0).max().unwrap_or(0) as i32;
         let reach_right = cells.iter().map(|c| c.offset.0).max().unwrap_or(0) as i32;
-        let x = ((k * step + step / 2) as i32).clamp(reach_left, width as i32 - 1 - reach_right);
-
-        // 找一个**有水**的列。
-        //
-        // 先看分配到的那个 x，没水就向两边找最近的有水列。早先是直接
-        // `continue`——那在"一半陆地一半海"的地形里等于**一半的鱼被丢掉**：
-        // 实测 `--fish 24` 只放下 9 条。而且被丢掉的总是靠岸那几列，
-        // 于是"水面看起来有一段没鱼"。
-        let first_water = |cx: i32| -> Option<i32> {
-            (0..world.height() as i32)
-                .find(|&y| world.get(cx as isize, y as isize) == MaterialKind::Water)
-        };
-        let mut surface = first_water(x);
-        if surface.is_none() {
-            // 环面：左右同时向外找，各走一半世界宽就一定能找到（除非没有水）。
-            for d in 1..=(width as i32 / 2) {
-                let left = (x - d).rem_euclid(width as i32);
-                if let Some(y) = first_water(left) {
-                    surface = Some(y);
-                    break;
-                }
-                let right = (x + d).rem_euclid(width as i32);
-                if let Some(y) = first_water(right) {
-                    surface = Some(y);
-                    break;
-                }
-            }
-        }
-        let Some(y) = surface else { continue };
 
         // 身体最上面那一格压在水面**下**一格：生产者要光，但**不能露头**。
         //
@@ -2928,16 +2928,38 @@ pub fn stock_surface(
         // 向上扫到的第一格就是空气，判据直接失败。实测贴着水面投放时，
         // 整批鱼在出生的第一个 tick 就被判成"不在水里"。
         let top = cells.iter().map(|c| c.offset.1).min().unwrap_or(0) as i32;
-        let anchor = (x, y - top + 1);
-        // 启动能量按**实际长出来的格数**算，不是按体型表的格数——
-        // 形态发生模式下这两者可能不一样，而"够不够活到能繁殖"只看前者。
-        let n = cells.len().max(1) as u32;
-        let energy = energy.max(crate::life::BIRTH_ENERGY_PER_CELL * n * 6 / 5);
-        let mut org = Organism::new(0, anchor, cells, genome);
-        org.energy = energy;
-        if let Ok(id) = sim.spawn_injected(world, org) {
-            ids.push(id);
+        // 水柱至少要有这么深才值得试。太浅的列放下去下半截插进沙里，
+        // `spawn_injected` 返回 `Blocked`，这条鱼就被悄悄丢了。
+        let need = (cells.iter().map(|c| c.offset.1).max().unwrap_or(0) as i32 - top + 1) + 2;
+
+        // **从候选列里挑**，不再直接按 `k * step` 取。
+        //
+        // 早先的写法是"第 k 条分到第 k*step 列，那列没水就 continue"。
+        // 在"一半陆地一半海"的地形里，这等于**一半的鱼被丢掉**：实测
+        // `--fish 24` 只放下 9 条，而且丢掉的总是靠岸那几列，于是
+        // "水面看起来有一段没鱼"。
+        let base = k * candidates.len() / count.max(1);
+        let mut placed = false;
+        for t in 0..candidates.len() {
+            let x = candidates[(base + t) % candidates.len()]
+                .clamp(reach_left, width as i32 - 1 - reach_right);
+            let Some(y) = water_top(world, x, need) else {
+                continue;
+            };
+            let anchor = (x, y - top + 1);
+            // 启动能量按**实际长出来的格数**算，不是按体型表的格数——
+            // 形态发生模式下这两者可能不一样，而"够不够活到能繁殖"只看前者。
+            let n = cells.len().max(1) as u32;
+            let energy = energy.max(crate::life::BIRTH_ENERGY_PER_CELL * n * 6 / 5);
+            let mut org = Organism::new(0, anchor, cells.clone(), genome.clone());
+            org.energy = energy;
+            if let Ok(id) = sim.spawn_injected(world, org) {
+                ids.push(id);
+                placed = true;
+                break;
+            }
         }
+        let _ = placed;
     }
     ids
 }
