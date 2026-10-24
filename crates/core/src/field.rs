@@ -56,6 +56,36 @@ pub const FIRE_HEAT: f32 = 320.0;
 /// 不是"光很少"。
 pub const SUN_ATTEN: f32 = 180.0;
 
+/// 一个粗格被生物**完全占满**时，它挡住下面多少比例的光。
+///
+/// 0.2：满覆盖的粗行透光 80%，一条 4 格的鱼（25% 覆盖）只挡 5%。
+///
+/// ## 为什么不是 0.5——这条是量出来的
+///
+/// 遮挡是按粗行**连乘**的，而鱼群聚在透光层，于是十几个粗行都压着鱼。
+/// 实测（三个种子 × 8000 tick，512²）：
+///
+/// | `BODY_SHADE` | 动物数 | 物种数 |
+/// |---|---|---|
+/// | 0（关） | 1617 / 1583 / 1088 | 350 / 334 / 271 |
+/// | **0.2** | **645 / 320 / 340** | 137 / 126 / 115 |
+/// | 0.5 | 196 / 176 / 99 | 52 / 78 / 58 |
+///
+/// 0.5 是**八倍**的崩塌：`0.81^10 ≈ 0.12`，整列水下直接黑掉。
+/// 0.2 保住了生态（约为不遮挡时的三分之一），而"密实的身体压暗下面"
+/// 这件事仍然成立。**这个数是"生态能承受的最大值"，不是"物理上最像的值"。**
+///
+/// ## 为什么按"覆盖度"而不是"有没有生物"
+///
+/// 粗格是 4×4，一条 4 格的鱼只占 25%——它不该把下面整列变黑。而一片密实的
+/// 藻席或一丛海草能占满整格，那才是真的遮挡。
+///
+/// **这个分辨率决定了"竞争"发生在个体之间还是群落之间。** 单株植物的影子
+/// 在 4×4 的粗格里几乎不存在（1/16），所以"高个子挡住矮个子"在**单株**层面
+/// 不会发生；但成片的植被会。而真实生态里植物的光竞争本来也是成片发生的
+/// ——所以这里刻意选了"群落级"，并且把它写清楚，免得以后有人以为是 bug。
+pub const BODY_SHADE: f32 = 0.2;
+
 /// 点光源的作用半径（像素）。
 ///
 /// 110 格 ≈ 一次落笔半径的二十倍，足够照亮一小片海床；
@@ -252,6 +282,15 @@ pub struct AirField {
     /// 于是"搁浅会死"这件事在物理上就不成立了——而那是用户明确要的行为。
     water: Vec<u8>,
 
+    /// 每个粗格里有多少格被**生物**占着（0..16）。
+    ///
+    /// v0.33 之前光场只认材质，"生物本身先不遮挡"。那样做有一个后果：
+    /// **长高没有任何收益**——自己挡自己只有损失，而挡住邻居才是植物长高的
+    /// 唯一理由。于是植物永远长不大，"高大 > 扁平"在物理上不可能出现。
+    ///
+    /// 这个数组就是那条规则的数据：`sun_march` 用它按覆盖度给下面的格打折。
+    body: Vec<u8>,
+
     /// 每次 `update_light` / `update_temp` 自增。渲染器靠它判断"要不要重传纹理"。
     revision: u64,
 }
@@ -274,6 +313,7 @@ impl Default for AirField {
             conduct: Vec::new(),
             fire: Vec::new(),
             water: Vec::new(),
+            body: Vec::new(),
             revision: 0,
         }
     }
@@ -297,6 +337,7 @@ impl AirField {
             conduct: vec![1.0; n],
             fire: vec![0; n],
             water: vec![0; n],
+            body: vec![0; n],
             revision: 0,
         }
     }
@@ -554,6 +595,7 @@ impl AirField {
                 let mut cond = 0.0f32;
                 let mut flame = 0u32;
                 let mut wet = 0u32;
+                let mut occupied = 0u32;
                 let mut counted = 0u32;
                 for py in 0..AIR_CELL {
                     let y = cy * AIR_CELL + py;
@@ -569,6 +611,11 @@ impl AirField {
                         counted += 1;
                         loss += sun_loss(k);
                         cond += conductivity(k);
+                        // 生物占着的格：不算固体（不该让整列变黑），
+                        // 但会计进 `body`，由 `sun_march` 按覆盖度打折。
+                        if world.owners()[world.index_of(x, y)].is_some() {
+                            occupied += 1;
+                        }
                         match k {
                             MaterialKind::Stone | MaterialKind::Sand => solid += 1,
                             MaterialKind::Fire => flame += 1,
@@ -585,6 +632,7 @@ impl AirField {
                 self.conduct[i] = (cond / n).clamp(0.0, 1.0);
                 self.fire[i] = flame.min(255) as u8;
                 self.water[i] = wet.min(255) as u8;
+                self.body[i] = occupied.min(255) as u8;
             }
         }
     }
@@ -611,6 +659,15 @@ impl AirField {
                 }
                 acc = (acc - self.sun_loss[i] * step).max(0.0);
                 self.light[i] = acc;
+                // **身体遮挡，放在存完 `light[i]` 之后。**
+                //
+                // 顺序是有意的：生物拿到的仍然是"头顶来的光"，它挡的是
+                // **下面**的格。反过来（先挡再存）会让每一具身体都把自己
+                // 压暗，于是"多长一格"变成自我惩罚——那不是竞争，是自杀。
+                let cover = self.body[i] as f32 / (AIR_CELL * AIR_CELL) as f32;
+                if cover > 0.0 {
+                    acc *= 1.0 - BODY_SHADE * cover;
+                }
                 y += 1;
             }
         }

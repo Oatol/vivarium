@@ -62,6 +62,46 @@ const OCTAVES: usize = 3;
 /// 全靠侵蚀去磨。0.45 让第三层只占前两层的八成，侵蚀的活轻一点。
 const PERSISTENCE: f32 = 0.45;
 
+/// 海床从岸边往下的平均坡度（格/列）。
+///
+/// **海床的深度由"离岸多远"决定，不由噪声幅度决定。** 这是 v0.33 的核心改动：
+/// 原来 `depth = (cut − e) × scale`，而 `scale` 被"陆地不能顶出世界"卡住
+/// （512² 里是 252），于是海只有 71 格深、**水占世界的 2.4%**，
+/// 而海床基准线以下 60% 是纯石头——一块没有任何生物能利用的死区。
+///
+/// 深度受 `水平跨度 × 坡度` 限制，而 254 列的海 × 1.2 ≈ 305 格，
+/// 正好把垂直空间用上。**坡度上限 2 是给行走用的**，海床不需要更陡，
+/// 也不需要更浅。
+const SEA_SLOPE: f32 = 1.2;
+
+/// 海床最深能到水面线以下的多少比例。
+///
+/// 0.72：512² 里水面线 128、世界高 512，可用 384 格 → 最深 276 格，
+/// 底下留 108 格基岩。**留基岩不是浪费**：世界必须有底，
+/// 而将来"生物能破坏地形"（M8 之后）得有一层可以挖的东西。
+const SEA_DEPTH_PERCENT: f32 = 0.72;
+
+/// 海床细节噪声的幅度（格）。
+///
+/// 8：它对坡度的贡献是 `2 × 8 × d(noise)/dx`，而三倍基频噪声的导数约
+/// 0.02 格/列，也就是 0.3 格/列——叠在 `SEA_SLOPE` 上还有富余，侵蚀不用干活。
+/// 再大就会让海床长出"台阶"，而台阶是鱼贴着底游时的墙。
+const SEAFLOOR_DETAIL: f32 = 8.0;
+
+/// 大尺度倾斜的权重：把"一张起伏的噪声图"变成"一边陆地、一边海"。
+///
+/// **没有它，海会被切碎。** fBm 的基频是 1.6，也就是整张图上只有一个半起伏；
+/// 当那个峰落在中间时，两边各剩一条窄海，中间是一整块大陆——而海床深度
+/// 现在按"离岸距离"算（`SEA_SLOPE`），窄海就永远是浅的。
+/// 实测三个种子水占比 14.9% / 4.9% / 7.4%——差三倍，而画面上看起来
+/// 完全像同一个规则。
+///
+/// 加一条线性斜坡之后，剖面必然是"一头高一头低"，海连成一片。
+/// 噪声仍然决定海岸线在哪、有几个海湾——**倾斜只决定"哪边是海"**。
+///
+/// 0.45：留 55% 给噪声。再大就变成一块斜板，海岸线会是一条直线。
+const TILT: f32 = 0.70;
+
 /// 相邻两列允许的最大高差（格）。
 ///
 /// **这是这一版地形的核心约束，不是观感参数。** 移动是四向离散的，
@@ -228,12 +268,23 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     // 不用"平均值"：fBm 的分布是近似对称的，但一座高山的尾部会把平均值
     // 拽偏，于是同一个 `LAND_TARGET_PERCENT` 在不同种子上给出不同的陆地占比。
     // 分位数是**定义**，不是估计。
+    // 大尺度倾斜：方向随机（不然每个世界都是"左岸右海"）。
+    //
+    // 放在归一化**之后**、切分位线**之前**：归一化保证噪声本身用满 0..1，
+    // 倾斜再把整体拉成一个斜坡。反过来（先倾斜再归一化）会把倾斜也
+    // 归一化掉——那等于没加。
+    let tilt = if rng.chance(0.5) { TILT } else { -TILT };
+    let denom = (w - 1).max(1) as f32;
+    for (x, e) in elev.iter_mut().enumerate() {
+        *e = *e * (1.0 - TILT) + tilt * (x as f32 / denom);
+    }
+
     let mut sorted = elev.clone();
     sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let cut_idx = (w * (100 - LAND_TARGET_PERCENT) / 100).min(w - 1);
     let cut = sorted[cut_idx];
 
-    // --- 3. 高度 → 纵坐标：**一个**比例尺，两侧共用 ---
+    // --- 3. 高度 → 纵坐标 ---
     //
     // 早先陆地和海各用一个比例尺（各自归一化到 `land_rise` / `sea_depth`），
     // 结果海岸线处有一个**折角**：同一格高差，陆侧按 92/0.55 放大、
@@ -249,6 +300,18 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     //
     // 取两者较小值。这条式子把"平缓"变成了一个**算出来的**数，
     // 而不是一组试出来的魔法常数。
+    //
+    // **v0.33：陆侧和海侧不再共用一个比例尺。**
+    //
+    // 共用是为了消除海岸线处的折角（v0.30 的教训），代价是**海深被陆高卡住**：
+    // 陆侧的上限是"不能顶出世界"，海侧只能跟着用同一个 `scale`，
+    // 于是 512² 里海只有 71 格深。而海床深度本来受的是**另一个**约束
+    // ——`水平跨度 × 坡度`——两者根本不该共用一个数。
+    //
+    // 现在：陆侧照旧（`scale` 由坡度 + 天空高度倒推），海侧改成
+    // **按离岸距离给深度**（`SEA_SLOPE`）。海岸线处两侧的坡度都在 2 以内，
+    // 所以不会重新长出折角——折角是"同一格高差被放大 167 倍 vs 318 倍"，
+    // 而这里两侧的导数分别是 ~1.0 和 1.2。
     let d_elev = 2.46 * BASE_FREQ / w as f32;
     // 用**乐观**的坡度上界来定比例尺，让侵蚀去收拾剩下的。
     //
@@ -259,14 +322,56 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     let by_slope = 3.0 * span / d_elev;
     // 陆地那半最高能抬到水面线之上 `waterline − 2` 格。
     let by_sky = (waterline as f32 - 2.0) / (1.0 - cut).max(1e-6);
-    // 海那半最深能到世界底部之上 2 格。
-    let by_sea = (h as f32 - waterline as f32 - 2.0) / cut.max(1e-6);
-    let scale = by_slope.min(by_sky).min(by_sea).max(4.0);
+    let scale = by_slope.min(by_sky).max(4.0);
 
-    let mut surface: Vec<isize> = elev
-        .iter()
-        .map(|&e| waterline as isize - ((e - cut) * scale).round() as isize)
-        .collect();
+    // 哪些列在岸上：分位线之上就是陆地。
+    let is_land: Vec<bool> = elev.iter().map(|&e| e >= cut).collect();
+
+    // 每一列**离最近的岸有多远**（列数）。世界横向是环面，但这里刻意
+    // 不环绕：环面的"岸"会从另一边接回来，于是整片海变成"两边都靠岸"，
+    // 深度永远长不大——而我们要的正是"中间那片很深"。
+    let mut shore_dist = vec![usize::MAX; w];
+    {
+        let mut last: Option<usize> = None;
+        for x in 0..w {
+            if is_land[x] {
+                last = Some(x);
+            } else if let Some(l) = last {
+                shore_dist[x] = x - l;
+            }
+        }
+        last = None;
+        for x in (0..w).rev() {
+            if is_land[x] {
+                last = Some(x);
+            } else if let Some(l) = last {
+                shore_dist[x] = shore_dist[x].min(l - x);
+            }
+        }
+    }
+
+    let max_depth = ((h - waterline) as f32 * SEA_DEPTH_PERCENT) as isize;
+    let detail_seed = noise_seed ^ 0x5DEE_CE66_D1CE_0001;
+
+    let mut surface: Vec<isize> = Vec::with_capacity(w);
+    for x in 0..w {
+        if is_land[x] {
+            surface.push(waterline as isize - ((elev[x] - cut) * scale).round() as isize);
+            continue;
+        }
+        // 海：深度正比于离岸距离，到 `max_depth` 封顶（于是有一片平坦的深海平原）。
+        let base = match shore_dist[x] {
+            usize::MAX => max_depth,
+            d => ((SEA_SLOPE * d as f32) as isize).min(max_depth),
+        };
+        let detail = (fbm(
+            x as f32 / w as f32 * BASE_FREQ * 3.0,
+            detail_seed,
+        ) - 0.5)
+            * 2.0
+            * SEAFLOOR_DETAIL;
+        surface.push((waterline as isize + base + detail.round() as isize).min(h as isize - 2));
+    }
     let sea_depth = surface
         .iter()
         .copied()

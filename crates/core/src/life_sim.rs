@@ -787,6 +787,15 @@ impl LifeSim {
             org.claim(world);
             sim.organisms.push(org);
         }
+        // **光场要在占格表填好之后**再刷一次。
+        //
+        // `AirField::restore` 在装完温度之后已经刷过一次，但那时有机体还没
+        // `claim`——而 v0.33 起光场会按身体覆盖度打折（`BODY_SHADE`）。
+        // 不补这一下，读档后的第一 tick 光和存档时差一截，两边立刻分叉，
+        // 而症状是"读档之后世界跑出了另一个结果"，看上去像随机数没存对。
+        // 只刷光，**不刷温度**：温度是积分状态，存档里存着，重算一遍就把
+        // 存档里的那份覆盖掉了（症状是"温度场没原样回来"，差值还有几度）。
+        sim.field.update_light(world);
         sim
     }
 
@@ -4803,6 +4812,64 @@ mod tests {
         assert!(
             big < small,
             "大身体上岸该更贵：小 {small} tick、大 {big} tick"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 身体进光场（v0.33）
+    // -----------------------------------------------------------------------
+
+    /// **身体遮挡按覆盖度走**：密实的身体挡得多，稀疏的挡得少。
+    ///
+    /// 这是"长高有收益"的唯一来源：一条鱼挡住下面一格没什么，
+    /// 而一片占满粗格的植被会把整列压暗——邻居就没饭吃了。
+    ///
+    /// 两个比值一起断言，而不是各写一个绝对阈值：`BODY_SHADE` 是会变的
+    /// （实测从 0.5 降到 0.2 才保住生态），而"密实的挡得比稀疏的多"
+    /// 这条**关系**不该跟着变。
+    #[test]
+    fn shading_scales_with_coverage() {
+        fn light_under(offsets: &[(i16, i16)]) -> (f32, f32) {
+            let mut w = pool();
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            sim.refresh_field(&w);
+            let before = sim.field().light_at(20.0, 50.0);
+
+            let cells: Vec<Cell> = offsets
+                .iter()
+                .map(|&o| Cell::new(CellType::Armor, o))
+                .collect();
+            let mut org = Organism::new(0, (20, 36), cells, Genome::blank());
+            org.energy = 500;
+            sim.spawn_injected(&mut w, org).unwrap();
+            sim.refresh_field(&w);
+            (before, sim.field().light_at(20.0, 50.0))
+        }
+
+        // 4×4 = 16 格，正好占满一个粗格。
+        let dense: Vec<(i16, i16)> = (0..4)
+            .flat_map(|dy| (0..4).map(move |dx| (dx as i16, dy as i16)))
+            .collect();
+        // 4 格横排，只占粗格的 1/4。
+        let sparse: Vec<(i16, i16)> = (0..4).map(|i| (i as i16, 0)).collect();
+
+        let (b1, a1) = light_under(&dense);
+        let (b2, a2) = light_under(&sparse);
+        let dense_ratio = a1 / b1;
+        let sparse_ratio = a2 / b2;
+
+        assert!(
+            dense_ratio < 0.9,
+            "占满一个粗格的身体应当明显挡光：{b1:.3} → {a1:.3}"
+        );
+        assert!(
+            sparse_ratio > 0.9,
+            "4 格的身体只占 1/4，不该明显挡光：{b2:.3} → {a2:.3}"
+        );
+        assert!(
+            dense_ratio < sparse_ratio,
+            "密实的身体必须比稀疏的挡得多：{dense_ratio:.3} vs {sparse_ratio:.3}"
         );
     }
 
