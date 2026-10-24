@@ -374,8 +374,12 @@ pub struct SelectedOrganism {
     pub move_cost: u32,
     /// 身体质量。
     pub mass: u32,
-    /// 细胞构成：每种类型几格。
-    pub cells: [usize; CellType::COUNT],
+    /// 细胞构成：**每种细胞器几格**（下标同 `palette::ORGANELLE_RGB`）。
+    ///
+    /// v0.41 从"每种类型几格"换成这个。原因很简单：一旦一格可以是
+    /// "叶绿体 + 气囊"，按类型分桶就不再可加——那 13 格里到底有几格是
+    /// 生产者？答案取决于你数的是哪一列。按细胞器数则永远可加。
+    pub organelles: [usize; 10],
     /// 世系深度。
     pub generation: u32,
     /// 亲代编号。`None` = 投放进来的初代。
@@ -385,19 +389,76 @@ pub struct SelectedOrganism {
     /// 镜像放在主循环做，不放在界面：界面要是自己按 `facing` 翻一遍，
     /// 就和渲染层各写了一份镜像规则——两份规则迟早会不一致，
     /// 而"缩略图和世界里的鱼左右相反"这种 bug 看半天也想不到。
-    pub shape: Vec<(i16, i16, u8)>,
+    pub shape: Vec<(i16, i16, u16)>,
     /// 能量走势（0..1，右端是当前）。
     pub energy_trace: Vec<f32>,
+    /// 缩略图上被点中的那一格：`(属于哪个个体, 第几格)`。
     /// 上一次决策的输入（`life::INPUTS` 路）。
     pub inputs: [f32; vivarium_core::life::INPUTS],
     /// 上一次决策：6 路输出。
     pub outputs: [f32; 6],
+    /// 形态发生的数据（段树 / 展开层数 / 梯度）。
+    pub morph: MorphView,
     /// 行为网络的**直连**权重矩阵（`INPUTS × OUTPUTS`，行优先）。
     ///
     /// 只带直连这一层，不带隐藏层：直连是"看到什么就做什么"那一层，
     /// 手工基因组里真正在干活的就是它。隐藏层有 `INPUTS×8 + 8×6` 个数，
     /// 画出来是一团噪声，而噪声不构成信息。
     pub direct: Vec<f32>,
+}
+
+/// 一段（见 `morph::SegmentSummary`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct SegmentView {
+    /// 嵌套深度。0 = 主干。
+    pub depth: u8,
+    /// 这一段的格数（不含重复与镜像）。
+    pub cells: usize,
+    /// 沿主轴重复几次。
+    pub repeat: u8,
+    /// 是否镜像一份。
+    pub mirror: bool,
+    /// 这一段的基础细胞器。
+    pub base: u16,
+}
+
+/// 一条梯度带（见 `morph::Band`）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BandView {
+    /// 沿主轴的位置区间 `0..1`。
+    pub along: (f32, f32),
+    /// 到包围盒边界的距离（格）。
+    pub from_edge: (f32, f32),
+    /// 命中后叠加的细胞器。
+    pub set: u16,
+    /// 命中后清除的细胞器。
+    pub clear: u16,
+}
+
+/// **形态发生**：基因组 → 身体的那一次计算。
+///
+/// 注意它**不是发育**。身体在出生那一刻就长完了，之后只死不长，
+/// 所以这里画的是"这一次展开的过程"，不是"一个细胞分裂成一团"。
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct MorphView {
+    /// 段树（先序）。
+    pub segments: Vec<SegmentView>,
+    /// 每一层段各长出多少格：`layers[d]` = 第 d 层贡献的格数。
+    ///
+    /// 这是"逐层展开"视图的全部数据——第 0 层 1 格、第 1 层 4 格、
+    /// 第 2 层 13 格，一眼就能看出身体是靠"重复"还是靠"子段"长出来的。
+    pub layers: Vec<usize>,
+    /// 梯度带。
+    pub bands: Vec<BandView>,
+    /// 体型上限。
+    pub max_cells: u8,
+    /// 4-邻接连通分量数。`> 1` 就是身体散架了（不该发生）。
+    pub components: usize,
+    /// 展开的格数**顶到了** `max_cells`。
+    ///
+    /// 这个数很重要：它说明"突变想长得更大但被上限截住了"，
+    /// 而截断是按 BFS 顺序砍的——砍掉的可能是身体的一半。
+    pub capped: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -863,6 +924,12 @@ pub struct UiState {
     pub view: ViewMode,
     /// 选中的个体。主循环据此填 `Snapshot::selected`。
     pub selected: Option<OrganismId>,
+    /// 检视面板里**被点中的那一格**：`(属于哪个个体, 第几格)`。
+    ///
+    /// 带上编号是为了"换了选中对象就自动失效"——不需要任何事件通知，
+    /// 画的时候比一下编号即可。这种"把失效条件写进数据里"的做法，
+    /// 比在每个可能改变选中的地方手动清一遍可靠得多。
+    pub picked_cell: Option<(OrganismId, usize)>,
     /// 面板可见性。
     pub show_inspector: bool,
     pub show_console: bool,
@@ -896,6 +963,7 @@ impl Default for UiState {
             cell: CellType::Producer,
             view: ViewMode::Material,
             selected: None,
+            picked_cell: None,
             show_inspector: true,
             show_console: true,
             console: Console::new(),

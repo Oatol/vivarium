@@ -45,7 +45,7 @@ use vivarium_core::organelle::Organelles;
 use vivarium_core::life::{Genome, INPUTS, OUTPUTS};
 use vivarium_core::life_sim::{handcrafted_fish_genome, stock_surface, LifeSim, Tactic, MAX_AGE};
 use vivarium_core::{save, worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
-use vivarium_ui::state::{SelectedOrganism, Snapshot};
+use vivarium_ui::state::{BandView, MorphView, SegmentView, SelectedOrganism, Snapshot};
 mod clock;
 mod ui_glue;
 
@@ -1304,17 +1304,77 @@ impl Game {
     fn selected_view(&self) -> Option<SelectedOrganism> {
         let id = self.ui.state.selected?;
         let org = self.life.organism(id)?;
-        let mut cells = [0usize; vivarium_core::CellType::COUNT];
+        // **按细胞器数，不按类型数。** 一格可以是"叶绿体 + 气囊"，
+        // 按类型分桶就不可加了（它算生产者还是算气囊？）。
+        // 下标同 `palette::ORGANELLE_RGB`。
+        let mut organelles = [0usize; 10];
         for cell in &org.cells {
-            cells[cell.kind.as_u8() as usize] += 1;
+            for (idx, mask, shift) in vivarium_core::palette::ORGANELLE_SLOTS {
+                let on = match shift {
+                    Some(sh) => cell.organelles.level(sh) > 0,
+                    None => cell.organelles.has(mask),
+                };
+                if on {
+                    organelles[idx] += 1;
+                }
+            }
+            if cell.organelles.has(vivarium_core::organelle::MITO) {
+                organelles[7] += 1;
+            }
         }
         // 形状按朝向镜像之后再交出去。**镜像只有一份实现**（`offset_x`），
         // 界面拿到的就是世界里那个朝向——缩略图不会和画面左右相反。
+        //
+        // 第三个数是**细胞器位掩码**（不是类型）：缩略图的颜色按它混，
+        // 所以"叶绿体 + 气囊"和纯生产者在缩略图上就该是两种颜色。
         let shape = org
             .cells
             .iter()
-            .map(|c| (org.offset_x(c.offset) as i16, c.offset.1, c.kind.as_u8()))
+            .map(|c| (org.offset_x(c.offset) as i16, c.offset.1, c.organelles.0))
             .collect();
+
+        // 形态发生：段树 + 逐层格数 + 梯度。
+        //
+        // 全部从 `org.genome.body` 现算——**不缓存、不复制**。缓存的话
+        // 一旦突变改了基因组而缓存没刷新，面板上画的就不是这具身体。
+        let body = &org.genome.body;
+        let layers_raw = body.expand_layers();
+        let mut layers = vec![0usize; 4];
+        for (_, _, _, d) in &layers_raw {
+            let i = (*d as usize).min(layers.len() - 1);
+            layers[i] += 1;
+        }
+        while layers.len() > 1 && layers.last() == Some(&0) {
+            layers.pop();
+        }
+        let morph = MorphView {
+            segments: body
+                .segments()
+                .into_iter()
+                .map(|s| SegmentView {
+                    depth: s.depth,
+                    cells: s.cells,
+                    repeat: s.repeat,
+                    mirror: s.mirror,
+                    base: s.base,
+                })
+                .collect(),
+            layers,
+            bands: body
+                .gradient
+                .bands
+                .iter()
+                .map(|b| BandView {
+                    along: b.along,
+                    from_edge: b.from_edge,
+                    set: b.set,
+                    clear: b.clear,
+                })
+                .collect(),
+            max_cells: body.max_cells,
+            components: vivarium_core::anatomy::count_components(&org.cells),
+            capped: org.cells.len() >= body.max_cells as usize,
+        };
         // 直连权重（17×6）。只取这一层，见 `SelectedOrganism::direct`。
         let mut direct = Vec::with_capacity(INPUTS * OUTPUTS);
         for i in 0..INPUTS {
@@ -1339,7 +1399,7 @@ impl Game {
             upkeep: org.upkeep(),
             move_cost: org.move_cost(),
             mass: org.mass(),
-            cells,
+            organelles,
             generation: org.generation,
             parent: org.parent,
             shape,
@@ -1347,6 +1407,7 @@ impl Game {
             inputs: org.last_inputs,
             outputs: org.last_out,
             direct,
+            morph,
         })
     }
 

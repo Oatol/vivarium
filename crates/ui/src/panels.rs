@@ -35,9 +35,12 @@
 
 use egui::{Align, Color32, CornerRadius, Frame, Layout, Margin, Panel, ScrollArea, Stroke, Ui};
 
+use vivarium_core::organelle::{Organelles, MITO};
 use vivarium_core::{palette, CellType, MaterialKind, TimeScale, ViewMode};
 
-use crate::state::{CellInfo, Command, Level, SelectedOrganism, Snapshot, Tool, UiState};
+use crate::state::{
+    CellInfo, Command, Level, MorphView, SelectedOrganism, Snapshot, Tool, UiState,
+};
 use crate::theme;
 use crate::widgets::{self, BtnState, Icon};
 
@@ -796,6 +799,171 @@ fn material_label(kind: MaterialKind) -> &'static str {
     }
 }
 
+/// 细胞器的中文名。**下标必须和 `palette::ORGANELLE_RGB` 一致。**
+///
+/// 和 `cell_label` 分开而不是合并：一个是"预设细胞的名字"（给工坊用），
+/// 一个是"细胞器清单的名字"（给检视用）。两者的集合不一样——
+/// 气囊和线粒体没有对应的预设细胞，却有颜色。
+fn organelle_name(idx: usize) -> &'static str {
+    match idx {
+        0 => "叶绿体",
+        1 => "鞭毛",
+        2 => "刺",
+        3 => "嘴",
+        4 => "装甲",
+        5 => "气囊",
+        6 => "眼",
+        7 => "线粒体",
+        8 => "建造",
+        9 => "根",
+        _ => "?",
+    }
+}
+
+/// 一颗"细胞器胶囊"：色点 + 名字（+ 等级）。
+fn organelle_chip(ui: &mut Ui, idx: usize, level: u32) {
+    let [r, g, b] = palette::ORGANELLE_RGB[idx];
+    let text = if level > 1 {
+        format!("{} {level} 级", organelle_name(idx))
+    } else {
+        organelle_name(idx).to_string()
+    };
+    // 用 `legend_chip` 而不是按钮：这里点不动，画成能点的样子会骗人。
+    widgets::legend_chip(ui, Color32::from_rgb(r, g, b), &text);
+}
+
+/// 一组细胞器的短文本，给"段 / 梯度带"那种地方用。
+fn organelle_set_text(bits: u16) -> String {
+    let o = Organelles(bits);
+    let mut parts: Vec<String> = Vec::new();
+    for (idx, mask, shift) in vivarium_core::palette::ORGANELLE_SLOTS {
+        let level = match shift {
+            Some(sh) => u32::from(o.level(sh)),
+            None => u32::from(o.has(mask)),
+        };
+        if level == 0 {
+            continue;
+        }
+        parts.push(if level > 1 {
+            format!("{}×{level}", organelle_name(idx))
+        } else {
+            organelle_name(idx).to_string()
+        });
+    }
+    if parts.is_empty() {
+        "空".to_string()
+    } else {
+        parts.join("+")
+    }
+}
+
+/// 形态发生：段树、逐层展开、梯度。
+fn morph_section(ui: &mut Ui, m: &MorphView) {
+    if m.segments.is_empty() {
+        ui.label(
+            egui::RichText::new("没有基因组数据")
+                .size(9.0)
+                .color(theme::TEXT_FAINT),
+        );
+        return;
+    }
+
+    // 第一行是总账：几段、几层、顶没顶到上限。
+    let expanded: usize = m.layers.iter().sum();
+    let cap = if m.capped {
+        format!(" · **顶到上限 {}**", m.max_cells)
+    } else {
+        format!(" / 上限 {}", m.max_cells)
+    };
+    ui.label(
+        egui::RichText::new(format!(
+            "{} 段 · 展开 {expanded} 格{cap}",
+            m.segments.len()
+        ))
+        .size(9.5)
+        .color(if m.capped { theme::WARN } else { theme::TEXT_DIM }),
+    );
+
+    // 段树：按深度缩进。`depth` 来自真展开的递归深度，不是另算的。
+    for seg in &m.segments {
+        let h = 12.0;
+        let (rect, _) =
+            ui.allocate_exact_size(egui::vec2(ui.available_width(), h), egui::Sense::hover());
+        let p = ui.painter();
+        let x = rect.left() + 2.0 + seg.depth as f32 * 10.0;
+        let mut tail = format!("{} 格", seg.cells);
+        if seg.repeat > 1 {
+            tail.push_str(&format!(" ×{}", seg.repeat));
+        }
+        if seg.mirror {
+            tail.push_str(" 镜像");
+        }
+        p.text(
+            egui::pos2(x, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            if seg.depth == 0 { "主干" } else { "└ 段" },
+            egui::FontId::new(theme::TEXT_SIZE, egui::FontFamily::Proportional),
+            if seg.depth == 0 {
+                theme::TEXT
+            } else {
+                theme::TEXT_DIM
+            },
+        );
+        p.text(
+            egui::pos2(x + 30.0, rect.center().y),
+            egui::Align2::LEFT_CENTER,
+            format!("{tail}  {}", organelle_set_text(seg.base)),
+            egui::FontId::new(9.0, egui::FontFamily::Monospace),
+            theme::TEXT_FAINT,
+        );
+    }
+
+    // 逐层展开：这是"身体是靠重复长出来的，还是靠子段长出来的"的直接证据。
+    if !m.layers.is_empty() {
+        let chain: Vec<String> = m.layers.iter().map(|n| n.to_string()).collect();
+        ui.label(
+            egui::RichText::new(format!("逐层：{} 格", chain.join(" → ")))
+                .size(9.0)
+                .color(theme::TEXT_FAINT),
+        );
+    }
+
+    // 梯度。
+    if m.bands.is_empty() {
+        ui.label(
+            egui::RichText::new("无梯度：整具身体是同一种细胞")
+                .size(9.0)
+                .color(theme::TEXT_FAINT),
+        );
+    } else {
+        for (i, b) in m.bands.iter().enumerate() {
+            let mut txt = format!("带{} 沿 {:.2}–{:.2}", i + 1, b.along.0, b.along.1);
+            if b.from_edge != (0.0, 0.0) {
+                txt.push_str(&format!(" 贴边 {:.0}–{:.0}", b.from_edge.0, b.from_edge.1));
+            }
+            if b.set != 0 {
+                txt.push_str(&format!(" +{}", organelle_set_text(b.set)));
+            }
+            if b.clear != 0 {
+                txt.push_str(&format!(" −{}", organelle_set_text(b.clear)));
+            }
+            ui.label(
+                egui::RichText::new(txt)
+                    .size(9.0)
+                    .color(theme::TEXT_DIM)
+                    .monospace(),
+            );
+        }
+    }
+
+    // 最后一句必须写死：它是这个面板最容易被误读的地方。
+    ui.label(
+        egui::RichText::new("身体在出生那一刻就长完了——之后只死不长，没有发育")
+            .size(9.0)
+            .color(theme::TEXT_FAINT),
+    );
+}
+
 fn cell_label(kind: CellType) -> &'static str {
     match kind {
         CellType::Mouth => "嘴",
@@ -1018,7 +1186,23 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
     //
     // 缩略图放在最上面，因为它回答的是"这是谁"。一行数字回答不了这个问题：
     // 10 格的银鱼和 10 格的掠食者，从数字上看只差"嘴 2 / 杀手 2"。
-    widgets::thumbnail(ui, 62.0, &sel.shape);
+    //
+    // v0.41 起它还能**点**：细胞是细胞器组合之后，"这一格到底是
+    // 叶绿体 + 气囊还是纯生产者"从外面看不出来，只能点开。
+    let picked = state
+        .picked_cell
+        .filter(|(id, _)| *id == sel.id)
+        .map(|(_, i)| i)
+        .filter(|i| *i < sel.shape.len());
+    let (_, clicked) = widgets::thumbnail(ui, 62.0, &sel.shape, picked);
+    if let Some(i) = clicked {
+        // 再点一次同一格 = 取消选中。手势比"清除"按钮便宜。
+        state.picked_cell = if picked == Some(i) {
+            None
+        } else {
+            Some((sel.id, i))
+        };
+    }
     ui.add_space(2.0);
     ui.label(
         egui::RichText::new(format!(
@@ -1034,6 +1218,64 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
         .size(9.5)
         .color(theme::TEXT_FAINT),
     );
+
+    // --- 选中的那一格 -----------------------------------------------------
+    //
+    // 这一块是"缩略图能点"的全部意义：一格里有哪几个细胞器、各几级。
+    // 没有它，玩家能点但看不到任何东西，等于没做。
+    match picked.and_then(|i| sel.shape.get(i).map(|c| (i, *c))) {
+        Some((i, (dx, dy, bits))) => {
+            let o = Organelles(bits);
+            ui.add_space(4.0);
+            widgets::section(ui, &format!("第 {i} 格 · 偏移 ({dx:+}, {dy:+})"));
+            ui.add_space(1.0);
+            // 一行细胞器清单。**按混色顺序排**（叶绿体 → 鞭毛 → 刺 → 开关），
+            // 和右边那颗色块的颜色构成一致，读起来才对得上。
+            let mut row_open = false;
+            let mut any = false;
+            for (idx, mask, shift) in vivarium_core::palette::ORGANELLE_SLOTS {
+                let level = match shift {
+                    Some(sh) => u32::from(o.level(sh)),
+                    None => u32::from(o.has(mask)),
+                };
+                if level == 0 {
+                    continue;
+                }
+                if !row_open {
+                    ui.horizontal_wrapped(|ui| {
+                        organelle_chip(ui, idx, level);
+                        row_open = true;
+                    });
+                } else {
+                    // `horizontal_wrapped` 不能跨调用续写，所以这里重开一行。
+                    ui.horizontal_wrapped(|ui| {
+                        organelle_chip(ui, idx, level);
+                    });
+                }
+                any = true;
+            }
+            if o.has(MITO) {
+                ui.horizontal_wrapped(|ui| {
+                    organelle_chip(ui, 7, 1);
+                });
+            }
+            if !any && !o.has(MITO) {
+                ui.label(
+                    egui::RichText::new("这一格什么细胞器都没有——它只是一团细胞质")
+                        .size(9.0)
+                        .color(theme::TEXT_FAINT),
+                );
+            }
+        }
+        None => {
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new("点缩略图里的格子，看它带哪些细胞器")
+                    .size(9.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+    }
 
     // --- 收支 -------------------------------------------------------------
     ui.add_space(4.0);
@@ -1075,29 +1317,34 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             .color(theme::TEXT_FAINT),
     );
 
-    // --- 细胞构成 ---------------------------------------------------------
+    // --- 细胞器构成 -------------------------------------------------------
+    //
+    // **按细胞器统计，不按"细胞类型"。** 一旦一格可以是"叶绿体 + 气囊"，
+    // 按类型分桶就不再可加——那 13 格里到底几格是生产者？取决于你数哪一列。
+    // 按细胞器数则永远可加：叶绿体 9、气囊 2、线粒体 13，加起来就是"身体里
+    // 有多少份功能"。
     ui.add_space(4.0);
-    widgets::section(ui, "细胞构成");
-    let total: usize = sel.cells.iter().sum();
+    widgets::section(ui, "细胞器构成");
+    let total: usize = sel.organelles.iter().sum();
     if total > 0 {
+        // 一条按比例分段的带子：每段一个细胞器，颜色就是它在世界里的颜色。
         let (rect, _) =
             ui.allocate_exact_size(egui::vec2(ui.available_width(), 10.0), egui::Sense::hover());
         let p = ui.painter();
         p.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
         let mut x = rect.left();
-        for kind in CellType::ALL {
-            let n = sel.cells[kind.as_u8() as usize];
-            if n == 0 {
+        for (idx, n) in sel.organelles.iter().enumerate() {
+            if *n == 0 {
                 continue;
             }
-            let w = rect.width() * n as f32 / total as f32;
+            let w = rect.width() * *n as f32 / total as f32;
             p.rect_filled(
                 egui::Rect::from_min_size(
                     egui::pos2(x, rect.top()),
                     egui::vec2(w.max(1.0), rect.height()),
                 ),
                 CornerRadius::ZERO,
-                palette_to_color(palette::cell_rgb(kind)),
+                palette_to_color(palette::ORGANELLE_RGB[idx]),
             );
             x += w;
         }
@@ -1108,10 +1355,9 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             egui::StrokeKind::Inside,
         );
     }
-    // 逐类列出格数，只列有的。一行一条，右边是数量。
-    for kind in CellType::ALL {
-        let n = sel.cells[kind.as_u8() as usize];
-        if n == 0 {
+    // 逐项列出格数，只列有的。一行一条，右边是数量。
+    for (idx, n) in sel.organelles.iter().enumerate() {
+        if *n == 0 {
             continue;
         }
         let h = 13.0;
@@ -1121,9 +1367,9 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
         p.text(
             egui::pos2(rect.left() + 4.0, rect.center().y),
             egui::Align2::LEFT_CENTER,
-            cell_label(kind),
+            organelle_name(idx),
             egui::FontId::new(theme::TEXT_SIZE, egui::FontFamily::Proportional),
-            palette_to_color(palette::cell_rgb(kind)),
+            palette_to_color(palette::ORGANELLE_RGB[idx]),
         );
         p.text(
             egui::pos2(rect.right(), rect.center().y),
@@ -1133,6 +1379,14 @@ fn selected_body(ui: &mut Ui, state: &mut UiState, sel: &SelectedOrganism) {
             theme::TEXT_DIM,
         );
     }
+
+    // --- 形态发生 ---------------------------------------------------------
+    //
+    // **这不是"发育"。** 身体在出生那一刻就长完了，之后只死不长；
+    // 这里画的是"基因组 → 身体"那一次计算的过程。
+    ui.add_space(4.0);
+    widgets::section(ui, "形态发生");
+    morph_section(ui, &sel.morph);
 
     // --- 感知 -------------------------------------------------------------
     //

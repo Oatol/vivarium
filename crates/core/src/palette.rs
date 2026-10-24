@@ -14,6 +14,10 @@
 
 use crate::life::CellType;
 use crate::material::MaterialKind;
+use crate::organelle::{
+    Organelles, ARMOR, BUILDER, CHLORO_SHIFT, DIGEST, EYE, FLAGELLUM_SHIFT, GAS, ROOT,
+    STING_SHIFT,
+};
 
 /// 背景色，同时也是 [`MaterialKind::Empty`] 的颜色。
 pub const BACKGROUND: [u8; 3] = [12, 13, 18];
@@ -49,6 +53,115 @@ pub const fn glyph(kind: MaterialKind) -> char {
 /// 而身体内部的分工在 1 字符的分辨率下根本读不出来。想看细胞类型请用像素视图。
 pub const CELL_GLYPH: char = '@';
 
+/// 细胞器的基色。**下标就是调色板里的位置**（`CELL_PALETTE_BASE + 下标`）。
+///
+/// ## 顺序是一份契约
+///
+/// 这张表同时被三处读：CPU 侧的 [`organelle_rgb`]、渲染层上传的 uniform
+/// 数组、以及 `blit.wgsl` 里那段混色。**三处的下标必须一致**——
+/// 所以顺序在这里写死，并且有一条测试钉住"每个下标对应的位掩码"。
+///
+/// ## 为什么线粒体在里面却不参与混色
+///
+/// 它几乎每格都有（"所有主动功能的前提"），按一份掺进去会把所有颜色
+/// 一律拉白：装甲 `#B4C4D0`、根 `#C0B0A2`、气囊 `#D5E2EE`——三个分不出。
+/// 所以它只做**标记**：shader 在这一格里点一个白点。
+pub const ORGANELLE_RGB: [[u8; 3]; 10] = [
+    [86, 200, 96],   // 0 叶绿体：绿。光合作用就是它，绿色是功能本身
+    [72, 176, 232],  // 1 鞭毛：青蓝。和水同色系，但亮得多
+    [214, 72, 160],  // 2 刺：紫红。危险色，但不刺眼
+    [230, 96, 64],   // 3 嘴：橙红。和火同色系但更亮，因为它是主动的
+    [128, 152, 176], // 4 装甲：灰蓝。刻意不抢眼
+    [200, 220, 240], // 5 气囊：淡蓝白。它是"什么都没有"的器官
+    [240, 208, 88],  // 6 眼：黄。像一颗眼点
+    [240, 244, 248], // 7 线粒体：白。**不参与混色**，只画点
+    [196, 152, 72],  // 8 建造：琥珀。和沙同色系
+    [140, 96, 60],   // 9 根：深棕。埋在土里那一半，不该抢眼
+];
+
+/// 每个下标对应的"有没有"判据，供测试与 UI 复用。
+///
+/// 返回值是 `(下标, 位掩码, 是不是有等级的)`。有等级的三个用
+/// `level >> shift`，其余用 `has`。
+pub const ORGANELLE_SLOTS: [(usize, u16, Option<u32>); 9] = [
+    (0, 0b11 << CHLORO_SHIFT, Some(CHLORO_SHIFT)),
+    (1, 0b11 << FLAGELLUM_SHIFT, Some(FLAGELLUM_SHIFT)),
+    (2, 0b11 << STING_SHIFT, Some(STING_SHIFT)),
+    (3, DIGEST, None),
+    (4, ARMOR, None),
+    (5, GAS, None),
+    (6, EYE, None),
+    (8, BUILDER, None),
+    (9, ROOT, None),
+];
+
+/// 细胞里**除了线粒体**之外一共几份"功能"。
+///
+/// 它就是混色的权重和，同时决定"浓淡"：份数越多颜色越暗（见 [`organelle_rgb`]）。
+pub fn organelle_weight(o: Organelles) -> u32 {
+    let mut total = 0u32;
+    for (_, mask, shift) in ORGANELLE_SLOTS {
+        total += match shift {
+            Some(sh) => u32::from(o.level(sh)),
+            None => u32::from(o.has(mask)),
+        };
+    }
+    total
+}
+
+/// 一份"功能"让颜色暗多少。
+///
+/// 0.10：一格 2 级叶绿体比 1 级暗 10%，2 级叶绿体 + 嘴暗 20%。
+/// **这是"等级看得见"的唯一机制**——单看一个细胞器时，加权平均会把
+/// 权重约掉（1 级和 2 级混出来一模一样），所以浓度必须单独表达。
+const SHADE_PER_EXTRA: f32 = 0.10;
+
+/// 最暗压到多少。
+///
+/// 0.62：再多器官也不会糊成一团黑。深色背景下"暗"很容易变成"看不见"。
+const SHADE_FLOOR: f32 = 0.62;
+
+/// 细胞器 → 颜色。**这是"一格长什么样"的唯一真相。**
+///
+/// ```text
+/// 颜色 = (各细胞器基色的加权平均) × (1 - 0.10 × (份数 - 1))
+/// 权重：有等级的三个按等级算（2 级 = 2 份），开关类的算 1 份
+/// 线粒体：**不参与**（它是所有细胞的底色，掺进来会把颜色一律拉白）
+/// ```
+///
+/// 于是"生产者 = 绿"、"2 级叶绿体 = 浓绿"、"叶绿体 + 气囊 = 薄荷"、
+/// "叶绿体 + 装甲 = 灰绿（硬壳藻）"——**没有人写这些规则，是混色自己算出来的。**
+///
+/// 只有线粒体的空细胞返回中性灰：它确实什么功能都没有，但必须看得见。
+pub fn organelle_rgb(o: Organelles) -> [u8; 3] {
+    let mut sum = [0u32; 3];
+    let mut total = 0u32;
+    for (idx, mask, shift) in ORGANELLE_SLOTS {
+        let w = match shift {
+            Some(sh) => u32::from(o.level(sh)),
+            None => u32::from(o.has(mask)),
+        };
+        if w == 0 {
+            continue;
+        }
+        let c = ORGANELLE_RGB[idx];
+        for k in 0..3 {
+            sum[k] += c[k] as u32 * w;
+        }
+        total += w;
+    }
+    if total == 0 {
+        return [96, 100, 108];
+    }
+    let shade = (1.0 - SHADE_PER_EXTRA * (total - 1) as f32).max(SHADE_FLOOR);
+    let mut out = [0u8; 3];
+    for k in 0..3 {
+        let v = (sum[k] as f32 / total as f32) * shade;
+        out[k] = v.round().clamp(0.0, 255.0) as u8;
+    }
+    out
+}
+
 /// 细胞类型 → 颜色。
 ///
 /// 按**功能**上色，不按个体上色——这一条是照着 ALIEN 的做法定的。
@@ -57,26 +170,10 @@ pub const CELL_GLYPH: char = '@';
 ///
 /// 色相拉得很开（绿 / 橙 / 青 / 黄 / 紫 / 灰蓝 / 琥珀），因为深色背景下
 /// 相邻色相会糊在一起。饱和度也拉满：活着的东西必须比任何材质都醒目。
-pub const fn cell_rgb(kind: CellType) -> [u8; 3] {
-    match kind {
-        // 吃：橙红，和火同色系但更亮，因为它是主动的。
-        CellType::Mouth => [230, 96, 64],
-        // 光合：绿。这是唯一把光变成能量的地方，绿色是它的功能本身。
-        CellType::Producer => [86, 200, 96],
-        // 运动：青蓝。和水同色系，但亮得多。
-        CellType::Mover => [72, 176, 232],
-        // 感知：黄。像一颗眼点。
-        CellType::Eye => [240, 208, 88],
-        // 攻击：紫红。危险色，但不刺眼。
-        CellType::Killer => [214, 72, 160],
-        // 防御：灰蓝。刻意不抢眼——装甲不该是身体上最亮的部分。
-        CellType::Armor => [128, 152, 176],
-        // 建造：琥珀。和沙同色系，因为它处理的就是材质。
-        CellType::Builder => [196, 152, 72],
-        // 根：深棕。和建造的琥珀同色系但暗得多——两者都是"结构"类细胞，
-        // 而根是埋在土里那一半，本来就不该抢眼。
-        CellType::Root => [140, 96, 60],
-    }
+/// 它现在只是 [`organelle_rgb`] 的一个特例（单一细胞器、1 份），
+/// 保留它是为了调色板和工坊的预设色块——那些地方画的确实是"一种细胞"。
+pub fn cell_rgb(kind: CellType) -> [u8; 3] {
+    organelle_rgb(Organelles::from_cell_type(kind))
 }
 
 /// 有机体编号 → 颜色。
@@ -159,6 +256,80 @@ mod tests {
             let lum: u32 = c.iter().map(|v| *v as u32).sum();
             let bg: u32 = BACKGROUND.iter().map(|v| *v as u32).sum();
             assert!(lum > bg * 8, "id {id} 不够亮：{c:?}");
+        }
+    }
+
+    /// **线粒体不参与混色。** 它几乎每格都有，掺进去会把所有颜色拉白——
+    /// 装甲 / 根 / 气囊会糊成三个分不出的浅灰。
+    ///
+    /// 判据：加不加线粒体，颜色必须**完全一样**。
+    #[test]
+    fn mitochondria_do_not_change_the_color() {
+        let plain = Organelles(1 << CHLORO_SHIFT);
+        let with_mito = Organelles((1 << CHLORO_SHIFT) | crate::organelle::MITO);
+        assert_eq!(organelle_rgb(plain), organelle_rgb(with_mito));
+        assert_eq!(organelle_weight(plain), organelle_weight(with_mito));
+    }
+
+    /// **等级必须看得见**：2 级叶绿体比 1 级更暗（浓）。
+    ///
+    /// 单看一个细胞器时，加权平均会把权重约掉——1 级和 2 级混出来
+    /// 一模一样。所以浓度由"份数越多越暗"单独表达，这条测试钉的就是它。
+    #[test]
+    fn a_higher_level_is_darker() {
+        let one = Organelles(1 << CHLORO_SHIFT);
+        let two = Organelles(2 << CHLORO_SHIFT);
+        let lum = |c: [u8; 3]| c.iter().map(|v| *v as u32).sum::<u32>();
+        assert!(
+            lum(organelle_rgb(two)) < lum(organelle_rgb(one)),
+            "2 级叶绿体该更浓：1 级 {:?}、2 级 {:?}",
+            organelle_rgb(one),
+            organelle_rgb(two)
+        );
+    }
+
+    /// 组合是**混出来的**，不是查表查出来的。
+    ///
+    /// "叶绿体 + 气囊"必须落在两者之间（薄荷），而不是等于其中任何一个。
+    /// 这条是"能发明新细胞"在颜色上的对应物。
+    #[test]
+    fn combinations_blend_between_their_parts() {
+        let green = organelle_rgb(Organelles(1 << CHLORO_SHIFT));
+        let gas = organelle_rgb(Organelles(GAS));
+        let mixed = organelle_rgb(Organelles((1 << CHLORO_SHIFT) | GAS));
+        for k in 0..3 {
+            let lo = green[k].min(gas[k]) as i32;
+            let hi = green[k].max(gas[k]) as i32;
+            // 混色之后还会按份数压暗，所以只要求"落在两端之间（含压暗余量）"。
+            let v = mixed[k] as i32;
+            assert!(
+                v >= lo - 40 && v <= hi + 4,
+                "通道 {k} 混出来是 {v}，两端是 {lo}..{hi}"
+            );
+        }
+        assert_ne!(mixed, green, "混色不能等于其中任何一端");
+        assert_ne!(mixed, gas, "混色不能等于其中任何一端");
+    }
+
+    /// 每个参与混色的细胞器颜色都得**互相分得开**。
+    ///
+    /// 判据是两两的欧氏距离，而不是"不相等"：差 3 个色阶的颜色技术上
+    /// 不同，画面上是同一个。
+    #[test]
+    fn organelle_colors_are_far_enough_apart() {
+        let idx: Vec<usize> = ORGANELLE_SLOTS.iter().map(|(i, _, _)| *i).collect();
+        for (n, &a) in idx.iter().enumerate() {
+            for &b in &idx[n + 1..] {
+                let (ca, cb) = (ORGANELLE_RGB[a], ORGANELLE_RGB[b]);
+                let d: f32 = (0..3)
+                    .map(|k| {
+                        let x = ca[k] as f32 - cb[k] as f32;
+                        x * x
+                    })
+                    .sum::<f32>()
+                    .sqrt();
+                assert!(d > 30.0, "细胞器 {a} 和 {b} 的颜色太近：距离 {d:.1}");
+            }
         }
     }
 

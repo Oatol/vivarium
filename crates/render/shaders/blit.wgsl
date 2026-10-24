@@ -1,7 +1,7 @@
 // 全屏四边形：把世界纹理贴到窗口上，并按格内 uv 画细胞形状。
 //
 // 纹理里存的**不是颜色，是语义**：每个 u32 是一个格子的身份——
-// 材质 id，或者 `0x8000_0000 | organism << 8 | cell_type`。
+// 材质 id，或者 `0x8000_0000 | organism << 13 | organelles`。
 // 颜色、形状、膜的轮廓光全在这里算。
 //
 // 为什么必须这样：一个细胞占一格。如果纹理里存的是压平后的 RGB，
@@ -25,17 +25,38 @@ struct Scene {
     // 显示滤镜：0 材质 / 1 温度 / 2 光照 / 3 物种。
     // 必须与 `ViewMode::as_u32` 一致。
     view_mode: u32,
-    // 0..15 材质，16..22 细胞类型。只用 rgb，a 空着。
+    // 0..15 材质，16..25 细胞器。只用 rgb，a 空着。
     //
     // 中间那一段空隙不是浪费：材质和细胞是两套编号，共用一个数组时必须
     // 划清界限。**这个偏移原本是 8，而材质涨到 9 种时 `Algae = 8` 正好
     // 撞上细胞的起点**——后写的细胞配色盖掉了先写的材质配色，
     // 藻被画成了嘴的橙红色。
-    palette: array<vec4<f32>, 24>,
+    //
+    // v0.41：细胞那一半从"7 种类型"变成"10 种细胞器"，长度 24 → 32。
+    palette: array<vec4<f32>, 32>,
 };
 
-// 细胞类型在 `palette` 里的起始下标。必须与 `palette.rs` 的同名常数一致。
+// 细胞器在 `palette` 里的起始下标。必须与 `palette.rs` 的同名常数一致。
 const CELL_PALETTE_BASE: u32 = 16u;
+
+// 有机体编号在视觉键里的起始位。必须与 `pixel.rs` 的 `ORGANISM_SHIFT` 一致。
+const ORGANISM_SHIFT: u32 = 13u;
+// 编号位宽 18 位。
+const ORGANISM_MASK: u32 = 0x3FFFFu;
+
+// 细胞器位。必须与 `organelle.rs` 的常量一致。
+const DIGEST_BIT: u32 = 1u << 6u;
+const ARMOR_BIT: u32 = 1u << 7u;
+const GAS_BIT: u32 = 1u << 8u;
+const EYE_BIT: u32 = 1u << 9u;
+const MITO_BIT: u32 = 1u << 10u;
+const BUILDER_BIT: u32 = 1u << 11u;
+const ROOT_BIT: u32 = 1u << 12u;
+
+// 混色时"每多一份功能暗多少"，以及最暗压到哪儿。
+// 必须与 `palette.rs` 的 `SHADE_PER_EXTRA` / `SHADE_FLOOR` 一致。
+const SHADE_PER_EXTRA: f32 = 0.10;
+const SHADE_FLOOR: f32 = 0.62;
 
 // 粗网格的边长。必须与 `field::AIR_CELL` 一致。
 const AIR_CELL: f32 = 4.0;
@@ -97,7 +118,70 @@ fn is_cell(k: u32) -> bool {
 }
 
 fn organism_of(k: u32) -> u32 {
-    return (k >> 8u) & 0x7FFFFFu;
+    return (k >> ORGANISM_SHIFT) & ORGANISM_MASK;
+}
+
+// 一格的细胞器位掩码。低 13 位，最高位是"这是细胞"的标志，所以要先剥掉。
+fn organelles_of(k: u32) -> u32 {
+    return k & 0x1FFFu;
+}
+
+// 细胞器的混色。**必须与 `palette::organelle_rgb` 逐项一致。**
+//
+//   颜色 = (各基色的加权平均) × (1 - 0.10 × (份数 - 1))
+//
+// 权重：有等级的三个（叶绿体 / 鞭毛 / 刺）按等级算，开关类算 1 份，
+// 线粒体**不参与**——它几乎每格都有，掺进来会把所有颜色拉白，
+// 装甲 / 根 / 气囊就分不出来了。它只画一个白点（见 `fs_main`）。
+fn organelle_color(bits: u32) -> vec3<f32> {
+    var sum = vec3<f32>(0.0);
+    var total = 0.0;
+
+    let chloro = f32((bits >> 0u) & 3u);
+    let flag = f32((bits >> 2u) & 3u);
+    let sting = f32((bits >> 4u) & 3u);
+    if (chloro > 0.0) {
+        sum += u.palette[CELL_PALETTE_BASE + 0u].rgb * chloro;
+        total += chloro;
+    }
+    if (flag > 0.0) {
+        sum += u.palette[CELL_PALETTE_BASE + 1u].rgb * flag;
+        total += flag;
+    }
+    if (sting > 0.0) {
+        sum += u.palette[CELL_PALETTE_BASE + 2u].rgb * sting;
+        total += sting;
+    }
+    if ((bits & DIGEST_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 3u].rgb;
+        total += 1.0;
+    }
+    if ((bits & ARMOR_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 4u].rgb;
+        total += 1.0;
+    }
+    if ((bits & GAS_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 5u].rgb;
+        total += 1.0;
+    }
+    if ((bits & EYE_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 6u].rgb;
+        total += 1.0;
+    }
+    if ((bits & BUILDER_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 8u].rgb;
+        total += 1.0;
+    }
+    if ((bits & ROOT_BIT) != 0u) {
+        sum += u.palette[CELL_PALETTE_BASE + 9u].rgb;
+        total += 1.0;
+    }
+    if (total <= 0.0) {
+        // 只有线粒体的空细胞：中性灰，比背景亮，看得见但毫不抢眼。
+        return vec3<f32>(0.376, 0.392, 0.424);
+    }
+    let shade = max(1.0 - SHADE_PER_EXTRA * (total - 1.0), SHADE_FLOOR);
+    return (sum / total) * shade;
 }
 
 fn same_organism(a: u32, org: u32) -> bool {
@@ -283,8 +367,8 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         return vec4<f32>(bg, 1.0);
     }
 
-    let kind = key & 0xFFu;
-    let base = u.palette[CELL_PALETTE_BASE + kind].rgb;
+    let bits = organelles_of(key);
+    let base = organelle_color(bits);
 
     // 明暗按**到格心的距离**算，不是按到身体边界的距离。
     //
@@ -299,6 +383,21 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     // 基础亮度压到 0.72 而不是 0.5：细胞边界处 core 归零，如果基础值太低，
     // 两颗细胞相接的地方会暗到和水几乎同色，融合出来的身体就断成两截。
     var c = base * (0.72 + 0.33 * core) + base * 0.35 * rim;
+
+    // 线粒体：**一个白点**，不参与混色。
+    //
+    // 它几乎每格都有，所以它不该改变"这格是什么颜色"——但它确实是个
+    // 可观测的差别：没有线粒体的细胞所有主动功能只有 25% 效率，
+    // 那是一种"活着的石头"，玩家该看得出它和正常细胞的区别。
+    //
+    // 点画在格心偏右上，避开 `core` 的亮点；半径按 `aa` 走，
+    // 缩到全景时它自然消失（那时一格才 1 像素，本来也画不下）。
+    if ((bits & MITO_BIT) != 0u) {
+        let dp = length(local - vec2<f32>(0.16, -0.16)) - 0.10;
+        let dot = 1.0 - smoothstep(-aa, aa, dp);
+        c = mix(c, u.palette[CELL_PALETTE_BASE + 7u].rgb, dot * 0.9);
+    }
+
     c = min(c, vec3<f32>(1.0));
     return vec4<f32>(mix(bg, c, body), 1.0);
 }

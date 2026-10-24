@@ -29,6 +29,8 @@
 //! 正好等于 wgpu 的 `COPY_BYTES_PER_ROW_ALIGNMENT`。
 //! 块上传天然满足行对齐，不需要手动补 padding。下面有一条编译期断言盯着这件事。
 
+#[cfg(test)]
+use vivarium_core::organelle::{Organelles, GAS};
 use vivarium_core::{field, AirField, CellOwner, MaterialCell, ViewMode, World, CHUNK_SIZE};
 
 use crate::{palette, RenderError, Renderer};
@@ -128,8 +130,8 @@ struct Letterbox {
 /// "一格长什么样"就只有 shader 一个地方在回答——不会出现
 /// "CPU 算的颜色和 shader 算的不一致"这种最难查的一类 bug。
 ///
-/// 布局必须与 `blit.wgsl` 里的 `Scene` 逐字节一致：432 字节，
-/// 每个 vec4 落在 16 的倍数上。
+/// 布局必须与 `blit.wgsl` 里的 `Scene` 逐字节一致：**560 字节**
+/// （48 字节头部 + 32 × 16 字节调色板），每个 vec4 落在 16 的倍数上。
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct SceneUniforms {
@@ -286,14 +288,32 @@ pub const CELL_BIT: u32 = 0x8000_0000;
 fn visual_key(cells: &[MaterialCell], owners: &[CellOwner], i: usize) -> u32 {
     let owner = owners[i];
     if owner.is_some() {
-        // 最高位标记"这一格是细胞"，中间 23 位是编号，低 8 位是细胞类型。
-        // 这个键同时是**世界纹理的内容**（见 `build_chunk`），
-        // 所以"脏块检测"和"上传的到底是什么"用的是同一个定义，不可能漂移。
-        CELL_BIT | (owner.organism << 8) | owner.kind as u32
+        // 最高位标记"这一格是细胞"，**低 13 位是细胞器位掩码**，
+        // 中间 18 位是编号。
+        //
+        // v0.41 换过一次布局：原来低 8 位放的是 `CellType`，而颜色现在
+        // 按细胞器混（叶绿体绿 + 气囊淡蓝 = 薄荷），那个有损的"代表类型"
+        // 不够用了。位宽是这样分的：
+        //
+        // | 位 | 用途 |
+        // |---|---|
+        // | 31 | 这一格是细胞 |
+        // | 13..30 | 有机体编号（18 位 = 26 万，够一个会话用） |
+        // | 0..12 | 细胞器（13 位，`Organelles` 正好用满） |
+        //
+        // **编号从 23 位缩到 18 位是有代价的**：编号超过 262143 会回绕，
+        // 于是两个不同个体可能撞上同一个视觉编号、被画成同一具身体。
+        // 现实里到不了（8000 tick 几百次出生），而且撞了也只是视觉上的。
+        CELL_BIT | (owner.organism << ORGANISM_SHIFT) | owner.organelles as u32
     } else {
         cells[i].kind.as_u8() as u32
     }
 }
+
+/// 有机体编号在视觉键里的起始位。
+///
+/// 必须与 `blit.wgsl` 里的 `ORGANISM_SHIFT` 一致。
+pub const ORGANISM_SHIFT: u32 = 13;
 
 #[derive(Debug, Clone)]
 pub struct PixelUploader {
@@ -1585,7 +1605,7 @@ mod tests {
     #[test]
     fn organism_pixels_override_the_material_underneath() {
         let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
-        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Producer.as_u8()));
+        w.set_owner(10, 10, CellOwner::new(1, 0, Organelles::from_cell_type(CellType::Producer).0));
         let mut up = PixelUploader::new(&w);
         settle(&mut up, &w);
         let px = up.build_chunk(&w, 0, 0).to_vec();
@@ -1597,41 +1617,58 @@ mod tests {
             MaterialKind::Water.as_u8() as u32,
             "鱼站在水里时上传的是鱼，不是水"
         );
+        let bits = Organelles::from_cell_type(CellType::Producer).0 as u32;
         assert_eq!(
             key,
-            CELL_BIT | (1 << 8) | CellType::Producer.as_u8() as u32,
+            CELL_BIT | (1 << ORGANISM_SHIFT) | bits,
             "编号 1 的生产者细胞"
         );
     }
 
+    /// **细胞器位掩码必须原样到 GPU**，因为颜色是在 shader 里混出来的。
+    ///
+    /// v0.41 之前这里传的是 `CellType`（0..7），于是"叶绿体 + 气囊"和
+    /// 纯生产者拿到的是同一个字节（都降级成 `Producer`），画出来一模一样。
+    /// 现在传 13 位位掩码，组合自己就是颜色。
     #[test]
-    fn the_cell_type_reaches_the_gpu() {
-        // 这是整个语义纹理的存在理由：渲染层必须知道"这是嘴还是生产者"，
-        // 否则没法按功能上色，也没法画不同的形状。
+    fn the_organelles_reach_the_gpu() {
         let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
-        w.set_owner(10, 10, CellOwner::new(7, 2, CellType::Mouth.as_u8()));
+        // 一格"叶绿体 + 气囊"：这个组合在旧的类型枚举里根本表达不出来。
+        let combo = Organelles::from_cell_type(CellType::Producer).with(GAS);
+        w.set_owner(10, 10, CellOwner::new(7, 2, combo.0));
         let mut up = PixelUploader::new(&w);
         settle(&mut up, &w);
         let px = up.build_chunk(&w, 0, 0).to_vec();
 
         let key = key_at(&px, (10 * CHUNK_SIZE + 10) * 4);
-        assert_eq!(key & 0xFF, CellType::Mouth.as_u8() as u32, "类型在低 8 位");
-        assert_eq!((key >> 8) & 0x7F_FFFF, 7, "编号在中间 23 位");
+        assert_eq!(key & 0x1FFF, combo.0 as u32, "细胞器在低 13 位");
+        assert_eq!(
+            (key >> ORGANISM_SHIFT) & 0x3_FFFF,
+            7,
+            "编号在中间 18 位"
+        );
         assert_ne!(key & CELL_BIT, 0, "最高位标记这是细胞");
+
+        // 光靠"代表类型"是分不出这两格的——这正是换布局的理由。
+        assert_eq!(
+            combo.primary_cell_type(),
+            CellType::Producer,
+            "这个组合的代表类型确实是生产者，所以按类型上色会丢掉气囊"
+        );
     }
 
     #[test]
-    fn changing_the_cell_type_dirties_the_chunk() {
-        // 同一个编号、同一个位置，只换了细胞类型——画面必须跟着变。
+    fn changing_the_organelles_dirties_the_chunk() {
+        // 同一个编号、同一个位置，只换了细胞器——画面必须跟着变。
         // 只按编号比的话这里会漏：器官换了，画面上什么都不变。
         let mut w = world_with(&[(10, 10, MaterialKind::Water)]);
-        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Mouth.as_u8()));
+        w.set_owner(10, 10, CellOwner::new(1, 0, Organelles::from_cell_type(CellType::Mouth).0));
         let mut up = PixelUploader::new(&w);
         settle(&mut up, &w);
         assert_eq!(up.prepare(&w), 0);
 
-        w.set_owner(10, 10, CellOwner::new(1, 0, CellType::Killer.as_u8()));
-        assert_eq!(up.prepare(&w), 1, "换了细胞类型必须重画");
+        w.set_owner(10, 10, CellOwner::new(1, 0, Organelles::from_cell_type(CellType::Killer).0));
+        assert_eq!(up.prepare(&w), 1, "换了细胞器必须重画");
     }
 
     #[test]
@@ -2146,8 +2183,8 @@ mod tests {
         // 16×16 的水，两格同族细胞横着并排。
         let mut world = World::new(64, 64).unwrap();
         world.fill_all(MaterialKind::Water);
-        world.set_owner(5, 5, CellOwner::new(1, 0, CellType::Mover.as_u8()));
-        world.set_owner(6, 5, CellOwner::new(1, 1, CellType::Mover.as_u8()));
+        world.set_owner(5, 5, CellOwner::new(1, 0, Organelles::from_cell_type(CellType::Mover).0));
+        world.set_owner(6, 5, CellOwner::new(1, 1, Organelles::from_cell_type(CellType::Mover).0));
 
         // 视口 4×4 格铺满 256 像素 → 每格 64 像素。
         // 格 5 的屏幕区间是 [96, 160)，格 6 是 [160, 224)，接缝正好在 x = 160。

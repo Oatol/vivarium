@@ -55,14 +55,20 @@ pub struct CellOwner {
     pub organism: u32,
     /// 该格是这个有机体的第几个细胞。
     pub cell: u16,
-    /// 这一格细胞的类型（`crate::life::CellType::as_u8`）。
+    /// 这一格细胞的**细胞器位掩码**（`crate::organelle::Organelles`）。
     ///
     /// 渲染层靠它决定画什么形状、上什么颜色。之所以存一份在占格表里，
     /// 而不是让渲染器去查生命层：渲染器只拿得到 `&World`，为了知道
-    /// "这是嘴还是生产者"而让它持有整个 `LifeSim`，是把两层焊死。
+    /// "这一格带哪些细胞器"而让它持有整个 `LifeSim`，是把两层焊死。
     ///
-    /// 加这个字段**没有多占内存**——`u32 + u16` 本来就要 padding 到 8 字节。
-    pub kind: u8,
+    /// **v0.41 从 `kind: u8` 换成 `organelles: u16`。** 原来存的是
+    /// "代表类型"，而颜色一旦要按细胞器混（叶绿体绿 + 气囊淡蓝 = 薄荷），
+    /// 那个有损的降级就不够用了：`叶绿体 + 气囊` 的代表类型是 `Producer`，
+    /// 按类型上色的话它和纯生产者一模一样。
+    ///
+    /// 换成 `u16` 之后结构体仍然是 8 字节（`u32 + u16 + u16`），
+    /// 一格都没多占。
+    pub organelles: u16,
 }
 
 impl CellOwner {
@@ -70,16 +76,16 @@ impl CellOwner {
     pub const NONE: Self = Self {
         organism: 0,
         cell: 0,
-        kind: 0,
+        organelles: 0,
     };
 
-    /// 由有机体编号、细胞下标与细胞类型构造。
+    /// 由有机体编号、细胞下标与细胞器位掩码构造。
     #[inline]
-    pub const fn new(organism: u32, cell: u16, kind: u8) -> Self {
+    pub const fn new(organism: u32, cell: u16, organelles: u16) -> Self {
         Self {
             organism,
             cell,
-            kind,
+            organelles,
         }
     }
 
@@ -640,9 +646,9 @@ impl World {
                 h = h.wrapping_mul(FNV_PRIME);
                 h ^= owner.cell as u64;
                 h = h.wrapping_mul(FNV_PRIME);
-                // 细胞类型也要进哈希：同一个编号、同一个下标，换成另一种细胞
+                // 细胞器也要进哈希：同一个编号、同一个下标，换成另一种细胞
                 // 就是另一个世界，而"世界变了哈希没变"会让回放对不上。
-                h ^= owner.kind as u64;
+                h ^= owner.organelles as u64;
                 h = h.wrapping_mul(FNV_PRIME);
             }
         }

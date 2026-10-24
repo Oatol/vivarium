@@ -1148,7 +1148,7 @@ impl Organism {
             world.set_owner(
                 x as isize,
                 y as isize,
-                crate::world::CellOwner::new(self.id, i as u16, cell.kind.as_u8()),
+                crate::world::CellOwner::new(self.id, i as u16, cell.organelles.0),
             );
         }
     }

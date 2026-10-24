@@ -23,7 +23,8 @@ use egui::{
     Align2, Color32, CornerRadius, FontId, Rect, Response, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
-use vivarium_core::{palette, CellType};
+use vivarium_core::organelle::Organelles;
+use vivarium_core::palette;
 
 use crate::theme;
 
@@ -661,9 +662,23 @@ pub fn vline(ui: &mut Ui) {
 ///
 /// 坐标系与世界一致：`+x` 向右、`+y` 向下，锚点用一圈亮框标出来
 /// （锚点不是装饰：感知深度、拥挤判定都用它）。
-pub fn thumbnail(ui: &mut Ui, height: f32, shape: &[(i16, i16, u8)]) -> Response {
+///
+/// ## 点一格 = 选中它
+///
+/// 返回被点中的**格下标**（`shape` 里的位置）。细胞一旦是"细胞器组合"，
+/// 缩略图就不再只是"这是谁"——它还是唯一能点进身体内部的地方：
+/// 一格到底是"叶绿体 + 气囊"还是纯生产者，只有点开才知道。
+///
+/// 命中用**格子的矩形**判，不用"最近中心"：相邻格的中心只差 `cell` 像素，
+/// 而最近中心会让每一格的边界都偏半格，点边缘时选中的是邻居。
+pub fn thumbnail(
+    ui: &mut Ui,
+    height: f32,
+    shape: &[(i16, i16, u16)],
+    picked: Option<usize>,
+) -> (Response, Option<usize>) {
     let (rect, resp) =
-        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::hover());
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), height), Sense::click());
     let p = ui.painter();
     p.rect_filled(rect, CornerRadius::ZERO, theme::SUNKEN);
     p.rect_stroke(
@@ -674,7 +689,7 @@ pub fn thumbnail(ui: &mut Ui, height: f32, shape: &[(i16, i16, u8)]) -> Response
     );
 
     if shape.is_empty() {
-        return resp;
+        return (resp, None);
     }
 
     // 包围盒。
@@ -694,12 +709,29 @@ pub fn thumbnail(ui: &mut Ui, height: f32, shape: &[(i16, i16, u8)]) -> Response
     let grid = Vec2::new(bw * cell, bh * cell);
     let origin = rect.center() - grid * 0.5;
 
-    for &(x, y, kind) in shape {
+    // 点中的那一格先画一个底，避免它的高亮被后画的邻居盖住。
+    if let Some(i) = picked {
+        if let Some(&(x, y, _)) = shape.get(i) {
+            let px = origin.x + (x - min_x) as f32 * cell;
+            let py = origin.y + (y - min_y) as f32 * cell;
+            p.rect_filled(
+                Rect::from_min_size(
+                    egui::pos2(px - 1.0, py - 1.0),
+                    Vec2::splat(cell + 1.0),
+                ),
+                CornerRadius::ZERO,
+                theme::ACCENT,
+            );
+        }
+    }
+
+    for &(x, y, bits) in shape {
         // `x` 已经由主循环按朝向镜像过，这里不再翻——镜像只有一份实现。
         let px = origin.x + (x - min_x) as f32 * cell;
         let py = origin.y + (y - min_y) as f32 * cell;
-        let c = CellType::from_u8(kind);
-        let [r, g, b] = palette::cell_rgb(c);
+        // **颜色按细胞器混**，和世界里那套是同一个函数——两处各写一份的话，
+        // 缩略图上的鱼和画面上的鱼会慢慢变成两种颜色。
+        let [r, g, b] = palette::organelle_rgb(Organelles(bits));
         let body = Rect::from_min_size(egui::pos2(px, py), Vec2::splat((cell - 1.0).max(1.0)));
         p.rect_filled(body, CornerRadius::ZERO, Color32::from_rgb(r, g, b));
         // 锚点：(0,0) 那一格描一圈白边。
@@ -713,7 +745,19 @@ pub fn thumbnail(ui: &mut Ui, height: f32, shape: &[(i16, i16, u8)]) -> Response
         }
     }
 
-    resp
+    // 命中：格子的矩形包含指针就算。
+    let clicked = if resp.clicked() {
+        resp.interact_pointer_pos().and_then(|pos| {
+            shape.iter().position(|&(x, y, _)| {
+                let px = origin.x + (x - min_x) as f32 * cell;
+                let py = origin.y + (y - min_y) as f32 * cell;
+                Rect::from_min_size(egui::pos2(px, py), Vec2::splat(cell.max(1.0))).contains(pos)
+            })
+        })
+    } else {
+        None
+    };
+    (resp, clicked)
 }
 
 /// 一行 "标签 · 条形 · 数值"。

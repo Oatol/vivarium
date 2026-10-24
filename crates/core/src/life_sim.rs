@@ -234,6 +234,48 @@ pub const LAND_DAMP_PER_ROOT: f32 = 0.08;
 /// 海草 481 株吃光所有光的重演。陆地该是"能活，但更苦"。
 pub const LAND_DAMP_MAX: f32 = 0.60;
 
+/// 土壤湿度：离最近的**含水的列**多远就干透了（列数）。
+///
+/// 160 列。512 宽的世界里陆地有 180 列，所以"从海岸往里走 160 列"大致
+/// 就是"走到大陆中央"——再往里就是沙漠。
+///
+/// **这个数决定了"植物能走多远"**，而它是这一整套规则里唯一一个
+/// 关于"陆地有多宽"的数。改它等于改地图上能长植物的比例。
+const SOIL_MOISTURE_SPAN: f32 = 200.0;
+
+/// 土壤湿度每多少点回充 1 点含水量。
+///
+/// 40：湿度 0..255 分成 0..6 共 7 档回充速率，而 `HYDRATION_DRAIN` 是 1。
+/// 所以**净收支为零的那一档是 40..79**——低于 40 的土壤，植物入不敷出。
+/// 这条分档很粗（只有 7 档），但它换来的是整数运算：`hydration` 是 `u8`，
+/// 用小数累积就得给它加一个进位字段，而那个字段要进存档。
+const SOIL_REFILL_PER: u8 = 40;
+
+/// 一株生产者这一 tick 收进来多少能量。
+///
+/// **整具身体一次截断，不要逐格截断再乘格数。**
+///
+/// 旧写法是 `(...) as u32 * producers`——先把单格产量截成整数再乘格数。
+/// 单格 `24 × 0.77 × 0.8 × 0.32 = 4.72` 截成 4，一条 6 格的身体每 tick
+/// 白丢 4.3 点（约 15%）。在"岸上产能只有水里三分之一"的地方，
+/// 这 15% 是**生死差别**：实测同一株植物，逐格截断时离岸 40 列饿死，
+/// 整具截断时活到 50 列。
+///
+/// 抽成函数是为了能被单元测试直接钉住——这条规则藏在 `step` 中间时，
+/// 唯一的观测方式是跑生态，而生态里它和十几个别的因素混在一起。
+fn producer_gain(light: f32, warmth: f32, damp: f32, wet: f32, producers: usize) -> u32 {
+    (PRODUCER_YIELD as f32 * light * warmth * damp * wet * producers as f32) as u32
+}
+
+/// 从湿度表里读一列（横向环绕）。
+fn moisture_at(moisture: &[u8], x: i32) -> u8 {
+    let w = moisture.len();
+    if w == 0 {
+        return 0;
+    }
+    moisture[x.rem_euclid(w as i32) as usize]
+}
+
 /// 一株植物的根能把它在岸上的产能抬到多少。
 ///
 /// ## 为什么是函数而不是常数
@@ -677,6 +719,20 @@ pub struct LifeSim {
     /// 如果它住在主循环，`step` 就要多一个参数——而那个签名会被
     /// 几百个测试调用，改动成本远大于收益。
     field: AirField,
+    /// 每一列土壤的湿度（`0..=255`），**按列存，不按格存**。
+    ///
+    /// ## 为什么按列
+    ///
+    /// 湿度在这里只回答一个问题："离最近的水有多远"。那是一个**横向**的量，
+    /// 同一列从地表到地底一样湿。按格存要多花 262 KB（512²）买一个
+    /// 沿深度不变的常数，不值。
+    ///
+    /// ## 为什么不存进存档
+    ///
+    /// 它是**世界布局的纯函数**（哪一列有水），和光场同一类东西——
+    /// 读档时重算一遍即可，存档里一个字都不用加。这也意味着玩家
+    /// 挖开一条运河之后湿度会跟着变，而不是冻在开局那一刻。
+    moisture: Vec<u8>,
 }
 
 impl Default for LifeSim {
@@ -697,6 +753,7 @@ impl Default for LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
+            moisture: Vec::new(),
             // 空场：0×0，所有查询都返回默认值。`new` 会按真实尺寸重建。
             field: AirField::default(),
         }
@@ -744,8 +801,10 @@ impl LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
+            moisture: Vec::new(),
             field,
         }
+        .with_moisture(world)
     }
 
     /// 光场与温度场（只读）。渲染器和界面从这里取。
@@ -767,6 +826,89 @@ impl LifeSim {
     /// 而用户会盯着一个没反应的世界。
     pub fn refresh_field(&mut self, world: &World) {
         self.field.refresh(world);
+    }
+
+    /// 重算每一列的土壤湿度。
+    ///
+    /// 判据：**这一列有没有水**。有水的列（海、湖、水洼）湿度满；
+    /// 没水的列按"到最近含水的列有多远"衰减。
+    ///
+    /// ```text
+    /// moisture(d) = 255 × (1 − d / 200)
+    /// ```
+    ///
+    /// **线性，不是平方。** 平方试过：它和"产能按湿度打折"叠在一起之后
+    /// 总效果是四次方，于是可活的那条带子窄到只有离岸十列——实测
+    /// 湿度 242 活、212 饿死。线性让"走一半路 = 一半水 = 一半产量"，
+    /// 而这句话是能被玩家理解的。
+    ///
+    /// 横向是**环面**，所以距离也是环绕的（从另一边绕过去更近就算更近）——
+    /// 和 `worldgen` 里算海岸距离时不同（那里刻意不环绕，否则海永远浅），
+    /// 因为这里问的是"水在哪儿"，环面上确实从两边都能走到。
+    fn with_moisture(mut self, world: &World) -> Self {
+        let w = world.width();
+        let h = world.height();
+        if w == 0 || h == 0 {
+            return self;
+        }
+        let mut wet = vec![false; w];
+        for (x, slot) in wet.iter_mut().enumerate() {
+            for y in 0..h {
+                if world.get(x as isize, y as isize) == MaterialKind::Water {
+                    *slot = true;
+                    break;
+                }
+            }
+        }
+        // 环面上的最近距离：**绕两圈**再取最小。
+        //
+        // 只绕一圈的话，跨过世界边界的那些列会算成"离水很远"——
+        // 而横向是环面，边界那一边的水确实就在隔壁。绕两圈之后
+        // 每列的左右两侧都被扫到过，`min` 自然给出环面上的真距离。
+        let mut dist = vec![usize::MAX; w];
+        let mut last: Option<usize> = None;
+        for i in 0..2 * w {
+            let x = i % w;
+            if wet[x] {
+                last = Some(i);
+            }
+            if let Some(l) = last {
+                dist[x] = dist[x].min(i - l);
+            }
+        }
+        let mut last: Option<usize> = None;
+        for i in (0..2 * w).rev() {
+            let x = i % w;
+            if wet[x] {
+                last = Some(i);
+            }
+            if let Some(l) = last {
+                dist[x] = dist[x].min(l - i);
+            }
+        }
+
+        self.moisture = dist
+            .iter()
+            .map(|&d| {
+                if d == usize::MAX {
+                    // 一滴水都没有的世界：全干。这是合法的（空世界就是这样）。
+                    return 0;
+                }
+                let t = 1.0 - (d as f32 / SOIL_MOISTURE_SPAN).min(1.0);
+                (255.0 * t).round().clamp(0.0, 255.0) as u8
+            })
+            .collect();
+        self
+    }
+
+    /// 这一列的土壤湿度（`0..=255`）。没有这一列时返回 0。
+    pub fn moisture_at(&self, x: i32) -> u8 {
+        moisture_at(&self.moisture, x)
+    }
+
+    /// 整张湿度表（每列一个数）。给界面和测量用。
+    pub fn moisture(&self) -> &[u8] {
+        &self.moisture
     }
 
     /// 打开/关闭藻席生长。
@@ -840,8 +982,13 @@ impl LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
+            moisture: Vec::new(),
             field,
         };
+        // 湿度是**布局的纯函数**，不存进档：读档时按当前世界重算。
+        // 于是"存档之后挖了一条运河"也能被读回来——湿度跟着地形走，
+        // 而不是冻在存档那一刻。
+        sim = sim.with_moisture(world);
         sim.rng.set_state(save.rng_state.0, save.rng_state.1);
 
         for org in save.organisms {
@@ -1389,32 +1536,84 @@ impl LifeSim {
     /// 判据是"某一格根细胞的四邻里有水"——**根要够得着水，不是身体泡在水里**。
     /// 这就是根和"整具身体泡在水里"的区别：后者要求锚点所在的粗格有水，
     /// 前者只要求某一格根挨着一格水。
-    fn root_is_wet(world: &World, org: &Organism) -> bool {
+    /// 根能拿到的水：`None` = 一点都没有，`Some(255)` = 贴着水，
+    /// `Some(m)` = 从土壤里吸，`m` 是那一列的湿度。
+    ///
+    /// ## 为什么根要能从土里吸水
+    ///
+    /// v0.37 的根只认"四邻是 `Water`"。那条判据让根变成了一个
+    /// **"水边开关"**：内陆一格水都没有，于是根扎得再好也活不了，
+    /// 植物永远上不了岸。而真实的根主要吸的是**土壤水**，不是泡在水里。
+    ///
+    /// 现在多一条路：四邻是石头或沙 → 按**那一列的湿度**吸
+    /// （见 [`LifeSim::moisture_at`]）。湿度随离水距离衰减，
+    /// 于是"能走多远"第一次变成了一个空间上的答案，而不是一道墙。
+    ///
+    /// 取所有根里**最湿的那一处**，不是平均：一棵树有一条根扎到了湿土，
+    /// 整株就该活——根是并联的，不是串联的。
+    fn root_water(world: &World, moisture: &[u8], org: &Organism) -> Option<u8> {
+        let mut best: Option<u8> = None;
         for cell in &org.cells {
             if !cell.organelles.has(ROOT) {
                 continue;
             }
             let (x, y) = org.cell_at(cell);
             for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
-                if world.get((x + dx) as isize, (y + dy) as isize) == MaterialKind::Water {
-                    return true;
+                let (nx, ny) = (x + dx, y + dy);
+                match world.get(nx as isize, ny as isize) {
+                    // 贴着水：满。直接返回，不用再看别的根。
+                    MaterialKind::Water => return Some(u8::MAX),
+                    // 土壤：按这一列的湿度。
+                    MaterialKind::Stone | MaterialKind::Sand => {
+                        let m = moisture_at(moisture, nx);
+                        best = Some(best.map_or(m, |b| b.max(m)));
+                    }
+                    _ => {}
                 }
             }
         }
-        false
+        best
     }
 
     /// 每 tick 更新含水量。
     ///
     /// 放在 `inject_sunlight` **之前**：光合这一 tick 用的是这一 tick 的水。
     fn tick_hydration(&mut self, world: &World) {
+        let max = crate::life::HYDRATION_MAX;
+        let drain = crate::life::HYDRATION_DRAIN;
+        // 先把湿度表借出来：循环里借的是 `organisms`，两个字段互不相干。
+        let moisture = &self.moisture;
         for org in &mut self.organisms {
-            let wet = Self::root_is_wet(world, org)
-                || dampness(self.field.water_frac(org.anchor.0 as f32, org.anchor.1 as f32)) > 0.5;
-            if wet {
-                org.hydration = crate::life::HYDRATION_MAX;
-            } else {
-                org.hydration = org.hydration.saturating_sub(crate::life::HYDRATION_DRAIN);
+            // 整具身体泡在水里：直接满，和根无关。
+            if dampness(self.field.water_frac(org.anchor.0 as f32, org.anchor.1 as f32)) > 0.5 {
+                org.hydration = max;
+                continue;
+            }
+            match Self::root_water(world, moisture, org) {
+                // 根贴着水：满。
+                Some(u8::MAX) => org.hydration = max,
+                // 根在土里：按湿度回充，**扣掉蒸发**。
+                //
+                // 净收支 = `湿度 / 40` − 蒸发。所以湿度 40..79 那一档
+                // 正好打平（活得住，但长不回来），再干就入不敷出。
+                // 这条分档很粗（只有 7 档），换来的是全整数运算——
+                // 用小数累积就得给 `hydration` 加一个进位字段，而那个字段
+                // 要进存档，而"为了一个进位改存档版本"不值。
+                Some(m) => {
+                    let refill = m / SOIL_REFILL_PER;
+                    if refill >= drain {
+                        // **必须 `saturating_add`。** 写成 `(h + d).min(max)`
+                        // 会在满水时先溢出：`255u8 + 5` 在 release 下回绕成 **4**，
+                        // 于是"水最多的地方植物最渴"。而 debug 下它直接 panic，
+                        // 所以单元测试（跑 debug）根本看不到——只有生态测量会看到，
+                        // 而且看起来像"植物上岸就死"。
+                        org.hydration = org.hydration.saturating_add(refill - drain).min(max);
+                    } else {
+                        org.hydration = org.hydration.saturating_sub(drain - refill);
+                    }
+                }
+                // 一点水都够不到：干耗。
+                None => org.hydration = org.hydration.saturating_sub(drain),
             }
         }
     }
@@ -1453,6 +1652,8 @@ impl LifeSim {
         }
 
         let mut injected = 0u64;
+        // 湿度表和 `organisms` 是两个字段，可以同时借。
+        let moisture = &self.moisture;
         for org in &mut self.organisms {
             let producers = org
                 .cells
@@ -1483,9 +1684,22 @@ impl LifeSim {
             //
             // 用 `max` 而不是赋值：半截泡在水里的身体本来就该按
             // 粗格水占比算，不该被根系"拉低"到岸上的地板。
-            if Self::root_is_wet(&*world, org) {
+            // 根的水源决定**岸上产能的地板**，而且地板本身**随湿度打折**。
+            //
+            // 只按"有没有根"给地板的话，内陆和海岸产得一样多——那这条
+            // 土壤湿度就只影响"回充快慢"，而回充快慢在满水时完全看不出来
+            // （`hydration` 一直是 255）。**物理上真正发生的事是气孔关闭**：
+            // 土越干，同样一片叶子能固定的碳越少。所以地板要乘湿度。
+            //
+            // 这一条和 `hydration` 是两件事，两个都要有：
+            //   - `damp` 打折 → **产能**立刻降（当天就少长）；
+            //   - `hydration` 掉 → 撑一段时间后**彻底停**（旱久了就死）。
+            // 只有前者，植物在沙漠里也能慢慢攒能量；只有后者，
+            // 满水状态下看不出任何梯度。
+            if let Some(m) = Self::root_water(&*world, moisture, org) {
                 let roots = org.cells.iter().filter(|c| c.organelles.has(ROOT)).count();
-                damp = damp.max(land_damp(roots));
+                let supply = m as f32 / u8::MAX as f32;
+                damp = damp.max(land_damp(roots) * supply);
             }
             if damp <= 0.0 {
                 continue;
@@ -1500,7 +1714,7 @@ impl LifeSim {
                 continue;
             }
             let warmth = crate::field::photosynthesis(self.field.temp_at(ax, ay));
-            let gain = (PRODUCER_YIELD as f32 * light * warmth * damp * wet) as u32 * producers as u32;
+            let gain = producer_gain(light, warmth, damp, wet, producers);
             if gain == 0 {
                 continue;
             }
@@ -5169,8 +5383,9 @@ mod tests {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         let id = sim.spawn_injected(&mut w, plant(true)).unwrap();
-        assert!(
-            LifeSim::root_is_wet(&w, sim.organism(id).unwrap()),
+        assert_eq!(
+            LifeSim::root_water(&w, sim.moisture(), sim.organism(id).unwrap()),
+            Some(u8::MAX),
             "根在 y=29，正下方就是水，应当算贴水"
         );
         for _ in 0..40 {
@@ -5186,9 +5401,10 @@ mod tests {
         let mut w2 = pool();
         let mut sim2 = LifeSim::new(&mut w2);
         let id2 = sim2.spawn_injected(&mut w2, plant(false)).unwrap();
-        assert!(
-            !LifeSim::root_is_wet(&w2, sim2.organism(id2).unwrap()),
-            "没有根细胞，不该算贴水"
+        assert_eq!(
+            LifeSim::root_water(&w2, sim2.moisture(), sim2.organism(id2).unwrap()),
+            None,
+            "没有根细胞，一滴水都够不到"
         );
         for _ in 0..40 {
             sim2.tick_hydration(&w2);
@@ -5198,6 +5414,123 @@ mod tests {
             crate::life::HYDRATION_MAX - 40,
             "没有根，离水之后应当每 tick 掉一格"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // 土壤湿度（v0.41）
+    // -----------------------------------------------------------------------
+
+    /// 受控平台：左边 20 列有水，右边一整块平地。
+    ///
+    /// 真实地形太吵（坡地上刚性身体放不下、内陆还有水洼），
+    /// 测"多干就活不下去"必须先把地形噪声去掉。
+    fn flat_shore() -> (World, i32) {
+        // 800 宽而不是 400：横向是**环面**，400 宽的话"离岸 200 列"
+        // 从另一边绕过去只有 180 列，测不到"超过跨度就干透"。
+        let mut w = World::new(800, 100).unwrap();
+        w.fill_rect(0, 60, 800, 40, MaterialKind::Stone);
+        w.fill_rect(0, 40, 20, 20, MaterialKind::Water);
+        (w, 20)
+    }
+
+    /// 一株"2 生产者 + 1 根"的小植物，站在平地上、根贴着土。
+    fn potted_plant(anchor: (i32, i32)) -> Organism {
+        let cells = vec![
+            Cell::new(CellType::Producer, (0, -1)),
+            Cell::new(CellType::Producer, (0, 0)),
+            Cell::from_organelles(crate::organelle::Organelles(ROOT), (0, 1)),
+        ];
+        let mut org = Organism::new(0, anchor, cells, Genome::blank());
+        org.energy = 500;
+        org
+    }
+
+    /// 湿度随离水距离**线性**下降，超过跨度就干透。
+    ///
+    /// 线性是被实测逼出来的：平方和"产能按湿度打折"叠起来是四次方，
+    /// 可活的带子窄到只剩离岸十列。
+    #[test]
+    fn soil_moisture_falls_off_with_distance_from_water() {
+        let (mut w, shore) = flat_shore();
+        let sim = LifeSim::new(&mut w);
+        let at = |d: i32| sim.moisture_at(shore + d);
+        // 最靠岸的那一列**不含水**（水到 x=19 为止），所以它的距离是 1，
+        // 湿度 255×(1−1/200) = 254。差这一格不是 bug，是"海岸线"的定义。
+        assert_eq!(at(0), 254, "紧挨着水的土几乎是满的");
+        assert!(at(50) > at(100), "越远越干：{} vs {}", at(50), at(100));
+        assert!(at(100) > at(150), "越远越干：{} vs {}", at(100), at(150));
+        assert_eq!(at(210), 0, "超过跨度就干透");
+        // 环绕仍然是通的：把水放在另一边时，这一列会重新变湿。
+        let mut w2 = World::new(800, 100).unwrap();
+        w2.fill_rect(0, 60, 800, 40, MaterialKind::Stone);
+        w2.fill_rect(780, 40, 20, 20, MaterialKind::Water);
+        let sim2 = LifeSim::new(&mut w2);
+        assert!(
+            sim2.moisture_at(20) > 200,
+            "水在另一头（环绕 40 列远）时，这一列应当很湿：{}",
+            sim2.moisture_at(20)
+        );
+    }
+
+    /// **根能从土里吸水**——这一条让"上岸"从"贴着水"变成"能走多远"。
+    ///
+    /// 判据不是"活得久"，而是"含水量不往下掉"：那才是"有水源"这件事
+    /// 最直接的证据。
+    #[test]
+    fn a_root_drinks_from_moist_soil() {
+        let (mut w, shore) = flat_shore();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 离岸 10 列：湿度 241，够回满。
+        let id = sim
+            .spawn_injected(&mut w, potted_plant((shore + 10, 58)))
+            .unwrap();
+        let before = sim.organism(id).unwrap().hydration;
+        for _ in 0..60 {
+            sim.tick_hydration(&w);
+        }
+        assert_eq!(
+            sim.organism(id).unwrap().hydration,
+            before,
+            "根在湿土里，含水量不该往下掉"
+        );
+    }
+
+    /// **干土里没有水。** 离岸 190 列（湿度 13 → 回充 0）→ 每 tick 掉一格。
+    #[test]
+    fn a_root_in_dry_soil_still_thirsts() {
+        let (mut w, shore) = flat_shore();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let x = shore + 190;
+        assert!(
+            sim.moisture_at(x) < 40,
+            "离岸 190 列的湿度应当低到回充不了：{}",
+            sim.moisture_at(x)
+        );
+        let id = sim.spawn_injected(&mut w, potted_plant((x, 58))).unwrap();
+        let before = sim.organism(id).unwrap().hydration;
+        for _ in 0..60 {
+            sim.tick_hydration(&w);
+        }
+        assert_eq!(
+            sim.organism(id).unwrap().hydration,
+            before - 60,
+            "干土里应当每 tick 掉一格"
+        );
+    }
+
+    /// 产量**整具身体一次截断**，不是逐格截断再乘格数。
+    ///
+    /// 这条是纯粹的算术判据：单格 4.72 截成 4 再乘 6 得 24，
+    /// 而整具一次截断得 29——**15% 的差别**，在岸上是生死线。
+    #[test]
+    fn production_is_truncated_once_for_the_whole_body() {
+        let one = producer_gain(0.77, 0.8, 0.32, 1.0, 1);
+        let six = producer_gain(0.77, 0.8, 0.32, 1.0, 6);
+        assert_eq!(one, 4, "单格应当是 4（4.72 截断）");
+        assert_eq!(six, 28, "六格应当是一次截断的 28，不是 6×4=24");
+        assert!(six > one * 6, "逐格截断会丢 {}%", 100 - one * 6 * 100 / six);
     }
 
     /// **根系越厚，岸上产能越高**——这是"投资根系"唯一的回报来源。
@@ -5229,8 +5562,9 @@ mod tests {
             let mut sim = LifeSim::new(&mut w);
             sim.set_food_growth(false);
             let id = sim.spawn_injected(&mut w, plant(roots)).unwrap();
-            assert!(
-                LifeSim::root_is_wet(&w, sim.organism(id).unwrap()),
+            assert_eq!(
+                LifeSim::root_water(&w, sim.moisture(), sim.organism(id).unwrap()),
+                Some(u8::MAX),
                 "{roots} 格根的版本必须都算贴水，否则两组不可比"
             );
             sim.inject_sunlight(&mut w);

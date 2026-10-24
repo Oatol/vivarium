@@ -21,7 +21,7 @@
 //!
 //! 产物写在 `target/ui-preview.png`。
 
-use vivarium_ui::state::{Level, SelectedOrganism, Snapshot, UiState};
+use vivarium_ui::state::{BandView, Level, MorphView, SegmentView, SelectedOrganism, Snapshot, UiState};
 use vivarium_ui::Ui;
 
 const W: u32 = 1100;
@@ -41,12 +41,15 @@ fn demo_snapshot() -> Snapshot {
     census[vivarium_core::MaterialKind::Remains.as_u8() as usize] = 2_791;
     census[vivarium_core::MaterialKind::Corpse.as_u8() as usize] = 812;
 
-    let mut cells = [0usize; vivarium_core::CellType::COUNT];
-    cells[vivarium_core::CellType::Producer.as_u8() as usize] = 5;
-    cells[vivarium_core::CellType::Mover.as_u8() as usize] = 4;
-    cells[vivarium_core::CellType::Mouth.as_u8() as usize] = 1;
-    cells[vivarium_core::CellType::Eye.as_u8() as usize] = 1;
-    cells[vivarium_core::CellType::Killer.as_u8() as usize] = 1;
+    // 细胞器计数（下标同 `palette::ORGANELLE_RGB`）：
+    // 5 格叶绿体、4 格鞭毛、1 格嘴、1 格眼、1 格刺，加上 12 格线粒体。
+    let mut cells = [0usize; 10];
+    cells[0] = 5;
+    cells[1] = 4;
+    cells[3] = 1;
+    cells[6] = 1;
+    cells[2] = 1;
+    cells[7] = 12;
 
     Snapshot {
         tick: 28_431,
@@ -105,10 +108,16 @@ fn demo_snapshot() -> Snapshot {
 /// 形状、权重、走势都手写成一条银鱼的近似值——预览图要能验证
 /// **缩略图画得像不像一条鱼**、**权重矩阵里那几行是不是亮的**，
 /// 全零的占位数据在这两件事上什么都证明不了。
-fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrganism {
+fn demo_selected(organelles: [usize; 10]) -> SelectedOrganism {
+    use vivarium_core::organelle::{Organelles, GAS, ROOT};
     use vivarium_core::CellType;
     // 银鱼：尾三格移动、前端两个嘴、背上两个生产者、腹下两个生产者、一只眼。
-    let shape: Vec<(i16, i16, u8)> = [
+    //
+    // 里面**故意混了两个"预设里没有的组合"**：
+    //   - 背上一格是"叶绿体 + 气囊"（漂浮的藻垫），颜色该偏薄荷；
+    //   - 腹下一格是"叶绿体 + 根"（扎在泥里产能），颜色该偏灰绿。
+    // 截图要能验证的正是"组合自己变成了颜色"，全用纯细胞的话看不出这件事。
+    let shape: Vec<(i16, i16, u16)> = [
         (CellType::Mover, -2, 0),
         (CellType::Mover, -1, 0),
         (CellType::Mover, 0, 0),
@@ -121,7 +130,12 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
         (CellType::Eye, 2, 1),
     ]
     .iter()
-    .map(|&(k, x, y)| (x, y, k.as_u8()))
+    .map(|&(k, x, y)| (x, y, Organelles::from_cell_type(k).0))
+    .chain([
+        // 两格组合细胞，接在身体上。
+        (1i16, -1i16, Organelles::from_cell_type(CellType::Producer).with(GAS).0),
+        (2, 2, Organelles::from_cell_type(CellType::Producer).with(ROOT).0),
+    ])
     .collect();
 
     // 权重：只让"撞墙掉头"和"往前游"亮起来，其余留 0——
@@ -159,7 +173,7 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
         upkeep: 37,
         move_cost: 13,
         mass: 13,
-        cells,
+        organelles,
         generation: 17,
         parent: Some(23),
         shape,
@@ -172,6 +186,36 @@ fn demo_selected(cells: [usize; vivarium_core::CellType::COUNT]) -> SelectedOrga
         inputs,
         outputs,
         direct,
+        // 形态发生：一段主干重复 3 次 + 一个镜像子段 + 一条梯度带。
+        // 数字手写，但**结构是真的**——预览图要能验证"段树画得对不对"。
+        morph: MorphView {
+            segments: vec![
+                SegmentView {
+                    depth: 0,
+                    cells: 4,
+                    repeat: 3,
+                    mirror: false,
+                    base: 1 << 2,
+                },
+                SegmentView {
+                    depth: 1,
+                    cells: 2,
+                    repeat: 2,
+                    mirror: true,
+                    base: 1 << 0,
+                },
+            ],
+            layers: vec![1, 4, 8],
+            bands: vec![BandView {
+                along: (0.0, 0.35),
+                from_edge: (0.0, 1.0),
+                set: 1 << 6,
+                clear: 0,
+            }],
+            max_cells: 24,
+            components: 1,
+            capped: false,
+        },
     }
 }
 

@@ -11,19 +11,25 @@
 //!
 //! 为了不让调用点全改一遍，数据部分在下面原样转发。
 
-use vivarium_core::{CellType, MaterialKind};
+use vivarium_core::MaterialKind;
 
-pub use vivarium_core::palette::{cell_rgb, glyph, organism_rgb, rgb, BACKGROUND, CELL_GLYPH};
+pub use vivarium_core::palette::{
+    cell_rgb, glyph, organelle_rgb, organism_rgb, rgb, BACKGROUND, CELL_GLYPH, ORGANELLE_RGB,
+};
 
 /// 细胞类型在调色板里的起始下标。**必须与 `blit.wgsl` 里的同名常数一致。**
 pub const CELL_PALETTE_BASE: usize = 16;
 
-/// 调色板长度。材质占 `[0, CELL_PALETTE_BASE)`，细胞占 `[16, 23)`。
-pub const PALETTE_LEN: usize = 24;
+/// 调色板长度。材质占 `[0, 16)`，细胞器占 `[16, 26)`。
+///
+/// **v0.41 从 24 涨到 32。** 细胞那一半从"7 种类型"变成了"10 种细胞器"
+/// （叶绿体/鞭毛/刺/嘴/装甲/气囊/眼/线粒体/建造/根），`16 + 10 = 26`，
+/// 24 装不下了。32 是 16 的倍数，uniform 的 16 字节对齐好算。
+pub const PALETTE_LEN: usize = 32;
 
 // 下标够不够用是**编译期**的事，不该等到跑测试才发现。
 const _: () = assert!(MaterialKind::COUNT <= CELL_PALETTE_BASE);
-const _: () = assert!(CELL_PALETTE_BASE + CellType::COUNT <= PALETTE_LEN);
+const _: () = assert!(CELL_PALETTE_BASE + ORGANELLE_RGB.len() <= PALETTE_LEN);
 
 /// sRGB 分量 → 线性。
 ///
@@ -68,8 +74,11 @@ pub fn scene_palette(srgb_output: bool) -> [[f32; 4]; PALETTE_LEN] {
     for kind in MaterialKind::ALL {
         out[kind.as_u8() as usize] = to_uniform(rgb(kind));
     }
-    for kind in CellType::ALL {
-        out[CELL_PALETTE_BASE + kind.as_u8() as usize] = to_uniform(cell_rgb(kind));
+    // 细胞那一半装的是**细胞器**的基色，不是"细胞类型"的颜色。
+    // 混色在 shader 里做（一格可能同时有叶绿体和气囊），
+    // 所以这里只提供 10 个基色。
+    for (i, c) in ORGANELLE_RGB.iter().enumerate() {
+        out[CELL_PALETTE_BASE + i] = to_uniform(*c);
     }
     out
 }
@@ -96,11 +105,17 @@ mod tests {
                 "{kind} 的配色被别的东西覆盖了"
             );
         }
-        for kind in CellType::ALL {
+        for (i, c) in ORGANELLE_RGB.iter().enumerate() {
             assert!(
-                same(p[CELL_PALETTE_BASE + kind.as_u8() as usize], cell_rgb(kind)),
-                "细胞 {kind:?} 的配色被别的东西覆盖了"
+                same(p[CELL_PALETTE_BASE + i], *c),
+                "细胞器 {i} 的配色被别的东西覆盖了"
             );
+        }
+        // 预设色块走的仍然是 `cell_rgb`，它必须等于"单一细胞器"的混色结果。
+        // 不等的话，底部调色板上的色块和世界里画出来的颜色会对不上。
+        for kind in vivarium_core::CellType::ALL {
+            let single = organelle_rgb(vivarium_core::organelle::Organelles::from_cell_type(kind));
+            assert_eq!(cell_rgb(kind), single, "{kind:?} 的预设色和混色结果不一致");
         }
     }
 }

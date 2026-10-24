@@ -300,7 +300,22 @@ impl Body {
     /// "改布局基因影响多少格"和"改梯度基因影响多少格"是两件不同的事，
     /// 混在一起量会得到一个谁也解释不了的数。
     pub fn expand(&self) -> Vec<(i16, i16, u16)> {
-        let mut out: Vec<(i16, i16, u16)> = Vec::new();
+        self.expand_layers()
+            .into_iter()
+            .map(|(x, y, base, _)| (x, y, base))
+            .collect()
+    }
+
+    /// 和 [`Self::expand`] 一样，但**每一格带上它来自第几层段**。
+    ///
+    /// 检视面板要画"形态发生"：第 0 层是主干、第 1 层是子段、第 2 层是子段的子段。
+    /// 那个视图需要的正是这个数，而 `expand` 把它丢了。
+    ///
+    /// 深度和 `expand_segment` 的递归深度是同一个值——`trunk` 是 0，
+    /// 它的孩子是 1。所以"第 N 层"和基因组里的嵌套层级是一一对应的，
+    /// 不需要另算一遍（另算一份必然和真展开漂开）。
+    pub fn expand_layers(&self) -> Vec<(i16, i16, u16, u8)> {
+        let mut out: Vec<(i16, i16, u16, u8)> = Vec::new();
         let mut taken: HashSet<(i16, i16)> = HashSet::new();
         expand_segment(&self.trunk, (0, 0), 0, &mut out, &mut taken);
         // **只有和根那一格 4-连通的部分才算身体。**
@@ -326,6 +341,45 @@ impl Body {
     pub fn segment_count(&self) -> usize {
         count_segments(&self.trunk)
     }
+
+    /// 段树的扁平摘要：`(深度, 格数, 重复次数, 是否镜像, 基础细胞器)`。
+    ///
+    /// 按**先序**排（主干、它的第一个孩子、那个孩子的孩子……），
+    /// 和 `expand_segment` 的遍历顺序一致，所以检视面板照着画缩进就是对的。
+    pub fn segments(&self) -> Vec<SegmentSummary> {
+        let mut out = Vec::new();
+        collect_segments(&self.trunk, 0, &mut out);
+        out
+    }
+}
+
+/// 一段的扁平摘要，给检视面板的"形态发生"视图用。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentSummary {
+    /// 嵌套深度。0 = 主干。
+    pub depth: u8,
+    /// 这一段的格数（不含重复与镜像）。
+    pub cells: usize,
+    /// 沿主轴重复几次。
+    pub repeat: u8,
+    /// 是否镜像一份。
+    pub mirror: bool,
+    /// 这一段的**基础**细胞器（梯度还没叠加）。
+    pub base: u16,
+}
+
+fn collect_segments(seg: &Segment, depth: u8, out: &mut Vec<SegmentSummary>) {
+    let base = seg.cells.iter().fold(0u16, |acc, c| acc | c.base);
+    out.push(SegmentSummary {
+        depth,
+        cells: seg.cells.len(),
+        repeat: seg.repeat,
+        mirror: seg.mirror,
+        base,
+    });
+    for child in &seg.children {
+        collect_segments(child, depth + 1, out);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -336,7 +390,7 @@ fn expand_segment(
     seg: &Segment,
     origin: (i16, i16),
     depth: u8,
-    out: &mut Vec<(i16, i16, u16)>,
+    out: &mut Vec<(i16, i16, u16, u8)>,
     taken: &mut HashSet<(i16, i16)>,
 ) {
     if depth > MAX_SEGMENT_DEPTH || seg.cells.is_empty() {
@@ -350,7 +404,7 @@ fn expand_segment(
         for cell in &seg.cells {
             let p = (cursor.0 + cell.offset.0, cursor.1 + cell.offset.1);
             if taken.insert(p) {
-                out.push((p.0, p.1, cell.base));
+                out.push((p.0, p.1, cell.base, depth));
             }
             // 2) 镜像：沿主轴的垂直方向翻转
             if seg.mirror {
@@ -363,7 +417,7 @@ fn expand_segment(
                     (cursor.0 - local.0, p.1)
                 };
                 if taken.insert(m) {
-                    out.push((m.0, m.1, cell.base));
+                    out.push((m.0, m.1, cell.base, depth));
                 }
             }
         }
@@ -778,7 +832,7 @@ fn collect_paths(seg: &Segment, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>)
 ///
 /// 第一格是主干 `cells[0]` 落在的格子——发育的"种子"。丢掉的部分不是身体，
 /// 而是"从半空里长出来的碎片"。
-fn keep_root_component(cells: &mut Vec<(i16, i16, u16)>) {
+fn keep_root_component(cells: &mut Vec<(i16, i16, u16, u8)>) {
     if cells.len() < 2 {
         return;
     }
