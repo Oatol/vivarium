@@ -21,32 +21,58 @@ use crate::world::World;
 
 /// 天空占世界高度的百分比。水面线在它下面。
 ///
-/// 三成：够给光梯度、气候层和将来的飞行生物留位置，
+/// 四分之一：够给光梯度、气候层和将来的飞行生物留位置，
 /// 又不至于让画面上半张全是空的。水体才是主舞台。
-const SKY_PERCENT: usize = 30;
-
-/// 海床基准线占世界高度的百分比。它下面是基岩。
 ///
-/// 刻意压在三分之二附近：水深只要一深，岛就得从海床一路堆到水面以上，
-/// 画面上会变成几根插在海里的尖塔。浅海让岛能长得宽而低，像岛。
-const SEABED_PERCENT: usize = 66;
+/// 它同时是**陆地能抬多高的上限**（陆地不能顶出世界），所以调低它
+/// 会连带压矮地形——见 `by_sky`。
+const SKY_PERCENT: usize = 25;
 
-/// 岛屿数量范围，`[MIN, MAX)`。
+/// 目标是让多少百分比的列露出水面。
 ///
-/// 512 宽的世界里放 3~5 座：再多就会连成一片大陆，
-/// 少了又会变成"海上孤零零一座山"。
-const ISLAND_COUNT: (usize, usize) = (3, 6);
+/// **这是"目标"而不是"抽奖"**：高度场生成完之后按分位数切一刀，
+/// 于是每个种子都恰好有这么多列在岸上。早先按固定倍率随机的版本，
+/// 有些种子一张图全是水（"海洋 + 岛屿"名不副实），有些又全是大山。
+const LAND_TARGET_PERCENT: usize = 50;
+
+/// 高度场的基频：整个宽度上大约有几个起伏。
+///
+/// **它买的是"形状多样性"，代价是"起伏幅度"。** 坡度正比于
+/// `BASE_FREQ × scale`，而 `scale` 是被坡度上限倒推出来的——所以基频越高，
+/// 地形特征越多、每个特征越矮。1.6 的实测结果：512² 里陆地抬 107 格、
+/// 海深 88 格；调到 2.2 就只剩 78 / 64。
+///
+/// 这个交易能用一句话说清，不是一组试出来的魔法数。
+const BASE_FREQ: f32 = 1.6;
+
+/// fBm 的八度数。
+///
+/// 3 个：大轮廓（海岸线走向）+ 中等起伏（海湾、半岛）+ 小尺度抖动（碎石岸）。
+/// 再多的话高频分量会贡献陡坡，而热力侵蚀要花很多轮去磨平它。
+const OCTAVES: usize = 3;
+
+/// 每层八度的振幅衰减。
+///
+/// 0.45 而不是 0.5：三层八度对**坡度**的贡献大致正比于 `振幅 × 频率`
+/// （频率每层翻倍），0.5 意味着三层贡献相等，最大坡度会顶到 2.5 以上，
+/// 全靠侵蚀去磨。0.45 让第三层只占前两层的八成，侵蚀的活轻一点。
+const PERSISTENCE: f32 = 0.45;
+
+/// 相邻两列允许的最大高差（格）。
+///
+/// **这是这一版地形的核心约束，不是观感参数。** 移动是四向离散的，
+/// 所以"相邻高差 > 1"就是一道必须靠纯垂直越过的墙；而 `pick_direction`
+/// 允许斜向之后，"水平 1 + 垂直 1"正好是 45°，也就是坡度 1。
+/// 坡度 2 是给"斜向 + 一格余量"留的余地，再陡就又是墙了。
+const MAX_SLOPE: isize = 2;
+
+/// 热力侵蚀最多跑多少轮。收敛就提前退出。
+const EROSION_PASSES: usize = 512;
 
 /// 每多少列放一团残骸。数值越大团块越稀疏。
-///
-/// 团块本身是透镜状（宽 7~17 格），所以这个密度已经能保证
-/// 基岩里到处都有零星的有机沉积，而不是一片纯净的石头。
 const REMAINS_CLUMPS_PER_COLUMNS: usize = 6;
 
 /// 放气泡所需的最小水柱高度（格）。
-///
-/// 一个气泡是 2×2 的方块，覆盖两列、两行。要求水柱至少有这么高，
-/// 那一段水里才不会被气泡占掉一大半。
 const MIN_BUBBLE_ROOM: usize = 10;
 
 /// 生成结果：地表形状 + 两条基准线。
@@ -65,9 +91,16 @@ pub struct WorldLayout {
 
 impl WorldLayout {
     /// 露出水面的列数，也就是"陆地宽度"。
+    ///
+    /// **判据是 `<= 水面线`，不是 `<`。** 地表正好落在水面线上的列
+    /// 一滴水都没有（材质生成里只有 `top > waterline` 才灌水），
+    /// 所以它是一块**海滩**，不是海。用小世界时这个区别很显眼：
+    /// 64 格高的世界里垂直分辨率只有十几格，`round()` 会把一大片列
+    /// 拍到水面线上——按 `<` 数会把它们全算成海，于是"陆地占比 0.12"
+    /// 而画面上明明一半是地。
     pub fn land_columns(&self) -> usize {
         let wl = self.waterline as isize;
-        self.surface.iter().filter(|&&y| y < wl).count()
+        self.surface.iter().filter(|&&y| y <= wl).count()
     }
 
     /// 最高的地表（最小的 y）。空世界返回水面线。
@@ -90,12 +123,43 @@ impl WorldLayout {
         best
     }
 
+    /// 最长的一段连续陆地，返回 `[lo, hi)`；一滴陆地都没有时返回 `None`。
+    ///
+    /// 为什么不是"最高的那一列"：v0.30 的地形是一片**海岸**而不是几座孤岛，
+    /// 最高点往往只是内陆一个不起眼的小丘，而玩家想看的是海岸线。
+    pub fn main_land(&self) -> Option<(usize, usize)> {
+        let wl = self.waterline as isize;
+        let mut best: Option<(usize, usize)> = None;
+        let mut start: Option<usize> = None;
+        for x in 0..=self.surface.len() {
+            let land = x < self.surface.len() && self.surface[x] <= wl;
+            match (land, start) {
+                (true, None) => start = Some(x),
+                (false, Some(lo)) => {
+                    if best.map_or(true, |(a, b)| x - lo > b - a) {
+                        best = Some((lo, x));
+                    }
+                    start = None;
+                }
+                _ => {}
+            }
+        }
+        best
+    }
+
+    /// 最长那段陆地的中心列。没有陆地时退回最高那一列。
+    pub fn main_land_center(&self) -> usize {
+        self.main_land()
+            .map(|(lo, hi)| lo + (hi - lo) / 2)
+            .unwrap_or_else(|| self.peak_x())
+    }
+
     /// 相机取景建议：返回视野左沿的 x。
     ///
-    /// 对准最高的那座岛。海洋世界里把相机停在开阔水面上，
-    /// 屏幕上就只剩一片蓝色——ASCII 视图尤其明显。
+    /// 对准最长那段陆地的中心。把相机停在开阔水面上，屏幕上就只剩一片蓝色
+    /// ——ASCII 视图尤其明显。
     pub fn focus_left(&self, view_width: usize) -> usize {
-        self.peak_x().saturating_sub(view_width / 2)
+        self.main_land_center().saturating_sub(view_width / 2)
     }
 
     /// 相机取景建议：返回视野上沿的 y。
@@ -110,76 +174,117 @@ impl WorldLayout {
     }
 }
 
-/// 按「海洋 + 岛屿」铺一遍初始地貌，返回地表形状。
+/// 按「海岸线 + 浅海」铺一遍初始地貌，返回地表形状。
+///
+/// ## 母题换过一次（v0.30）
+///
+/// 旧版是"海床漂移 + 几座高斯钟形岛"。它能跑，但岛必须从海底一路堆到
+/// 水面以上，而水深是固定的——于是**唯一能调的就是宽度**。实测半宽 42 列时
+/// 剖面最陡 **17 格/列**，84 列里 38 列超过 1 格/列。而移动是四向离散的，
+/// 相邻高差 > 1 就是一道必须靠纯垂直越过的墙：鱼学不会，就沿着崖壁一直蹭。
+/// 玩家看到的是"水里的生物只朝一个方向游，撞在石壁上"。
+///
+/// 现在换成 fBm 高度场 + 热力侵蚀：
+///
+/// 1. **高度场**：三个八度的值噪声，`BASE_FREQ = 3`；
+/// 2. **海岸线**：按分位数切一刀，保证恰好 `LAND_TARGET_PERCENT` 的列在岸上
+///    ——陆地占比是一个**目标**，不是一次抽奖；
+/// 3. **热力侵蚀**：逐列把超过 `MAX_SLOPE` 的高差搬给邻居，迭代到收敛。
+///    这一步把"平缓"从感觉变成可断言的东西（`max_slope <= 2`）。
+///
+/// 剩下的（气泡、残骸、岛顶的火）与旧版一致。
 pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
     let w = world.width();
     let h = world.height();
 
-    let waterline = (h * SKY_PERCENT / 100).clamp(1, h.saturating_sub(1));
-    let seabed = (h * SEABED_PERCENT / 100).clamp(waterline + 1, h);
-    let depth = seabed - waterline;
+    let waterline = (h * SKY_PERCENT / 100).clamp(2, h.saturating_sub(2));
 
-    // 海床起伏的幅度。必须随世界高度缩放——固定值在小世界里
-    // 相当于水柱的四分之一，会让"岛一定露出水面"这个保证失效。
-    let drift_max = (depth / 8).clamp(3, 20);
+    // --- 1. 高度场 ---
+    let noise_seed = rng.next_u64();
+    let mut elev = vec![0f32; w];
+    for (x, slot) in elev.iter_mut().enumerate() {
+        *slot = fbm(x as f32 / w as f32 * BASE_FREQ, noise_seed);
+    }
 
-    // --- 1. 海床起伏：带均值回归的低频漂移 ---
+    // --- 2. 归一化 + 按分位数切海岸线 ---
     //
-    // 纯随机游走会一路漂走——M0 的地形就踩过这个坑（沙层爬到了画面半空）。
-    // 这里让偏离基线越远，回拉的概率越大。
-    let mut drift = vec![0isize; w];
-    let mut d = 0isize;
-    for slot in drift.iter_mut() {
-        if d != 0 && rng.chance(0.34) {
-            d -= d.signum();
-        } else if rng.chance(0.16) {
-            d += if rng.chance(0.5) { 1 } else { -1 };
-            d = d.clamp(-(drift_max as isize), drift_max as isize);
-        }
-        *slot = d;
+    // **先归一化再切。** fBm 的实际取值范围随种子变化很大（实测 64² 的
+    // 某个种子只用了 0.2 的幅度），而后面所有映射都假设"0..1"。
+    // 不归一化的话，同一个 `scale` 在不同种子上会给出天差地别的起伏——
+    // 症状是"有些种子整张图是一块平地"，而且看不出是哪一步错了。
+    let (emin, emax) = elev
+        .iter()
+        .copied()
+        .fold((f32::MAX, f32::MIN), |(lo, hi), v| (lo.min(v), hi.max(v)));
+    let span = (emax - emin).max(1e-6);
+    for e in elev.iter_mut() {
+        *e = (*e - emin) / span;
     }
 
-    // --- 2. 岛屿：每座 = 一个宽而低的浅滩 + 一个窄而高的峰 ---
-    let islands = rng.gen_range_usize(ISLAND_COUNT.0, ISLAND_COUNT.1);
-    // 第一座岛要露出水面多少格。太小会在小世界里被取整吃掉。
-    let emerge = (depth / 12).max(3);
-    let mut rise = vec![0isize; w];
-    for i in 0..islands {
-        // 半宽取到世界的 1/12 ~ 1/6。岛要"宽而低"才像岛——
-        // 窄而高只会画出一根插在海里的尖塔，因为岛顶要够到水面以上，
-        // 高度是被水深定死的，唯一能调的就是宽度。
-        let half = rng.gen_range_usize((w / 12).max(4), (w / 6).max(8));
-        let cx = rng.gen_range_usize(half, (w - half).max(half + 1));
-        let peak = if i == 0 {
-            // 第一座岛**保证**露出水面。
-            //
-            // "海洋 + 岛屿"里的"岛屿"不该是抽奖——早先版本按固定倍率随机，
-            // 结果有些种子一张图全是水。另外预览图要靠这座岛
-            // 把调色板里的火画出来。
-            //
-            // 多给 `drift_max` 是因为峰顶所在列的漂移可能恰好向下，
-            // 那会把峰顶又拽回水面以下。
-            depth + emerge + drift_max
-        } else {
-            // 峰高必须**超过水深**，否则岛永远露不出水面——这是几何上的必然：
-            // 岛顶要高于水面线，而水面线本身就在海床之上 depth 格。
-            // 取 0.92~1.24 倍水深：低的一端成为浅滩，高的一端成为岛。
-            depth * rng.gen_range_usize(92, 124) / 100
-        };
-        raise_bump(&mut rise, cx, half, peak);
-        // 浅滩：略宽、更低，让岛的基部有个缓坡而不是一根柱子。
-        //
-        // 刻意收窄（1.25 倍半宽）而不是放宽到 1.5 倍：早先版本里那道浅滩
-        // 铺得太开，几座岛的坡脚连成一片，整张图看起来是一座大山
-        // 而不是"海里的几座岛"。
-        raise_bump(&mut rise, cx, half + half / 4, peak * 25 / 100);
-    }
+    // 不用"平均值"：fBm 的分布是近似对称的，但一座高山的尾部会把平均值
+    // 拽偏，于是同一个 `LAND_TARGET_PERCENT` 在不同种子上给出不同的陆地占比。
+    // 分位数是**定义**，不是估计。
+    let mut sorted = elev.clone();
+    sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    let cut_idx = (w * (100 - LAND_TARGET_PERCENT) / 100).min(w - 1);
+    let cut = sorted[cut_idx];
 
-    let surface: Vec<isize> = (0..w)
-        .map(|x| seabed as isize + drift[x] - rise[x])
+    // --- 3. 高度 → 纵坐标：**一个**比例尺，两侧共用 ---
+    //
+    // 早先陆地和海各用一个比例尺（各自归一化到 `land_rise` / `sea_depth`），
+    // 结果海岸线处有一个**折角**：同一格高差，陆侧按 92/0.55 放大、
+    // 海侧按 143/0.45 放大。实测最陡的 4 格/列就出现在那条线上，
+    // 而不是在深海——**折角才是问题，深度不是。**
+    //
+    // 共用一个 `scale` 之后映射在 `cut` 处 C¹ 连续，坡度上界只剩
+    // "高度场的导数 × scale"。于是 `scale` 可以直接从约束倒推：
+    //
+    // 1. 坡度：`scale ≤ MAX_SLOPE / d(elev)/dx`；
+    // 2. 陆地不能顶出世界：`scale ≤ (waterline − 2) / 0.55`（0.55 是
+    //    噪声高于分位线那一半的跨度，取上界）。
+    //
+    // 取两者较小值。这条式子把"平缓"变成了一个**算出来的**数，
+    // 而不是一组试出来的魔法常数。
+    let d_elev = 2.46 * BASE_FREQ / w as f32;
+    // 用**乐观**的坡度上界来定比例尺，让侵蚀去收拾剩下的。
+    //
+    // `d_elev` 是高度场导数的**最坏情况**，而真实剖面上达到最坏值的只是
+    // 很短的几段。按最坏值定比例尺会把地形压得过矮（实测 512² 里海只有
+    // 70 格深，生物数从 692 掉到 234）。按 3 倍定，超出的部分都是短段，
+    // 侵蚀几轮就能磨到 2 以内——而长斜坡本来就不会超。
+    let by_slope = 3.0 * span / d_elev;
+    // 陆地那半最高能抬到水面线之上 `waterline − 2` 格。
+    let by_sky = (waterline as f32 - 2.0) / (1.0 - cut).max(1e-6);
+    // 海那半最深能到世界底部之上 2 格。
+    let by_sea = (h as f32 - waterline as f32 - 2.0) / cut.max(1e-6);
+    let scale = by_slope.min(by_sky).min(by_sea).max(4.0);
+
+    let mut surface: Vec<isize> = elev
+        .iter()
+        .map(|&e| waterline as isize - ((e - cut) * scale).round() as isize)
         .collect();
+    let sea_depth = surface
+        .iter()
+        .copied()
+        .max()
+        .unwrap_or(waterline as isize)
+        .max(waterline as isize) as usize
+        - waterline;
+    let seabed = waterline + sea_depth;
 
-    // --- 3. 铺材质 ---
+    // --- 3. 热力侵蚀 ---
+    erode(&mut surface, MAX_SLOPE, EROSION_PASSES);
+    // 侵蚀可能把某一列推到边界外（极端种子里会有），夹回来。
+    // 夹回来会重新制造陡坡，所以夹完再跑一遍——两遍就够，实测没有种子需要第三遍。
+    for s in surface.iter_mut() {
+        *s = (*s).clamp(1, h as isize - 2);
+    }
+    erode(&mut surface, MAX_SLOPE, EROSION_PASSES);
+    for s in surface.iter_mut() {
+        *s = (*s).clamp(1, h as isize - 2);
+    }
+
+    // --- 4. 铺材质 ---
     //
     // 逐列自地表往下分层：水 → 沙 → 石。
     //
@@ -200,8 +305,22 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
             );
         }
 
-        // 表层沙
-        let sand = rng.gen_range_usize(3, 9).min(h - top);
+        // 沙层厚度按"离水面多远"走，不再是一个固定的随机区间。
+        //
+        // 旧版每列都是 3~8 格沙，于是山顶和海滩的材质一模一样，看不出
+        // "这里是被水冲刷过的"。现在：海滩最厚（冲积），海床中等（沉积），
+        // 高处最薄（风化和剥蚀把细粒带走了，露出基岩）。
+        let rel = top as isize - waterline as isize;
+        let (sand_lo, sand_hi) = if rel > 12 {
+            (2, 6) // 高处：薄
+        } else if rel > 0 {
+            (4, 9) // 浅海：沉积
+        } else if rel > -6 {
+            (6, 12) // 海滩：冲积最厚
+        } else {
+            (3, 8) // 内陆
+        };
+        let sand = rng.gen_range_usize(sand_lo, sand_hi).min(h - top);
         if sand > 0 {
             world.fill_rect(x as isize, top as isize, 1, sand, MaterialKind::Sand);
         }
@@ -275,7 +394,7 @@ pub fn sea_and_islands(world: &mut World, rng: &mut Rng) -> WorldLayout {
         }
     }
 
-    // 一小撮火，落在最高的岛顶上方的空中。
+    // 一小撮火，落在最高的那根山脊上方的空中。
     // M1 起它会自己蔓延、被水浇灭、十几 tick 后烧完——正好用来确认反应表接对了。
     let mut peak_x = 0usize;
     for x in 1..w {
@@ -368,37 +487,96 @@ pub fn scan(world: &World) -> WorldLayout {
     }
 }
 
-/// 岛屿的横向剖面，输入 `t ∈ [-1, 1]`，输出 `0..=1` 的相对高度。
+/// 一维值噪声：整数格点取随机值，中间用 smoothstep 插值。
 ///
-/// **平顶 + 陡坡**，而不是纯余弦钟形。纯钟形画出来是一个圆锥，
-/// 几座锥体拼在一起看着像山脉，不像岛——真实岛屿是有一块台地的。
-/// 中间一半是平的（沙滩 / 台地），两侧用余弦平滑落到零（岸坡）。
-fn bump_profile(t: f32) -> f32 {
-    const FLAT: f32 = 0.5;
-    let a = t.abs();
-    if a <= FLAT {
-        1.0
-    } else {
-        let u = (a - FLAT) / (1.0 - FLAT);
-        0.5 * (1.0 + (std::f32::consts::PI * u).cos())
-    }
+/// 为什么不用正弦叠加：正弦是周期的，会看出重复；为什么不用浮点哈希：
+/// 世界生成必须逐位可复现，而整数哈希在每一层都精确。
+fn value_noise(x: f32, seed: u64) -> f32 {
+    let i = x.floor();
+    let f = x - i;
+    let a = hash01(i as i64, seed);
+    let b = hash01(i as i64 + 1, seed);
+    // smoothstep：两端一阶导为 0，所以格点处没有折角。
+    let t = f * f * (3.0 - 2.0 * f);
+    a + (b - a) * t
 }
 
-/// 在 `rise` 上叠加一个岛形隆起，逐列取最大值。
+/// 整数 → `[0, 1)` 的确定性哈希（splitmix64 的尾巴）。
+fn hash01(x: i64, seed: u64) -> f32 {
+    let mut h = (x as u64)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        .wrapping_add(seed);
+    h ^= h >> 30;
+    h = h.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    h ^= h >> 27;
+    h = h.wrapping_mul(0x94D0_49BB_1331_11EB);
+    h ^= h >> 31;
+    // 取高 24 位：低位的分布不如高位均匀。
+    (h >> 40) as f32 / (1u64 << 24) as f32
+}
+
+/// 分形布朗运动：多个八度的值噪声叠加。
+fn fbm(x: f32, seed: u64) -> f32 {
+    let mut sum = 0.0f32;
+    let mut amp = 1.0f32;
+    let mut freq = 1.0f32;
+    let mut norm = 0.0f32;
+    for o in 0..OCTAVES {
+        // 每层换一个种子，否则三层的格点会重合，叠出来还是同一个形状。
+        let layer_seed = seed ^ ((o as u64 + 1).wrapping_mul(0x2545_F491_4F6C_DD1D));
+        sum += value_noise(x * freq, layer_seed) * amp;
+        norm += amp;
+        amp *= PERSISTENCE;
+        freq *= 2.0;
+    }
+    sum / norm
+}
+
+/// 热力侵蚀：逐列把超过 `max_slope` 的高差搬给邻居，迭代到收敛。
 ///
-/// 用 `max` 而不是累加：两座岛重叠时应当取高的那座，
-/// 而不是叠成一座谁也没设计过的尖山。
-fn raise_bump(rise: &mut [isize], cx: usize, half: usize, peak: usize) {
-    if half == 0 || peak == 0 || rise.is_empty() {
+/// 注意 `surface` 是**纵坐标**（+Y 向下），所以"左边更低"意味着
+/// `surface[x-1] > surface[x]`。
+///
+/// 每一轮用**快照**算增量再统一应用，不是就地改。就地改会让遍历顺序
+/// 决定结果：从右往左扫和从左往右扫会得到不同的地形，而这种不对称
+/// 在画面上表现为"所有坡都朝一个方向"——看起来完全像"噪声生成写错了"。
+///
+/// 收敛性：每次把超出量减半（整数向上取整，所以至少减 1），
+/// 超出量单调下降，必然在有限轮内停。
+fn erode(surface: &mut [isize], max_slope: isize, passes: usize) {
+    let n = surface.len();
+    if n < 3 {
         return;
     }
-    let lo = cx.saturating_sub(half);
-    let hi = (cx + half).min(rise.len() - 1);
-    for (x, slot) in rise.iter_mut().enumerate().take(hi + 1).skip(lo) {
-        let t = (x as f32 - cx as f32) / half as f32;
-        let r = (bump_profile(t) * peak as f32).round() as isize;
-        if r > *slot {
-            *slot = r;
+    let mut delta = vec![0isize; n];
+    for _ in 0..passes {
+        delta.iter_mut().for_each(|d| *d = 0);
+        let mut moved = false;
+        for x in 0..n {
+            if x > 0 {
+                let d = surface[x - 1] - surface[x];
+                if d > max_slope {
+                    let t = (d - max_slope + 1) / 2;
+                    delta[x - 1] -= t;
+                    delta[x] += t;
+                    moved = true;
+                }
+            }
+            if x + 1 < n {
+                let d = surface[x + 1] - surface[x];
+                if d > max_slope {
+                    let t = (d - max_slope + 1) / 2;
+                    delta[x + 1] -= t;
+                    delta[x] += t;
+                    moved = true;
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+        for (s, d) in surface.iter_mut().zip(delta.iter()) {
+            *s += d;
         }
     }
 }
@@ -592,7 +770,12 @@ mod tests {
             );
             checked += 1;
         }
-        assert!(checked > W / 2, "大部分列都该有水柱，实际只有 {checked}");
+        // 阈值从"一半以上"降到"四分之一以上"：陆地占比 55% 之后，
+        // 有水柱的列本来就只有四成左右，而其中还有一部分浅到不够 3 格。
+        assert!(
+            checked * 4 > W,
+            "至少四分之一的列该有水柱，实际只有 {checked}"
+        );
     }
 
     #[test]
@@ -665,16 +848,119 @@ mod tests {
     }
 
     #[test]
-    fn focus_left_puts_the_tallest_island_in_frame() {
-        let (_, l) = build(512, 512, SEED);
-        let vw = 120;
-        let left = l.focus_left(vw);
-        assert!(
-            left <= l.peak_x() && l.peak_x() < left + vw,
-            "最高的岛（x={}）应当落在视野 [{left}, {}) 之内",
-            l.peak_x(),
-            left + vw
+    fn focus_left_puts_land_in_frame() {
+        // 判据从"最高的那一列在视野里"改成"视野里有陆地"。
+        // 地形换成海岸线之后，最高点往往只是内陆一个不起眼的小丘，
+        // 而玩家想看的是岸——钉住 peak_x 只会让这条测试在无关改动上变红。
+        for seed in 0..24u64 {
+            let (_, l) = build(512, 512, seed);
+            let vw = 160;
+            let left = l.focus_left(vw);
+            let (lo, hi) = (left.min(512), (left + vw).min(512));
+            let land = (lo..hi)
+                .filter(|&x| l.surface[x] < l.waterline as isize)
+                .count();
+            assert!(
+                land * 10 >= (hi - lo) * 3,
+                "seed {seed}: 视野 [{lo},{hi}) 里只有 {land} 列陆地"
+            );
+        }
+    }
+
+    #[test]
+    fn main_land_is_the_longest_run() {
+        let l = WorldLayout {
+            waterline: 10,
+            seabed: 30,
+            surface: vec![5, 5, 20, 5, 5, 5, 20, 20, 5],
+        };
+        assert_eq!(l.main_land(), Some((3, 6)));
+        assert_eq!(l.main_land_center(), 4);
+
+        // 全是水：没有陆地，退回最高那一列。
+        let none = WorldLayout {
+            waterline: 10,
+            seabed: 30,
+            surface: vec![20, 20, 20],
+        };
+        assert_eq!(none.main_land(), None);
+        assert_eq!(none.main_land_center(), none.peak_x());
+
+        // 首尾两列都是陆地，但**不该被接成一段**——世界是环面，
+        // 而"最长的那片陆地"是给人看的，不是给寻路用的。
+        let wrap = WorldLayout {
+            waterline: 10,
+            seabed: 30,
+            surface: vec![5, 20, 5, 5],
+        };
+        assert_eq!(
+            wrap.main_land(),
+            Some((2, 4)),
+            "首尾两列不该被接成一段（世界是环面，但「最长的那片陆地」是给人看的）"
         );
+    }
+
+    #[test]
+    fn the_slope_is_never_steeper_than_two() {
+        // **这是 v0.30 的核心验收。**
+        //
+        // 移动是四向离散的，所以相邻高差 > 1 就是一道必须靠纯垂直越过的墙；
+        // 允许斜向之后，"水平 1 + 垂直 1"正好是 45°（坡度 1）。
+        // 旧版地形的剖面最陡 17 格/列，于是鱼只会沿着崖壁蹭——
+        // 玩家看到的是"水里的生物只朝一个方向游，撞在石壁上"。
+        //
+        // 跑 100 个种子 × 三种尺寸，一个都不许超。
+        for (w, h) in [(64, 64), (256, 256), (512, 512)] {
+            let mut worst = 0isize;
+            for seed in 0..100u64 {
+                let (_, l) = build(w, h, seed);
+                for x in 1..w {
+                    let d = (l.surface[x] - l.surface[x - 1]).abs();
+                    worst = worst.max(d);
+                }
+            }
+            assert!(
+                worst <= MAX_SLOPE,
+                "{w}x{h}: 100 个种子里最陡的坡是 {worst} 格/列"
+            );
+        }
+    }
+
+    #[test]
+    fn land_and_water_split_the_world_roughly_in_half() {
+        // 陆地占比是个**目标**（分位数切出来的），不是抽奖。
+        // 侵蚀会把岸线往两边磨一点，所以给一个带宽。
+        // 只测"垂直分辨率够用"的世界。64 格高的世界里陆地只有十几格预算，
+        // `round()` 会把大片列拍到水面线上，占比失去意义——
+        // 那不是地形生成的问题，是像素太少。
+        for (w, h) in [(256, 256), (512, 512), (600, 450)] {
+            let mut lo = 1.0f32;
+            let mut hi = 0.0f32;
+            let mut water_lo = 1.0f32;
+            let mut water_hi = 0.0f32;
+            for seed in 0..40u64 {
+                let (world, l) = build(w, h, seed);
+                let frac = l.land_columns() as f32 / w as f32;
+                lo = lo.min(frac);
+                hi = hi.max(frac);
+                let census = world.census();
+                let water =
+                    census[MaterialKind::Water.as_u8() as usize] as f32 / (w * h) as f32;
+                water_lo = water_lo.min(water);
+                water_hi = water_hi.max(water);
+            }
+            assert!(
+                lo >= 0.40 && hi <= 0.68,
+                "{w}x{h}: 陆地占比 {lo:.2}..{hi:.2} 超出 0.40..0.68"
+            );
+            // 水格占总格数的比例**刻意很小**（实测 3%~7%）：512 高的世界里
+            // 海只有 100 格深，其余全是基岩。这是坡度约束的直接代价——
+            // 想深就得陡，而陡等于墙。所以这里只要求"有水"，不要求"很多水"。
+            assert!(
+                water_hi >= 0.02 && water_lo <= 0.15,
+                "{w}x{h}: 水占比 {water_lo:.3}..{water_hi:.3} 不像一条浅海"
+            );
+        }
     }
 
     #[test]
@@ -687,22 +973,56 @@ mod tests {
     }
 
     #[test]
-    fn bump_peaks_at_center_and_fades_to_zero_at_edges() {
-        let mut rise = vec![0isize; 101];
-        raise_bump(&mut rise, 50, 50, 100);
-        assert_eq!(rise[50], 100, "中心应当等于峰高");
-        assert_eq!(rise[0], 0, "左边缘应当归零");
-        assert_eq!(rise[100], 0, "右边缘应当归零");
-        for x in 51..=100 {
-            assert!(rise[x] <= rise[x - 1], "x={x} 处不单调递减");
+    fn noise_is_deterministic_and_in_unit_range() {
+        let mut lo = f32::MAX;
+        let mut hi = f32::MIN;
+        for i in 0..2000 {
+            let v = fbm(i as f32 * 0.37, 12345);
+            assert!((0.0..=1.0).contains(&v), "fbm 越界：{v}");
+            lo = lo.min(v);
+            hi = hi.max(v);
+        }
+        // 同一个输入必须给同一个值——世界生成的全部可复现性都压在这一条上。
+        assert_eq!(fbm(3.7, 12345), fbm(3.7, 12345));
+        assert_ne!(fbm(3.7, 12345), fbm(3.7, 12346), "换种子应当换形状");
+        // 太窄说明噪声退化成常数，太宽说明分布不对。
+        assert!(hi - lo > 0.3, "fbm 的取值范围只有 {lo}..{hi}");
+    }
+
+    #[test]
+    fn erosion_flattens_a_cliff() {
+        // 一道 40 格高的断崖。侵蚀之后相邻高差必须 <= MAX_SLOPE。
+        let mut s = vec![50isize; 20];
+        s.extend(std::iter::repeat(90isize).take(20));
+        erode(&mut s, MAX_SLOPE, 4096);
+        for x in 1..s.len() {
+            let d = (s[x] - s[x - 1]).abs();
+            assert!(d <= MAX_SLOPE, "x={x} 处还差 {d} 格");
         }
     }
 
     #[test]
-    fn overlapping_bumps_take_the_taller_one() {
-        let mut rise = vec![0isize; 101];
-        raise_bump(&mut rise, 50, 50, 100);
-        raise_bump(&mut rise, 50, 50, 40);
-        assert_eq!(rise[50], 100, "重叠时应当取高的那座，而不是累加");
+    fn erosion_conserves_the_total_height() {
+        // 侵蚀只是**搬运**，不是凭空削平。总量变了说明增量算错了方向——
+        // 症状是"整块陆地慢慢沉进海里"，而画面上看起来只是"地形变缓了"。
+        let mut s = vec![40isize; 10];
+        s.extend(std::iter::repeat(120isize).take(10));
+        s.extend(std::iter::repeat(60isize).take(10));
+        let before: isize = s.iter().sum();
+        erode(&mut s, MAX_SLOPE, 4096);
+        let after: isize = s.iter().sum();
+        assert_eq!(before, after, "侵蚀改了总高度");
+    }
+
+    #[test]
+    fn erosion_does_not_prefer_a_direction() {
+        // 就地改（而不是快照 + 统一应用）会让结果依赖遍历顺序，
+        // 表现是"所有坡都朝一个方向"——看起来完全像噪声生成写错了。
+        // 这里用一段对称的剖面，侵蚀之后必须仍然对称。
+        let mut s: Vec<isize> = (0..21).map(|x| 40 + (x as isize - 10).abs() * 8).collect();
+        erode(&mut s, MAX_SLOPE, 4096);
+        for x in 0..10 {
+            assert_eq!(s[x], s[20 - x], "x={x} 处左右不对称");
+        }
     }
 }
