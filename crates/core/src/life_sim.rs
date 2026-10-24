@@ -31,7 +31,8 @@
 use crate::body::{BodyPlan, PLANS};
 use crate::field::AirField;
 use crate::life::{
-    remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
+    remains_of, Cell, CellType, Genome, Organism, OrganismId, BIRTH_ENERGY_PER_CELL, INPUTS,
+    IN_AGE, IN_ALIEN_AHEAD,
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
     IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
     IN_ORGANISM_DIR_X, IN_ORGANISM_DIR_Y, IN_PREV_DOWN, IN_PREV_LEFT, IN_PREV_RIGHT, IN_PREV_UP,
@@ -2208,7 +2209,10 @@ impl LifeSim {
         let parent = &self.organisms[idx];
         // 门槛按身体大小算：大身体造子代更贵，必须攒得更久。
         // 固定 400 会让"变大"变成纯赚——见 `life::MAX_ENERGY_PER_CELL` 那段注释。
-        let birth_energy = parent.birth_energy();
+        //
+        // 注意这是"**什么时候试**"的门槛，用的是亲代当前的身体；
+        // "**这一个孩子值多少**"用的是子代发育出来的格数，在下面重算。
+        // 两者不能合并：变异可以让子代比亲代大得多。
         if parent.energy < parent.reproduction_energy() {
             return None;
         }
@@ -2244,9 +2248,9 @@ impl LifeSim {
         // 先把亲代身上要用的东西拷出来，再动账——否则 `&mut self` 的借用
         // 会一路顶到循环里，`self.fits` 就没法调了。
         let anchor = parent.anchor;
-        let cells = parent.cells.clone();
         let facing = parent.facing;
         let generation = parent.generation + 1;
+        let parent_energy = parent.energy;
         let mut genome = parent.genome.clone();
         // L2 表观遗传：压力大的亲代生出变异更大的子代。
         //
@@ -2255,6 +2259,29 @@ impl LifeSim {
         let stress = parent.stress.min(64) as f32 / 64.0;
         let sigma = MUTATION_SIGMA * (1.0 + stress);
         genome.mutate(&mut self.rng, MUTATION_RATE, sigma);
+
+        // **子代的身体由它自己的基因组长出来。**
+        //
+        // 这一行是"形态变异真的会改变身体"的唯一接线点，而它原来写的是
+        // `parent.cells.clone()`——子代继承父代**当前**的身体（连被咬掉的
+        // 缺口一起继承），基因组一路漂移但身体从不变。
+        //
+        // 症状极具欺骗性：8000 tick 后**表型只有 3 种，而基因组有 647 种**
+        // （简并度 215）。看数字像"中性网络非常发达"，实际是
+        // **基因型和表型脱钩**——那些"中性"根本不是简并，是没接线。
+        let cells = genome.body.develop();
+        if cells.is_empty() {
+            // 变异把身体弄没了。不是错误，是这个基因型的命运。
+            return None;
+        }
+        // 造价按**子代**的格数算：变异可能让身体变大，那就要付更多的钱。
+        // 用亲代的 `birth_energy()` 会让"变大"变成白送。
+        let birth_energy = BIRTH_ENERGY_PER_CELL * cells.len().max(1) as u32;
+        if parent_energy < birth_energy {
+            // 攒的钱不够养这个孩子。**这是"大身体繁殖更贵"的正确表达**——
+            // 它让 `max_cells` 变异有代价，而不是单向的"越大越好"。
+            return None;
+        }
 
         let child = Organism {
             id: 0, // spawn 会分配

@@ -303,7 +303,22 @@ impl Body {
         let mut out: Vec<(i16, i16, u16)> = Vec::new();
         let mut taken: HashSet<(i16, i16)> = HashSet::new();
         expand_segment(&self.trunk, (0, 0), 0, &mut out, &mut taken);
+        // **只有和根那一格 4-连通的部分才算身体。**
+        //
+        // 这不是洁癖，是被实测逼出来的：8000 tick 的演化里出现过
+        // `包围盒 10×5` 但中间空一行、`散架成 3 块` 的身体。根因是
+        // `span()` 按投影算、而格子在投影上可以有空隙（`mirror` 翻到
+        // 另一侧时也会留下一格空档），于是子段从"半空"里长出来。
+        //
+        // 一个不连通的身体在物理上是荒谬的：`try_move` 只逐格验通行，
+        // 中间那道墙根本不参与判定，于是它能"穿过"一格厚的石头。
+        // 所以这条规则放在**发育**里，而不是放在变异里拒绝——
+        // 真实胚胎里失去接触的细胞也是直接凋亡。
+        // **截断会重新切断身体。** 一个段自己的 `cells` 是任意几何
+        // （比如四格菱形），截在中间就只剩两个对角格——而对角相邻在
+        // 4-连通意义上不算连着。所以顺序必须是：先截断、再取连通块。
         out.truncate(self.max_cells.max(1) as usize);
+        keep_root_component(&mut out);
         out
     }
 
@@ -625,6 +640,79 @@ impl Body {
     }
 }
 
+/// **两个父代之间**的子树交叉（重组）。
+///
+/// 语义：从 `b` 里挑一段当供体，**替换** `a` 里的一段。于是子代可能带着
+/// "`a` 的一只附肢 + `b` 的另一只"——**两个亲代都没有的形状**。
+///
+/// ## 为什么必须放在结构化基因组上
+///
+/// 行为网络（MLP）上有 competing conventions：两个父代的隐藏层神经元编号
+/// 不对应，交叉出来的孩子是噪声。而 `Segment` 的"交换单位"语义完整——
+/// 换一棵子树就是换一个附肢。**所以重组只在这里做，权重一律不交叉。**
+///
+/// ## 它还没有接线到繁殖
+///
+/// 现在的繁殖是**单亲**的（`reproduce` 只取一个亲代）。真正的重组需要
+/// 有性繁殖：找配偶、能量对半分、种群动态全变。那是一个独立决策，
+/// 不该塞进"换基因组表示"这一轮。这里先把**算子**做实并证明它有用
+/// （`crossover_can_combine_structures_neither_parent_has`），
+/// 接线留给后面。
+pub fn crossover(a: &Body, b: &Body, rng: &mut Rng) -> Body {
+    let mut child = a.clone();
+
+    // 供体：从 b 的树上随便挑一段。
+    let mut paths: Vec<Vec<usize>> = Vec::new();
+    collect_paths(&b.trunk, &mut Vec::new(), &mut paths);
+    let donor_path = paths.swap_remove(rng.gen_range_usize(0, paths.len()));
+    let donor = segment_at(&b.trunk, &donor_path).clone();
+
+    // 断点：**优先非根**。换掉整根等于克隆另一个亲代，那不是重组。
+    let mut paths: Vec<Vec<usize>> = Vec::new();
+    collect_paths(&a.trunk, &mut Vec::new(), &mut paths);
+    let non_root: Vec<Vec<usize>> = paths.into_iter().filter(|p| !p.is_empty()).collect();
+    if non_root.is_empty() || rng.next_f32() < 0.15 {
+        child.trunk = donor;
+    } else {
+        let i = rng.gen_range_usize(0, non_root.len());
+        let path = non_root[i].clone();
+        *segment_at_mut(&mut child.trunk, &path) = donor;
+    }
+
+    // 换进来的段可能更大，上限要跟着涨——否则新结构会被 `max_cells`
+    // 截掉，症状是"交叉成功了但格数一动不动"（和 `mutate_duplicate`
+    // 踩过的是同一个坑）。
+    let added = count_cells(&child.trunk).min(MAX_BODY_CELLS as usize) as u16;
+    child.max_cells = (child.max_cells as u16)
+        .max(added.min(MAX_BODY_CELLS as u16))
+        .min(MAX_BODY_CELLS as u16) as u8;
+    child
+}
+
+/// 按路径取一段（只读）。
+fn segment_at<'a>(seg: &'a Segment, path: &[usize]) -> &'a Segment {
+    let mut cur = seg;
+    for &i in path {
+        cur = &cur.children[i];
+    }
+    cur
+}
+
+/// 按路径取一段（可写）。
+fn segment_at_mut<'a>(seg: &'a mut Segment, path: &[usize]) -> &'a mut Segment {
+    let mut cur = seg;
+    for &i in path {
+        cur = &mut cur.children[i];
+    }
+    cur
+}
+
+/// 一段（含子孙、含重复份）总共占几格。
+fn count_cells(seg: &Segment) -> usize {
+    let own = seg.cells.len() * seg.repeat.max(1) as usize;
+    own + seg.children.iter().map(count_cells).sum::<usize>()
+}
+
 /// 从树上随机挑一个段（按节点数均匀，不是按格数）。
 ///
 /// 实现上先收集"从根到每个段的路径"，再按路径下钻一次。
@@ -652,6 +740,33 @@ fn collect_paths(seg: &Segment, cur: &mut Vec<usize>, out: &mut Vec<Vec<usize>>)
     }
 }
 
+/// 只留下和第一格 4-连通的那一块。
+///
+/// 第一格是主干 `cells[0]` 落在的格子——发育的"种子"。丢掉的部分不是身体，
+/// 而是"从半空里长出来的碎片"。
+fn keep_root_component(cells: &mut Vec<(i16, i16, u16)>) {
+    if cells.len() < 2 {
+        return;
+    }
+    let all: HashSet<(i16, i16)> = cells.iter().map(|c| (c.0, c.1)).collect();
+    let root = (cells[0].0, cells[0].1);
+    let mut seen: HashSet<(i16, i16)> = HashSet::new();
+    seen.insert(root);
+    let mut stack = vec![root];
+    while let Some((x, y)) = stack.pop() {
+        for (dx, dy) in [(1i16, 0i16), (-1, 0), (0, 1), (0, -1)] {
+            let p = (x + dx, y + dy);
+            if all.contains(&p) && seen.insert(p) {
+                stack.push(p);
+            }
+        }
+    }
+    if seen.len() == all.len() {
+        return;
+    }
+    cells.retain(|c| seen.contains(&(c.0, c.1)));
+}
+
 fn count_segments(seg: &Segment) -> usize {
     1 + seg.children.iter().map(count_segments).sum::<usize>()
 }
@@ -664,6 +779,7 @@ fn count_segments(seg: &Segment) -> usize {
 mod tests {
     use super::*;
     use crate::body::PLANS;
+    use crate::organelle::{ARMOR, CHLORO_SHIFT, FLAGELLUM_SHIFT};
 
     #[test]
     fn a_single_cell_segment_is_one_cell() {
@@ -744,6 +860,45 @@ mod tests {
 
     #[test]
     fn mirror_gives_pairs_across_the_axis() {
+        // 镜像的用途是**成对器官**：轴上有一格当脊柱，两侧各一格。
+        // 所以测试也要按真实形状搭——只有轴外一格时镜像会隔着一条空行，
+        // 那不是身体（见下一条测试）。
+        let mut seg = Segment {
+            cells: vec![
+                BodyCell {
+                    offset: (0, 0),
+                    base: MITO,
+                },
+                BodyCell {
+                    offset: (0, 1),
+                    base: MITO,
+                },
+            ],
+            axis: 0,
+            repeat: 1,
+            mirror: true,
+            children: Vec::new(),
+        };
+        seg.mirror = true;
+        let b = Body {
+            trunk: seg,
+            gradient: Gradient::default(),
+            max_cells: 24,
+        };
+        let cells = b.develop();
+        let ys: HashSet<i16> = cells.iter().map(|c| c.offset.1).collect();
+        assert_eq!(cells.len(), 3, "轴上 1 格 + 两侧各 1 格：{ys:?}");
+        assert!(ys.contains(&0) && ys.contains(&1) && ys.contains(&-1), "{ys:?}");
+    }
+
+    #[test]
+    fn mirror_without_a_spine_is_dropped() {
+        // 只有轴外一格时，镜像给出的是"隔一条空行的两格"——**不连通**。
+        // 发育规则（`keep_root_component`）把远侧丢掉，于是镜像退化成原样。
+        //
+        // 这不是 bug，是"身体必须连通"这条规则的直接后果：想长成对器官，
+        // 得先有脊柱把两侧连起来。**这条规则把 `mirror` 从"免费翻倍"
+        // 变成了"需要先有躯干"**——正好是我们想要的取舍。
         let mut seg = Segment::single(BodyCell {
             offset: (0, 1),
             base: MITO,
@@ -755,9 +910,117 @@ mod tests {
             max_cells: 24,
         };
         let cells = b.develop();
-        assert_eq!(cells.len(), 2, "镜像应当给出 2 格");
-        let ys: HashSet<i16> = cells.iter().map(|c| c.offset.1).collect();
-        assert!(ys.contains(&1) && ys.contains(&-1), "镜像应当跨过 y=0：{ys:?}");
+        assert_eq!(cells.len(), 1, "隔着空行的镜像不该算身体");
+    }
+
+    #[test]
+    fn crossover_can_combine_structures_neither_parent_has() {
+        // 重组的价值不在"打散"，在**组合**：两个谱系各自长出一只附肢，
+        // 重组能让一个后代同时带着两只。没有这一步，漂移和重复都只是
+        // "在已有的东西上折腾"。
+        let mk = |bit: u16| Segment {
+            cells: vec![BodyCell {
+                offset: (0, 0),
+                base: bit,
+            }],
+            axis: 0,
+            repeat: 1,
+            mirror: false,
+            children: Vec::new(),
+        };
+        // a：躯干 + 两个子段（叶绿体 / 鞭毛）
+        let mut a = Body {
+            trunk: mk(MITO),
+            gradient: Gradient::default(),
+            max_cells: 24,
+        };
+        a.trunk.children.push(mk(1 << CHLORO_SHIFT));
+        a.trunk.children.push(mk(1 << FLAGELLUM_SHIFT));
+        // b：躯干 + 一个子段（装甲）
+        let mut b = Body {
+            trunk: mk(MITO),
+            gradient: Gradient::default(),
+            max_cells: 24,
+        };
+        b.trunk.children.push(mk(ARMOR));
+
+        let mut combined = 0usize;
+        let mut rng = Rng::new(0x5EED_1234);
+        for _ in 0..400 {
+            let c = crossover(&a, &b, &mut rng);
+            let kids = &c.trunk.children;
+            if kids.len() == 2
+                && kids.iter().any(|k| k.cells[0].base == ARMOR)
+                && kids.iter().any(|k| k.cells[0].base != ARMOR)
+            {
+                combined += 1;
+            }
+        }
+        assert!(
+            combined > 20,
+            "400 次交叉里只有 {combined} 次真的组合了两个亲代的结构"
+        );
+    }
+
+    #[test]
+    fn a_diamond_of_four_cells_collapses_to_one() {
+        // 对角线相邻不算连通。四格菱形（上下左右各一格、中心空）在
+        // 4-连通意义上就是 4 个孤立细胞——它不该是一具身体。
+        let seg = Segment {
+            cells: vec![
+                BodyCell { offset: (1, 0), base: MITO },
+                BodyCell { offset: (0, 1), base: MITO },
+                BodyCell { offset: (2, 1), base: MITO },
+                BodyCell { offset: (1, 2), base: MITO },
+            ],
+            axis: 0,
+            repeat: 1,
+            mirror: false,
+            children: Vec::new(),
+        };
+        let b = Body { trunk: seg, gradient: Gradient::default(), max_cells: 24 };
+        let cells = b.develop();
+        assert_eq!(cells.len(), 1, "菱形应当只剩根那一格，实际 {:?}", cells.iter().map(|c| c.offset).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_body_is_never_disconnected() {
+        // 8000 tick 的演化里出现过 `包围盒 10×5`、中间空一行、"散架成 3 块"
+        // 的身体。不连通在物理上是荒谬的：`try_move` 只逐格验通行，
+        // 中间那道墙不参与判定，于是它能穿过一格厚的石头。
+        //
+        // 这里从银鱼出发做 200 次变异 × 20 个种子，逐个数连通分量。
+        let mut rng = Rng::new(0xC0FF_EE01);
+        let mut checked = 0usize;
+        for seed in 0..20u64 {
+            let mut b = Body::from_plan(&crate::body::SILVERFISH);
+            let mut r = Rng::new(seed.wrapping_mul(0x9E37_79B9) ^ 7);
+            b.mutate(&mut r, 6);
+            let cells = b.expand();
+            let set: HashSet<(i16, i16)> = cells.iter().map(|c| (c.0, c.1)).collect();
+            // 一次洪泛，数能到几格。
+            let mut seen: HashSet<(i16, i16)> = HashSet::new();
+            let mut stack = vec![*set.iter().next().unwrap()];
+            seen.insert(stack[0]);
+            while let Some((x, y)) = stack.pop() {
+                for (dx, dy) in [(1i16, 0i16), (-1, 0), (0, 1), (0, -1)] {
+                    let p = (x + dx, y + dy);
+                    if set.contains(&p) && seen.insert(p) {
+                        stack.push(p);
+                    }
+                }
+            }
+            assert_eq!(
+                seen.len(),
+                set.len(),
+                "种子 {seed} 长出了不连通的身体（{} / {} 格）",
+                seen.len(),
+                set.len()
+            );
+            checked += 1;
+            let _ = &mut rng;
+        }
+        assert_eq!(checked, 20);
     }
 
     #[test]
