@@ -277,7 +277,7 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
         widgets::section(ui, "这副身体");
         let cells = state.workshop.to_cells();
         let n = cells.len();
-        let (movers, eyes, mouths, killers) = count_kinds(&cells);
+        let (movers, eyes, mouths, killers, producers) = count_kinds(&cells);
         let speed = 1 + (movers / 4).min(2);
         widgets::stat_row(ui, "格数", &n.to_string(), theme::TEXT);
         widgets::stat_row(
@@ -299,12 +299,19 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
         widgets::stat_row(ui, "嘴", &mouths.to_string(), theme::TEXT_DIM);
         widgets::stat_row(ui, "杀手", &killers.to_string(), theme::TEXT_DIM);
 
-        // 合法性：没有嘴就吃不了东西，一定要当场说清楚。
+        // 合法性：**至少要有一种能量来源**，不是"必须有嘴"。
+        //
+        // 早先这条判据是 `mouths == 0` 直接拦掉，理由是"没有嘴就吃不了东西"。
+        // 但那句话只对了一半：**生产者自己就能产能**，而纯生产者身体
+        // （海草）不但能活，实测还是超模的——它省下全部移动开销，
+        // 4 格净赚 56.8/tick，自动投放会把光吃光。**这条门挡住的是一个强策略。**
         ui.add_space(4.0);
         if n == 0 {
             hint_line(ui, "画布是空的", theme::TEXT_FAINT);
-        } else if mouths == 0 {
-            hint_line(ui, "没有嘴——它吃不了东西", theme::DANGER);
+        } else if mouths == 0 && producers == 0 {
+            // 仍然拦：既不能产能也不能吃，放下去只是慢慢饿死。
+            // 但话要说准——它饿死的原因是没有能量来源，不是"没有嘴"。
+            hint_line(ui, "没有能量来源——它只会慢慢饿死", theme::DANGER);
         } else if n > MAX_BODY_CELLS as usize {
             // 这里原来写的是"超过 16 格，水里推不动"——**那句是假的**。
             // 16 是 `passable()` 里的一条通行性判据（超过 16 格水变成固体），
@@ -332,7 +339,7 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
             }
         });
         ui.add_space(4.0);
-        let ready = n > 0 && mouths > 0 && n <= MAX_BODY_CELLS as usize;
+        let ready = n > 0 && (mouths > 0 || producers > 0) && n <= MAX_BODY_CELLS as usize;
         if widgets::flat_button(ui, "放置到世界", BtnState::Normal).clicked() && ready {
             state.emit(Command::PlaceBody(cells.clone()));
             state.workshop.open = false;
@@ -412,21 +419,23 @@ fn hint_line(ui: &mut Ui, text: &str, color: Color32) {
 }
 
 /// 数一数各类细胞。返回 `(移动, 眼, 嘴, 杀手)`。
-fn count_kinds(cells: &[(i16, i16, u8)]) -> (usize, usize, usize, usize) {
+fn count_kinds(cells: &[(i16, i16, u8)]) -> (usize, usize, usize, usize, usize) {
     let mut movers = 0;
     let mut eyes = 0;
     let mut mouths = 0;
     let mut killers = 0;
+    let mut producers = 0;
     for &(_, _, k) in cells {
         match CellType::from_u8(k) {
             CellType::Mover => movers += 1,
             CellType::Eye => eyes += 1,
             CellType::Mouth => mouths += 1,
             CellType::Killer => killers += 1,
+            CellType::Producer => producers += 1,
             _ => {}
         }
     }
-    (movers, eyes, mouths, killers)
+    (movers, eyes, mouths, killers, producers)
 }
 
 /// 身体是不是连成一片（四邻连通，从任意一格出发能走到所有格）。

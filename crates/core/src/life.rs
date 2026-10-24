@@ -55,6 +55,22 @@ pub const MAX_ENERGY_PER_CELL: u32 = 350;
 /// 67 让三格鱼算出来是 201，对上旧的 `BIRTH_ENERGY = 200`。
 pub const BIRTH_ENERGY_PER_CELL: u32 = 67;
 
+/// 一份吸收进来的能量里，有多大比例转成**生物量**（1/N）。
+///
+/// 8 = 1/8。这是"身体本身"和"脂肪"的分家：能量池会烧完，生物量不会。
+///
+/// ## 为什么需要这个账户
+///
+/// 早先 `energy` 一个池子既是脂肪又是身体，于是**饿死 = 把自己烧成 0**，
+/// 尸体是空的。实测 8000 tick 里 14,824 次死亡、137,411 格尸体，
+/// 其中 61% 能量为 0、剩下 39% 平均只有 5 点——**全部尸体只占账本注入的
+/// 0.18%**。一格尸体够一个嘴活一个 tick，食腐这个生态位在数学上不存在。
+///
+/// 而食腐是真实海洋里最大的能量回收通道之一。要让它存在，尸体就得有
+/// "组织"的价值，而组织是光合作用固化下来的能量——所以它该从**收入**里划，
+/// 不是凭空加到死亡那一刻。
+pub const STRUCTURE_SHARE: u32 = 8;
+
 /// 单个权重的绝对值上限。
 ///
 /// **不是 8。** 早先写 8，而手工基因组的趋光权重需要 ±12（见
@@ -673,7 +689,17 @@ pub struct Organism {
     /// 身体：每个细胞的类型与相对偏移。
     pub cells: Vec<Cell>,
     /// 生物可用能量（整数点，避免浮点漂移破坏守恒断言）。
+    ///
+    /// 这是**脂肪**：付维持成本、付移动、付繁殖用的那一池，会烧完。
     pub energy: u32,
+    /// **生物量**：这一具身体本身值多少能量。
+    ///
+    /// 和 `energy` 是两件事。`energy` 烧完就饿死，但身体还在——尸体被吃时
+    /// 转移的主要是这一份。见 [`STRUCTURE_SHARE`]。
+    ///
+    /// 它从**收入**里划（光合 / 进食 / 捕食各划 1/8），上限是
+    /// [`Organism::max_structure`]（一具身体最多值它的造价）。
+    pub structure: u32,
     /// 活了多少 tick。
     pub age: u32,
     /// 朝向。决定"前方"是哪一格。
@@ -740,6 +766,7 @@ impl Organism {
             width: 0,
             cells,
             energy: 0,
+            structure: 0,
             age: 0,
             facing: Facing::RIGHT,
             genome,
@@ -899,6 +926,43 @@ impl Organism {
     #[inline]
     pub fn birth_energy(&self) -> u32 {
         BIRTH_ENERGY_PER_CELL * self.cells.len().max(1) as u32
+    }
+
+    /// 生物量上限：**一具身体最多值它的造价**。
+    ///
+    /// 用造价当上限不是随手取的：`BIRTH_ENERGY_PER_CELL` 本来就是"造一格
+    /// 细胞要多少能量"，所以"这一格值多少"和"造它花了多少"是同一个数。
+    /// 于是**尸体最多值回它的造价**——不会出现"吃一具尸体赚回两条命"。
+    #[inline]
+    pub fn max_structure(&self) -> u32 {
+        BIRTH_ENERGY_PER_CELL * self.cells.len().max(1) as u32
+    }
+
+    /// 吸收一份能量：1/`STRUCTURE_SHARE` 转成生物量，其余进能量池。
+    ///
+    /// 返回**真正收下的那份**（两个池子都满了就收不下，调用方不该记账）。
+    ///
+    /// 顺序是"先划生物量、再进能量池"，而且生物量满了就把那份额度
+    /// 退还给能量池——否则一个吃饱的老个体永远攒不满结构，
+    /// 而"活得久 = 尸体更肥"正是这个账户要买的东西。
+    pub fn absorb(&mut self, amount: u32) -> u32 {
+        let room_e = self.max_energy().saturating_sub(self.energy);
+        let room_s = self.max_structure().saturating_sub(self.structure);
+        let take = amount.min(room_e + room_s);
+        if take == 0 {
+            return 0;
+        }
+        let mut to_s = (take / STRUCTURE_SHARE).min(room_s);
+        let mut to_e = take - to_s;
+        if to_e > room_e {
+            // 能量池满了：把溢出的那部分推给生物量。
+            let over = to_e - room_e;
+            to_e = room_e;
+            to_s = (to_s + over).min(room_s);
+        }
+        self.structure += to_s;
+        self.energy += to_e;
+        to_s + to_e
     }
 
     /// 是不是**浮游藻**：一格生产者。

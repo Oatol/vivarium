@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 3;
+pub const VERSION: u16 = 4;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -345,6 +345,9 @@ fn put_organism(out: &mut Out, org: &Organism) {
     out.i32(org.anchor.1);
     out.i32(org.width);
     out.u32(org.energy);
+    // v4：生物量。和 `energy` 分开存——它是"身体本身"的价值，
+    // 尸体被吃时转移的主要是这一份（见 `life::STRUCTURE_SHARE`）。
+    out.u32(org.structure);
     out.u32(org.age);
     out.i8(org.facing.x);
     out.i8(org.facing.y);
@@ -596,6 +599,7 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
     // 是"读档之后身体还在同一处"的前提。
     let _saved_width = r.i32()?;
     let energy = r.u32()?;
+    let structure = r.u32()?;
     let age = r.u32()?;
     let facing = Facing {
         x: r.i8()?,
@@ -643,6 +647,7 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
         width: world_width,
         cells,
         energy,
+        structure,
         age,
         facing,
         genome,
@@ -905,6 +910,9 @@ mod tests {
             assert_eq!(a.id, b.id);
             assert_eq!(a.anchor, b.anchor);
             assert_eq!(a.energy, b.energy);
+            // 生物量也要原样回来：它决定尸体被吃时转移多少能量，
+            // 丢了它读档后的食腐收益会静默变少。
+            assert_eq!(a.structure, b.structure, "生物量没回来");
             assert_eq!(a.age, b.age);
             assert_eq!(a.facing, b.facing);
             assert_eq!(a.parent, b.parent);

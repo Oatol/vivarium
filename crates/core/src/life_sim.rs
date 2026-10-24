@@ -965,7 +965,11 @@ impl LifeSim {
             }
         }
         EnergyAudit {
-            organisms: self.organisms.iter().map(|o| o.energy as u64).sum(),
+            organisms: self
+                .organisms
+                .iter()
+                .map(|o| o.energy as u64 + o.structure as u64)
+                .sum(),
             remains,
             dissipated: self.ledger.dissipated,
             injected: self.ledger.injected,
@@ -1102,7 +1106,8 @@ impl LifeSim {
         let mut species: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for org in &self.organisms {
             cells += org.cell_count();
-            energy += org.energy as u64;
+            // 统计口径把生物量算进去：对玩家来说"它有多少本钱"是两者之和。
+            energy += (org.energy + org.structure) as u64;
             max_gen = max_gen.max(org.generation);
             species.insert(org.body_fingerprint());
             if org.is_plankton() {
@@ -1205,7 +1210,13 @@ impl LifeSim {
         // 每格分不到 4 点能量的尸体视为"已经被自己烧光了"：flags 直接写 0。
         // （腐烂已经不看 `flags` 了——那套判据被 `Corpse` 材质取代。
         // 这里仍然把零头归零，只是为了不留下"1 点能量的尸体"这种噪声。）
-        let per_cell = org.energy / n;
+        // **尸体值的是"脂肪 + 身体"。**
+        //
+        // 早先只算 `energy`，于是饿死的身体（把脂肪烧光了）留下一具
+        // 0 能量的尸体——而饿死是主要死因。实测 61% 的尸体格能量为 0，
+        // 全部尸体只占账本注入的 0.18%，食腐这个生态位在数学上不存在。
+        // `structure` 就是那一份"身体本身"，见 `life::STRUCTURE_SHARE`。
+        let per_cell = (org.energy + org.structure) / n;
         let per_cell = if per_cell < 4 {
             0
         } else {
@@ -1233,13 +1244,18 @@ impl LifeSim {
                 //
                 // 碎屑是粉末（`MoveRule::Falls`），所以半空里死的会掉到地上堆起来；
                 // 它也是 `eat_remains` 的食物——**陆地有机质的入口**就在这一行。
-                // 能量不写进去（碎屑不带能量），那一份走下面的 `dissipated`。
+                //
+                // 能量**必须**写进去，和湿尸体一样多。v0.34 第一版漏了这一行
+                // （`world.set` 会把 flags 清 0），于是干尸体是一格 0 能量的东西
+                // ——能吃，但吃了等于没吃。同一个字段又一次只走了一半的路径。
                 world.set(x, y, MaterialKind::Remains);
+                world.set_flags(x, y, per_cell as u8);
+                placed += 1;
             }
         }
         // 摊不尽的零头 + **没能落到任何一格上的那份**（干细胞的份额）都要记账。
         // 少记这一项，守恒断言会报"少了 N 点"——实测 32000 tick 少了 22657 点。
-        self.ledger.dissipated += (org.energy - per_cell * placed) as u64;
+        self.ledger.dissipated += ((org.energy + org.structure) - per_cell * placed) as u64;
     }
 
     /// 捕食：杀手细胞咬邻格的其他生物。
@@ -1301,11 +1317,13 @@ impl LifeSim {
                 continue;
             };
             self.organisms[qi].energy -= dealt;
-            let room = self.organisms[pi]
-                .max_energy()
-                .saturating_sub(self.organisms[pi].energy);
-            let gained = dealt.min(room);
-            self.organisms[pi].energy += gained;
+            // 捕食者吃的是**脂肪**（猎物的 `energy`），不是猎物的身体——
+            // 身体留在尸体里给食腐者。这一条把两个生态位分开：
+            // **捕食者拿现金，食腐者拿房产。**
+            let org = &self.organisms[pi];
+            let room = org.max_energy().saturating_sub(org.energy)
+                + org.max_structure().saturating_sub(org.structure);
+            let gained = self.organisms[pi].absorb(dealt.min(room));
             self.ledger.dissipated += (dealt - gained) as u64;
             self.stats.bitten += 1;
         }
@@ -1379,11 +1397,13 @@ impl LifeSim {
             if gain == 0 {
                 continue;
             }
-            let room = org.max_energy().saturating_sub(org.energy);
-            let gain = gain.min(room);
-            org.energy += gain;
-            // 只记真正加进去的那份。被上限截掉的、以及浮点转整数丢掉的零头
-            // 从未进入生物可用池，不该出现在"注入"里。
+            // 收进来的这份能量按 `STRUCTURE_SHARE` 分成"生物量"和"脂肪"。
+            // `absorb` 返回真正收下的量——两个池子都满了就收不下，
+            // 那部分不该记进"注入"。
+            let gain = org.absorb(gain);
+            if gain == 0 {
+                continue;
+            }
             injected += gain as u64;
         }
         self.ledger.injected += injected;
@@ -2039,23 +2059,26 @@ impl LifeSim {
         let Some(pi) = self.organisms.iter().position(|o| o.id == eater) else {
             return false;
         };
-        let available = self.organisms[qi].energy;
+        // **藻的身体也要算进"可吃的"**：`structure` 是它长出来的组织。
+        // 只算 `energy` 的话，那具身体会随着 `organisms.remove` 一起消失，
+        // 而账本上什么都没记——症状是"吃掉一个藻，能量账少几点"。
+        let available = self.organisms[qi].energy + self.organisms[qi].structure;
         if available == 0 {
             return false;
         }
         // 吃不下就浪费掉——和 `eat_remains` 一样：超过上限的部分变成热。
-        let room = self.organisms[pi]
-            .max_energy()
-            .saturating_sub(self.organisms[pi].energy);
-        let gained = available.min(room);
+        let org = &self.organisms[pi];
+        let room = org.max_energy().saturating_sub(org.energy)
+            + org.max_structure().saturating_sub(org.structure);
+        let gained = self.organisms[pi].absorb(available.min(room));
         if gained == 0 {
             return false;
         }
-        self.organisms[pi].energy += gained;
         self.ledger.dissipated += (available - gained) as u64;
         // 清空它的能量，然后**推迟**移除（见 `eaten_plankton` 的注释）。
         // 能量清零是为了让同一 tick 里别的鱼不会再吃一口。
         self.organisms[qi].energy = 0;
+        self.organisms[qi].structure = 0;
         self.eaten_plankton.push(prey);
         true
     }
@@ -2069,6 +2092,9 @@ impl LifeSim {
         for id in ids {
             if let Some(i) = self.organisms.iter().position(|o| o.id == id) {
                 let org = self.organisms.remove(i);
+                // 兜底：`eat_plankton` 已经把两个池子清零了，这里正常是 0。
+                // 但"移除一个有机体而不记账"是漏账的经典来源，所以留一道保险。
+                self.ledger.dissipated += (org.energy + org.structure) as u64;
                 // **借走的水要还。** 藻出生时占住的那格水被记成"借"
                 // （`Cell::wet`），它整个被吞掉之后水就该回来。
                 // 不还的话每吃一个藻世界就少一格水——而"鱼吃藻"是常态，
@@ -2410,6 +2436,9 @@ impl LifeSim {
             width,
             cells,
             energy: birth_energy,
+            // 子代的生物量从 0 开始：它还没长大。
+            // 这一条让"杀幼崽"和"杀成体"有区别——成体的尸体更肥。
+            structure: 0,
             age: 0,
             facing,
             genome,
@@ -2622,9 +2651,12 @@ impl LifeSim {
             return false;
         };
         let gain = world.flags(x, y) as u32;
-        let room = self.organisms[idx]
-            .max_energy()
-            .saturating_sub(self.organisms[idx].energy);
+        // 上限要把**两个池子**都算上：能量满了但生物量还有空位时，
+        // 这口东西照样吃得下（进的是结构）。只算能量的话，
+        // 一个吃饱的老个体会对着一具肥尸体干瞪眼。
+        let org = &self.organisms[idx];
+        let room = org.max_energy().saturating_sub(org.energy)
+            + org.max_structure().saturating_sub(org.structure);
         let taken = gain.min(room);
         if taken == 0 {
             return false;
@@ -2651,8 +2683,7 @@ impl LifeSim {
             // 留一部分在尸体上，下一顿再来。
             world.set_flags(x, y, (gain - taken) as u8);
         }
-        let org = &mut self.organisms[idx];
-        org.energy += taken;
+        self.organisms[idx].absorb(taken);
         self.stats.eaten += 1;
         true
     }
@@ -3150,11 +3181,25 @@ mod tests {
     ///
     /// 旧说法是"出生只能把水挤开、不能把水变没"，而那正是
     /// "水被顶到身体上方 → 子代站在那格水上 → 一代代爬进天空"的源头。
-    fn water_volume(world: &World) -> usize {
-        world.count_of(MaterialKind::Water)
-            + world.occupied_count()
-            + world.count_of(MaterialKind::Remains)
-            + world.count_of(MaterialKind::Corpse)
+    /// **水的守恒量**：世界里的水 + 活细胞借走的水 + 尸体欠着的水。
+    ///
+    /// 早先这里写的是 `水 + 占用格数 + 碎屑 + 尸体`，那量的是**物质**而不是水。
+    /// 两者在"所有细胞都出生在水里"时恰好相等，而 v0.31 之后身体可以出生在
+    /// **空气**里——它占的那格是 `Empty`，凭空多出一格物质，于是这个和会 +1。
+    /// 实测 600 tick 的繁殖压力测试在第 162 tick 报 +2，查下来是两格
+    /// 空气里出生的细胞，**水一滴没漏**。
+    ///
+    /// 正确的判据只数"借过水的格"（`Cell::wet`）：尸体一定是湿的
+    /// （`bury` 给干细胞写的是 `Remains`），所以 `Corpse` 的格数就是
+    /// 欠着的水。碎屑和空气里出生的细胞都不进这个账。
+    fn water_volume(world: &World, sim: &LifeSim) -> usize {
+        let borrowed: usize = sim
+            .organisms()
+            .iter()
+            .flat_map(|o| &o.cells)
+            .filter(|c| c.wet)
+            .count();
+        world.count_of(MaterialKind::Water) + borrowed + world.count_of(MaterialKind::Corpse)
     }
 
     #[test]
@@ -3298,7 +3343,11 @@ mod tests {
         // 这里吃的是**天然碎屑**（`Remains`），不是尸体：它不是从身体借来的，
         // 吃掉之后只留下空位，不还水。尸体才还水。
         assert_eq!(w.get(22, 25), MaterialKind::Empty);
-        assert_eq!(sim.organism(id).unwrap().energy, 50 + REMAINS_ENERGY);
+        // **一部分进了生物量。** 判据要看两个池子的和——只断言 `energy`
+        // 会把"1/8 转成组织"当成"少了 3 点能量"。
+        let org = sim.organism(id).unwrap();
+        assert_eq!(org.energy + org.structure, 50 + REMAINS_ENERGY);
+        assert!(org.structure > 0, "吃进来的东西应当有一部分变成身体");
         let after = sim.audit(&w);
         assert_eq!(after.accounted(), before.accounted(), "进食只是搬运");
     }
@@ -3445,14 +3494,18 @@ mod tests {
     #[test]
     fn wrapping_never_loses_water() {
         let mut w = pool();
-        let before = water_volume(&w);
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
+        let before = water_volume(&w, &sim);
         let id = sim.spawn_injected(&mut w, swimmer((62, 40), 5000)).unwrap();
 
         for _ in 0..300 {
             sim.step(&mut w);
-            assert_eq!(water_volume(&w), before, "环绕移动只能搬水，不能吞水");
+            assert_eq!(
+                water_volume(&w, &sim),
+                before,
+                "环绕移动只能搬水，不能吞水"
+            );
         }
         assert!(sim.organism(id).is_some());
     }
@@ -3736,10 +3789,10 @@ mod tests {
     #[test]
     fn being_born_borrows_water_and_dying_returns_it() {
         let mut w = pool();
-        let before = water_volume(&w);
         let mut sim = LifeSim::new(&mut w);
         // 关掉播种：这条测的是几何与体积账，不是生态。
         sim.set_food_growth(false);
+        let before = water_volume(&w, &sim);
         let id = sim.spawn_injected(&mut w, swimmer((10, 40), 5000)).unwrap();
 
         // 出生"借走"两格水：水位会掉两格，但总量守恒。
@@ -3748,7 +3801,7 @@ mod tests {
             before - 2,
             "两格身体借走两格水"
         );
-        assert_eq!(water_volume(&w), before, "借不是丢");
+        assert_eq!(water_volume(&w, &sim), before, "借不是丢");
 
         // 后半段是回归测试：早先按"第 k 个细胞的旧位置 → 第 k 个细胞的新位置"
         // 搬运流体，身体内部重叠时会把水换进**新身体内部**。那格随即被占成细胞，
@@ -3765,7 +3818,7 @@ mod tests {
                     );
                 }
             }
-            assert_eq!(water_volume(&w), before, "游动只能搬水，一格都不能少");
+            assert_eq!(water_volume(&w, &sim), before, "游动只能搬水，一格都不能少");
         }
     }
 
@@ -3815,7 +3868,7 @@ mod tests {
 
         let id = sim.spawn_injected(&mut w, big).unwrap();
         let start = sim.organism(id).unwrap().anchor;
-        let volume = water_volume(&w);
+        let volume = water_volume(&w, &sim);
 
         for _ in 0..10 {
             sim.step(&mut w);
@@ -3824,7 +3877,7 @@ mod tests {
         let org = sim.organism(id).expect("18 格的身体不该在这 10 tick 里死掉");
         assert_ne!(org.anchor, start, "18 格的身体一格也没动——水又变成墙了");
         assert_eq!(w.occupied_count(), 18, "身体散架了");
-        assert_eq!(water_volume(&w), volume, "水少了：顶开水的时候漏了");
+        assert_eq!(water_volume(&w, &sim), volume, "水少了：顶开水的时候漏了");
         assert!(sim.audit(&w).is_balanced(), "能量账不平");
     }
 
@@ -3845,7 +3898,7 @@ mod tests {
             let mut sim = LifeSim::new(&mut w);
             // 关掉播种：这条测的是几何与体积账，不是生态。
             sim.set_food_growth(false);
-            let volume = water_volume(&w);
+            let volume = water_volume(&w, &sim);
             let id = sim
                 .spawn_injected(
                     &mut w,
@@ -3868,7 +3921,7 @@ mod tests {
                     plan.name
                 );
                 assert_eq!(
-                    water_volume(&w),
+                    water_volume(&w, &sim),
                     volume,
                     "「{}」在第 {tick} tick 把水弄丢了",
                     plan.name
@@ -4264,7 +4317,7 @@ mod tests {
         let mut w = pool();
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
-        let before = water_volume(&w);
+        let before = water_volume(&w, &sim);
         // 一个只会生孩子、不会游的基因组：把繁殖路径压到最密。
         let mut genome = Genome::blank();
         genome.weights[Genome::b_o(OUT_REPRODUCE)] = 3.0;
@@ -4276,7 +4329,7 @@ mod tests {
         for tick in 0..600 {
             sim.step(&mut w);
             assert_eq!(
-                water_volume(&w),
+                water_volume(&w, &sim),
                 before,
                 "第 {tick} tick 水位漂了：出生借的水和尸体还的水对不上"
             );
@@ -4841,6 +4894,59 @@ mod tests {
     // -----------------------------------------------------------------------
     // 身体进光场（v0.33）
     // -----------------------------------------------------------------------
+
+    /// **食腐要有利可图：尸体值的是身体，不是脂肪。**
+    ///
+    /// 早先 `bury` 只把 `energy` 写进尸体，于是饿死的身体留下一具 0 能量的
+    /// 尸体——而饿死是主要死因。实测 61% 的尸体格能量为 0，全部尸体只占
+    /// 账本注入的 0.18%，一格尸体够一个嘴活一个 tick：**食腐这个生态位
+    /// 在数学上不存在**。
+    ///
+    /// 现在尸体的价值是 `energy + structure`，而 `structure` 是它活着的时候
+    /// 从光合里攒下来的。这条测试钉的就是"把脂肪烧光之后，身体还值钱"。
+    #[test]
+    fn a_starved_body_still_leaves_an_edible_corpse() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 12), Genome::blank(), 100),
+            )
+            .unwrap();
+        // 晒一阵光：生物量从光合里长出来。
+        for _ in 0..60 {
+            sim.step(&mut w);
+        }
+        let org = sim.organism(id).expect("60 tick 还不该死");
+        assert!(
+            org.structure > 0,
+            "晒了 60 tick 光，应当攒出生物量（structure = {}）",
+            org.structure
+        );
+
+        // 把脂肪抽干再让它死：尸体仍然值钱。
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+        sim.organisms[i].energy = 0;
+        // 用 `MAX_AGE` 而不是 `u32::MAX`：代谢里会 `age += 1`，
+        // 顶到上限会溢出（debug 下直接 panic）。
+        sim.organisms[i].age = MAX_AGE;
+        sim.step(&mut w);
+
+        let mut best = 0u8;
+        for y in 0..64isize {
+            for x in 0..64isize {
+                if w.get(x, y) == MaterialKind::Corpse {
+                    best = best.max(w.flags(x, y));
+                }
+            }
+        }
+        assert!(
+            best > 0,
+            "饿死的身体也该留下有能量的尸体——它值的是身体，不是脂肪"
+        );
+    }
 
     /// **干死的身体必须留下点东西。**
     ///
