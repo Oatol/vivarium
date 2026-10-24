@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 5;
+pub const VERSION: u16 = 6;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -519,8 +519,20 @@ fn read_materials(r: &mut In<'_>, total: usize) -> Result<Vec<MaterialCell>, Sav
 
 fn read_genome(r: &mut In<'_>) -> Result<Genome, SaveError> {
     let n = r.u16()? as usize;
-    if n > crate::life::WEIGHT_COUNT {
-        return Err(SaveError::Corrupt("权重个数超过网络规模"));
+    // **必须精确相等，不能"小于就补零"。**
+    //
+    // 权重是**按位置**解释的（`b_i` / `b_o` 算下标），所以少几个权重不是
+    // "缺几个数"，而是**整张表错位**。早先这里只拦 `n > WEIGHT_COUNT`，
+    // 于是 v0.39 把 `INPUTS` 从 22 加到 24 之后，旧档会带着 370 个权重
+    // 读进一张 398 格的表——前面几百个数还在老位置上，后面全是 0，
+    // 跑起来"活着但行为完全不对"，而**没有任何报错**。
+    //
+    // 症状会是"读档之后生物都变傻了"，而查起来要一路查到权重布局。
+    // 宁可在这里明确地失败。
+    if n != crate::life::WEIGHT_COUNT {
+        return Err(SaveError::Corrupt(
+            "权重个数与网络规模不符（v0.39 改了输入数，旧档不再兼容）",
+        ));
     }
     let mut weights = vec![0.0f32; crate::life::WEIGHT_COUNT];
     for w in weights.iter_mut().take(n) {

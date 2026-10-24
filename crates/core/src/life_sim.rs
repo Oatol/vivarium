@@ -36,7 +36,8 @@ use crate::life::{
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
     IN_FACING_Y, IN_FOOD_AHEAD, IN_FOOD_DIR_X, IN_FOOD_DIR_Y, IN_KIN_AHEAD, IN_LIGHT,
     IN_ORGANISM_DIR_X, IN_ORGANISM_DIR_Y, IN_PREV_DOWN, IN_PREV_LEFT, IN_PREV_RIGHT, IN_PREV_UP,
-    IN_STUCK, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT, OUT_LEFT,
+    IN_CORPSE_DIR_X, IN_CORPSE_DIR_Y, IN_STUCK, IN_SUPPORTED_BELOW, OUTPUTS, OUT_DOWN, OUT_EAT,
+    OUT_LEFT,
     OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
@@ -213,11 +214,40 @@ const LIFE_SEED: u64 = 0x5EED_1F3E;
 /// 贴着水面游的鱼不该因为头顶出水就断粮。
 pub const SUBMERGED_MIN: f32 = 0.35;
 
-/// 根能提供的**最低湿度**：根扎在水边时，整株植物按这个比例产能。
+/// 根能提供的湿度**起点**：一格根扎在水边时，整株按这个比例产能。
 ///
-/// 0.35 ≈ 水里的三分之一。够慢但够活——陆生植物本来就该长得慢，
-/// 而"慢"正是它和水中植物之间该有的取舍。
-pub const LAND_DAMP: f32 = 0.35;
+/// 0.20 ≈ 水里的五分之一。比 v0.37 那个 0.35 低，因为那时候它是**上限**
+/// （一个常数），而现在它是**斜坡的起点**——一株植物长多少根，它就能多接近
+/// [`LAND_DAMP_MAX`]。这是 v0.39 的全部改动：把"有根 / 没根"的开关
+/// 换成"根系多厚"的连续量。
+pub const LAND_DAMP_BASE: f32 = 0.20;
+
+/// 每多一格根，岸上的产能提高多少。
+///
+/// 0.08：一格根 0.28、三格 0.44、五格封顶 0.60。
+pub const LAND_DAMP_PER_ROOT: f32 = 0.08;
+
+/// 根系能买到的产能上限。
+///
+/// 0.60：岸上光更强（没有水的衰减），`0.6 × 强光` 大致等于水里的满产。
+/// **不再往上抬**——否则第一株长出厚根系的植物会铺满陆地，那是 v0.23
+/// 海草 481 株吃光所有光的重演。陆地该是"能活，但更苦"。
+pub const LAND_DAMP_MAX: f32 = 0.60;
+
+/// 一株植物的根能把它在岸上的产能抬到多少。
+///
+/// ## 为什么是函数而不是常数
+///
+/// v0.37 里 `LAND_DAMP` 是个常数：只要有**一格**根贴着水，整株就按 0.35 产。
+/// 于是"多长一格根"没有任何收益——根只是一个开关，突变不会被推向它。
+/// 实测 8000 tick 里**一株带根的植物都没出现**：机制在，但没有梯度。
+///
+/// 换成斜坡之后 `damp` 成了根格数的函数，**投资根系第一次有回报**。
+/// 而根不是免费的（每格 1/tick 维持 + 占质量），所以最优格数由
+/// "岸上光有多强"决定，不是无限长——**这是这条曲线唯一的依据。**
+fn land_damp(roots: usize) -> f32 {
+    (LAND_DAMP_BASE + LAND_DAMP_PER_ROOT * roots as f32).min(LAND_DAMP_MAX)
+}
 
 /// 完全上岸时，每一步移动贵几倍。
 ///
@@ -535,6 +565,22 @@ pub struct LifeStats {
     pub killers: usize,
     /// 本 tick 新长出的藻席格数。
     pub food_grown: u32,
+    /// 本 tick 被吃掉的**尸体**格数（[`LifeStats::eaten`] 的子集）。
+    ///
+    /// ## 为什么单独一个数
+    ///
+    /// `eaten` 把碎屑、藻、尸体混在一起数，而三者的生态含义完全不同：
+    /// 碎屑是"世界生成时撒的底货"，藻是"现长的"，只有**尸体**才是
+    /// "食腐"这个生态位的证据。
+    ///
+    /// v0.35 把尸体的平均能量从 5 点提到 38 点，让食腐在能量上成立了；
+    /// v0.39 又给了它一条独立的嗅觉通道。但**"成立"不等于"被占据"**——
+    /// 这个数就是那条验收的唯一直接证据：它长期为 0，说明没有任何谱系
+    /// 在吃尸体，不管机制多完整。
+    ///
+    /// 不能拿"尸体存量下降"代替它：存量同时受死亡率、腐烂速度、
+    /// 材质模拟的影响，掉下来分不清是谁干的。
+    pub scavenged: u32,
     /// 本 tick 腐烂掉的尸体格数。
     ///
     /// 和 `food_grown` 是一对：一个进、一个出。生态有没有在"堆尸体"，
@@ -1429,13 +1475,17 @@ impl LifeSim {
             // **v0.31：从门槛改成斜坡**（见 [`dampness`]）。原来是
             // `water_frac < 0.35` 直接跳过，于是"半上岸"在能量上不存在。
             let mut damp = dampness(self.field.water_frac(ax, ay));
-            // **根贴着水 → 至少 LAND_DAMP。**
+            // **根贴着水 → 至少 `land_damp(根格数)`。**
             //
             // 这一条才是"植物能上岸"的全部：根扎在岸边的水里，
-            // 身体长在岸上，光合按三分之一跑。没有根的话 `damp` 仍然是
+            // 身体长在岸上，光合按根系厚度跑。没有根的话 `damp` 仍然是
             // 粗格水占比——离开水面就是 0。
-            if damp < LAND_DAMP && Self::root_is_wet(&*world, org) {
-                damp = LAND_DAMP;
+            //
+            // 用 `max` 而不是赋值：半截泡在水里的身体本来就该按
+            // 粗格水占比算，不该被根系"拉低"到岸上的地板。
+            if Self::root_is_wet(&*world, org) {
+                let roots = org.cells.iter().filter(|c| c.organelles.has(ROOT)).count();
+                damp = damp.max(land_damp(roots));
             }
             if damp <= 0.0 {
                 continue;
@@ -2001,6 +2051,45 @@ impl LifeSim {
                 }
             }
         }
+        // ---- 尸体味：单独一条射线（v0.39）----
+        //
+        // 判据和上面那条**故意不同**（见 `IN_CORPSE_DIR_X` 的文档）：
+        // 活体和水都不挡（腐烂的化学信号溶在水里），只有石头和沙挡。
+        //
+        // 为什么必须是第二条射线：上面那条遇到**第一个**食物就 break，
+        // 而海里第一个食物几乎总是藻。共用的话这一路会恒为 0。
+        let (mut corpse_x, mut corpse_y) = (0.0f32, 0.0f32);
+        for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+            for d in 1..=smell_radius {
+                let sx = org.wrap_x(org.anchor.0 + dx * d);
+                let sy = org.anchor.1 + dy * d;
+                let (sxs, sys) = (sx as isize, sy as isize);
+                if !world.in_bounds(sxs, sys) {
+                    break;
+                }
+                let kind = world.get(sxs, sys);
+                // 只在**带能量的**尸体上停：0 能量的尸体吃了也没有意义，
+                // 而让食腐者去追一具空壳比闻不到更糟。
+                if kind == MaterialKind::Corpse && world.flags(sxs, sys) > 0 {
+                    corpse_x += dx as f32 / d as f32;
+                    corpse_y += dy as f32 / d as f32;
+                    break;
+                }
+                // 水 / 气 / 空位 / 碎屑 / 活体（材质是 `Empty`）都能闻过去。
+                if !matches!(
+                    kind,
+                    MaterialKind::Water
+                        | MaterialKind::Gas
+                        | MaterialKind::Empty
+                        | MaterialKind::Remains
+                ) {
+                    break;
+                }
+            }
+        }
+        inp[IN_CORPSE_DIR_X] = corpse_x.clamp(-1.0, 1.0);
+        inp[IN_CORPSE_DIR_Y] = corpse_y.clamp(-1.0, 1.0);
+
         inp[IN_FOOD_DIR_X] = smell_x.clamp(-1.0, 1.0);
         inp[IN_FOOD_DIR_Y] = smell_y.clamp(-1.0, 1.0);
         inp[IN_ORGANISM_DIR_X] = org_x.clamp(-1.0, 1.0);
@@ -2742,6 +2831,11 @@ impl LifeSim {
             world.set_flags(x, y, (gain - taken) as u8);
         }
         self.organisms[idx].absorb(taken);
+        // 食腐的判据是**吃掉的是尸体**，不是碎屑。两者在 `eaten` 里同值，
+        // 但一个是"捡底货"、一个是"吃别人"，生态含义完全不同。
+        if kind == MaterialKind::Corpse {
+            self.stats.scavenged += 1;
+        }
         self.stats.eaten += 1;
         true
     }
@@ -5103,6 +5197,242 @@ mod tests {
             sim2.organism(id2).unwrap().hydration,
             crate::life::HYDRATION_MAX - 40,
             "没有根，离水之后应当每 tick 掉一格"
+        );
+    }
+
+    /// **根系越厚，岸上产能越高**——这是"投资根系"唯一的回报来源。
+    ///
+    /// v0.37 里 `LAND_DAMP` 是个常数，所以一格根和十格根产得一样多，
+    /// 突变没有任何理由往"多长根"走（实测 8000 tick 一株带根植物都没出现）。
+    /// 这条测试钉的就是那个梯度：**同一具身体、同一个位置，只改根格数**。
+    #[test]
+    fn more_roots_yield_more_energy_on_land() {
+        // 水面 y=30。锚点 25，四格生产者占 y=25..28（粗格 24..27 里没有水，
+        // 所以 `dampness` 是 0），根横排在 y=29——四邻 (x,30) 全是水。
+        fn plant(roots: usize) -> Organism {
+            let mut cells: Vec<Cell> = (0..4)
+                .map(|dy| Cell::new(CellType::Producer, (0, dy)))
+                .collect();
+            for i in 0..roots {
+                // **纯根，不带叶绿体。** 否则两组的 `producers` 数就不一样了，
+                // 测到的会是"格数变多"，而不是"根系变厚"。
+                cells.push(Cell::from_organelles(
+                    crate::organelle::Organelles(ROOT),
+                    (i as i16, 4),
+                ));
+            }
+            Organism::new(0, (20, 25), cells, Genome::blank())
+        }
+
+        fn injected(roots: usize) -> u64 {
+            let mut w = pool();
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            let id = sim.spawn_injected(&mut w, plant(roots)).unwrap();
+            assert!(
+                LifeSim::root_is_wet(&w, sim.organism(id).unwrap()),
+                "{roots} 格根的版本必须都算贴水，否则两组不可比"
+            );
+            sim.inject_sunlight(&mut w);
+            sim.ledger().injected
+        }
+
+        let one = injected(1);
+        let four = injected(4);
+        assert!(one > 0, "一格根也该有产出，实测 {one}");
+        // 0.28 vs 0.52 → 比值 1.86。截断会吃掉几个点，留到 1.5 就够严。
+        assert!(
+            four as f32 > one as f32 * 1.5,
+            "四格根该比一格根产得多得多：一格 {one}、四格 {four}"
+        );
+    }
+
+    /// 根系买到的产能**有上限**，而且起点比 v0.37 那个常数低。
+    ///
+    /// 上限存在的理由不是数值好看：`0.6 × 岸上强光 ≈ 水里满产`，
+    /// 再往上抬，第一株长出厚根系的植物就会铺满陆地（v0.23 海草 481 株）。
+    #[test]
+    fn root_dampness_is_a_capped_ramp() {
+        assert!(land_damp(0) < land_damp(1), "零格根是起点，一格就该更高");
+        assert!(
+            land_damp(1) < land_damp(3),
+            "三格根该比一格高：{} vs {}",
+            land_damp(1),
+            land_damp(3)
+        );
+        assert_eq!(land_damp(100), LAND_DAMP_MAX, "再多的根也只到上限");
+        assert!(
+            land_damp(0) > 0.0,
+            "起点不能是 0——那样一格根等于没有"
+        );
+    }
+
+    /// **食腐的判据是"吃掉的是尸体"**，不是"吃到了东西"。
+    ///
+    /// `eaten` 把碎屑、藻、尸体混在一起数，而"捡世界生成时撒下的底货"
+    /// 和"吃别人"是两件事。这个数长期为 0 就说明食腐生态位**没有被占据**，
+    /// 不管机制多完整。
+    #[test]
+    fn scavenging_is_counted_apart_from_eating_debris() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 20), Genome::blank(), 100),
+            )
+            .unwrap();
+
+        // 碎屑：算 `eaten`，不算 `scavenged`。
+        w.set(20, 20, MaterialKind::Remains);
+        w.set_flags(20, 20, 25);
+        assert!(sim.eat_remains(&mut w, id, 20, 20), "应当吃得下");
+        assert_eq!(sim.stats().scavenged, 0, "吃碎屑不算食腐");
+        assert_eq!(sim.stats().eaten, 1);
+
+        // 尸体：两样都算。
+        w.set(21, 20, MaterialKind::Corpse);
+        w.set_flags(21, 20, 60);
+        assert!(sim.eat_remains(&mut w, id, 21, 20), "应当吃得下");
+        assert_eq!(sim.stats().scavenged, 1, "吃尸体才是食腐");
+        assert_eq!(sim.stats().eaten, 2);
+    }
+
+    // -----------------------------------------------------------------------
+    // 尸体嗅觉（v0.39）
+    // -----------------------------------------------------------------------
+
+    /// 尸体味指向**最近的尸体**，而且只认**带能量的**。
+    ///
+    /// "只认带能量的"是一条有意的取舍：0 能量的尸体吃了等于没吃，
+    /// 让食腐者去追一具空壳比闻不到更糟——它会把全部能量花在赶路上。
+    #[test]
+    fn corpse_scent_points_at_the_nearest_corpse() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 20), Genome::blank(), 500),
+            )
+            .unwrap();
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+
+        let calm = sim.sense(&w, i);
+        assert_eq!(calm[IN_CORPSE_DIR_X], 0.0, "没有尸体时这一路该是 0");
+        assert_eq!(calm[IN_CORPSE_DIR_Y], 0.0, "没有尸体时这一路该是 0");
+
+        // 右边 6 格放一具尸体。
+        w.set(16, 20, MaterialKind::Corpse);
+        w.set_flags(16, 20, 60);
+        let right = sim.sense(&w, i);
+        assert!(
+            right[IN_CORPSE_DIR_X] > 0.0,
+            "尸体在右边，x 该是正的：{}",
+            right[IN_CORPSE_DIR_X]
+        );
+        assert!(
+            right[IN_CORPSE_DIR_Y].abs() < 1e-6,
+            "同一行上不该有垂直分量：{}",
+            right[IN_CORPSE_DIR_Y]
+        );
+
+        // 换到左边。
+        w.set(16, 20, MaterialKind::Empty);
+        w.set(4, 20, MaterialKind::Corpse);
+        w.set_flags(4, 20, 60);
+        let left = sim.sense(&w, i);
+        assert!(
+            left[IN_CORPSE_DIR_X] < 0.0,
+            "尸体在左边，x 该是负的：{}",
+            left[IN_CORPSE_DIR_X]
+        );
+
+        // 空壳不算。
+        w.set_flags(4, 20, 0);
+        let empty = sim.sense(&w, i);
+        assert_eq!(
+            empty[IN_CORPSE_DIR_X], 0.0,
+            "0 能量的尸体不该被闻到——追空壳比闻不到更糟"
+        );
+    }
+
+    /// 尸体味的遮挡规则**故意和食物射线不同**：碎屑不挡，石头挡。
+    ///
+    /// 这条是"尸体有自己一条射线"的全部理由。共用射线的话，海里第一个
+    /// 含能量食物几乎总是藻或碎屑，射线一停尸体就再也闻不到了。
+    #[test]
+    fn corpse_scent_ignores_debris_but_not_stone() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 20), Genome::blank(), 500),
+            )
+            .unwrap();
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+
+        // 尸体在右边 8 格，中间 12..14 铺一堆碎屑。
+        w.set(18, 20, MaterialKind::Corpse);
+        w.set_flags(18, 20, 60);
+        for x in 12..=14isize {
+            w.set(x, 20, MaterialKind::Remains);
+            w.set_flags(x, 20, 25);
+        }
+        let through_debris = sim.sense(&w, i);
+        assert!(
+            through_debris[IN_CORPSE_DIR_X] > 0.0,
+            "碎屑不该挡住尸体味：{}",
+            through_debris[IN_CORPSE_DIR_X]
+        );
+
+        // 同一批格子换成石头：味道该断。
+        for x in 12..=14isize {
+            w.set(x, 20, MaterialKind::Stone);
+        }
+        let through_stone = sim.sense(&w, i);
+        assert_eq!(
+            through_stone[IN_CORPSE_DIR_X], 0.0,
+            "石头该挡住尸体味（沉积物会吸收），实测 {}",
+            through_stone[IN_CORPSE_DIR_X]
+        );
+    }
+
+    /// **这一路输入真的能驱动行为**：接上之后，鱼会逆着巡航偏置朝尸体游。
+    ///
+    /// 只断言"输入有值"是不够的——那只能说明 `sense` 写了数，说明不了
+    /// 这路数进得了网络、赢得了 `pick_direction` 的阈值。
+    /// 所以这里给基线一个**往右**的巡航偏置，把尸体放在**左边**：
+    /// 没有这一路的话它一定往右。
+    #[test]
+    fn a_genome_can_steer_by_corpse_scent() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 尸体在左边 6 格。
+        w.set(4, 20, MaterialKind::Corpse);
+        w.set_flags(4, 20, 60);
+
+        let mut g = Genome::blank();
+        // 和手工鱼一样的巡航偏置：没有别的信号时它往右。
+        g.weights[Genome::b_o(OUT_RIGHT)] = 0.7;
+        // 尸体在左 → `IN_CORPSE_DIR_X` 是负的 → 乘 -10 变成正的"向左"。
+        g.connect(IN_CORPSE_DIR_X, OUT_LEFT, -10.0);
+
+        let id = sim
+            .spawn_injected(&mut w, LifeSim::simple_fish((10, 20), g, 2_000))
+            .unwrap();
+        for _ in 0..40 {
+            sim.step(&mut w);
+        }
+        let x = sim.organism(id).expect("40 tick 不该死").anchor.0;
+        assert!(
+            x < 10,
+            "闻着尸体味该往左游（基线是往右），实测 x={x}"
         );
     }
 

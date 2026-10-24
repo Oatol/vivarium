@@ -20,7 +20,7 @@
 use std::collections::BTreeMap;
 
 use vivarium_core::life_sim::{stock_surface, LifeSim};
-use vivarium_core::{worldgen, MaterialSim, Rng, World};
+use vivarium_core::{worldgen, MaterialKind, MaterialSim, Rng, World};
 
 /// 平均"扁平度"：包围盒的宽 / 高。
 fn flatness(sim: &LifeSim) -> f64 {
@@ -56,9 +56,13 @@ fn run(seed: u64) -> String {
     let mut mat = MaterialSim::new();
     mat.set_threads(1);
     stock_surface(&mut world, &mut sim, 16, 300, false);
+    // 累计"吃掉尸体"的格数。这是食腐生态位的**唯一直接证据**：
+    // 尸体存量会同时受死亡率、腐烂、材质模拟影响，掉了分不清是谁干的。
+    let mut scavenged = 0u64;
     for _ in 0..8000 {
         mat.step(&mut world);
         sim.step(&mut world);
+        scavenged += sim.stats().scavenged as u64;
     }
 
     let st = sim.stats();
@@ -76,8 +80,29 @@ fn run(seed: u64) -> String {
         .unwrap_or(0);
     let distinct_shapes = hist.len();
 
+    // **尸体存量**：食腐者存在的唯一可观测证据。
+    //
+    // 判据不是"有没有生物在吃"（那要抓现行），而是**同时存在的尸体有多少**。
+    // 没人吃的时候尸体只会慢慢烂掉，于是存量高、平均能量高、腐烂计数高；
+    // 一旦有食腐者，这三条会一起掉。v0.35 之前这个数没有意义（尸体平均
+    // 5 点能量，谁来吃都亏），所以它只从 v0.39 开始有解释力。
+    let (mut corpses, mut corpse_energy) = (0u64, 0u64);
+    for y in 0..512isize {
+        for x in 0..512isize {
+            if world.get(x, y) == MaterialKind::Corpse {
+                corpses += 1;
+                corpse_energy += world.flags(x, y) as u64;
+            }
+        }
+    }
+    let corpse_mean = if corpses == 0 {
+        0.0
+    } else {
+        corpse_energy as f64 / corpses as f64
+    };
+
     format!(
-        "seed {seed:>5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}",
+        "seed {seed:>5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}",
         st.organisms,
         st.plankton,
         st.species,
@@ -88,6 +113,10 @@ fn run(seed: u64) -> String {
         distinct_shapes,
         flatness(&sim),
         st.stranded,
+        corpses,
+        corpse_mean,
+        scavenged,
+        st.corpses_rotted,
     )
 }
 
