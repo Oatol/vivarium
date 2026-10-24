@@ -24,13 +24,13 @@ use vivarium_core::{worldgen, MaterialSim, Rng, World};
 fn what_m2a_did_to_the_ecosystem() {
     let mut world = World::new(512, 512).unwrap();
     let mut rng = Rng::new(11);
-    worldgen::sea_and_islands(&mut world, &mut rng);
+    let layout = worldgen::sea_and_islands(&mut world, &mut rng);
     let mut sim = LifeSim::new(&mut world);
     let mut mat = MaterialSim::new();
     mat.set_threads(1);
 
     let ids = stock_surface(&mut world, &mut sim, 16, 300, false);
-    println!("投放 {} 条", ids.len());
+    println!("投放 {} 条（水面线 y={}）", ids.len(), layout.waterline);
 
     let mut total_diagonal = 0u64;
     let mut total_moved = 0u64;
@@ -42,7 +42,7 @@ fn what_m2a_did_to_the_ecosystem() {
         total_moved += st.moved.iter().sum::<u32>() as u64;
         if (t + 1) % 1000 == 0 {
             println!(
-                "  tick {:5}  活 {:4}  最大 {:2} 格  平均 {:.1}  能量 {:8}  斜向 {:6}/{:.1}%  搁浅 {:3}",
+                "  tick {:5}  活 {:4}  最大 {:2} 格  平均 {:.1}  能量 {:8}  斜向 {:6}/{:.1}%  脱水 {:3}  最高 y {:3}",
                 t + 1,
                 sim.organisms().len(),
                 sim.organisms().iter().map(|o| o.cells.len()).max().unwrap_or(0),
@@ -56,6 +56,7 @@ fn what_m2a_did_to_the_ecosystem() {
                     0.0
                 },
                 st.stranded,
+                st.shallowest,
             );
         }
     }

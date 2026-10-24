@@ -200,6 +200,50 @@ const LIFE_SEED: u64 = 0x5EED_1F3E;
 /// 贴着水面游的鱼不该因为头顶出水就断粮。
 pub const SUBMERGED_MIN: f32 = 0.35;
 
+/// 完全上岸时，每一步移动贵几倍。
+///
+/// 3 倍：一条 6 格、速度 1 的鱼在水里每步 6 点，上岸后 24 点，而它的维持
+/// 成本大约 20/tick——**在岸上走一步等于多活一 tick 的钱**。这个量级刚好让
+/// "短距离横穿一条浅滩"可行，"住在岸上"不可行。
+///
+/// 为什么是"加价"而不是"禁止"：禁止会让上岸变成一件不可能的事，而
+/// 陆地演化需要的是"很贵但可行"。贵到弱个体立刻饿死、强个体能撑住，
+/// 才是"渐进"。
+pub const LAND_COST: f32 = 3.0;
+
+/// 陆地上每格质量每 tick 的支撑成本。
+///
+/// 0.5：一条 6 格的身体完全上岸要多付 3/tick，20 格要多付 10/tick。
+/// 和 [`LAND_COST`] 分工不同——那是"走一步多贵"，这是"站着不动也要付"。
+/// 只有前者的话，一条上岸的鱼可以一动不动地待着，于是搁浅会变成一种
+/// 可行的休眠策略。
+pub const LAND_UPKEEP: f32 = 0.5;
+
+/// 低于这个水占比，叶绿体完全不工作。
+///
+/// 不设成 0：真正的叶绿体在干燥环境里会关闭气孔停止工作，而保留一点门槛
+/// 也让"干透的石头"和"潮间带"在能量上分得开。
+pub const DRY_MIN: f32 = 0.05;
+
+/// 水占比 → 光合作用的产能折扣（0..=1）。
+///
+/// **这条斜坡是"陆地渐进"在能量侧的全部实现。**
+///
+/// 早先是 `water_frac < 0.35` 直接 `continue`，也就是"要么满产、要么零产"。
+/// 那条悬崖正好落在海岸线上，于是"半上岸"在能量上根本不存在——陆地演化
+/// 只能是一刀切。现在 0.05 以下是干的，0.05~0.35 线性爬升，于是潮间带
+/// 有了 0~100% 之间的连续产能。
+///
+/// 抽成函数而不是内联，是因为它是**唯一一个可以单独测的判据**：内联在
+/// `inject_sunlight` 里的话，要验证"水占比 0.2 时产量是一半"就得搭一个
+/// 恰好 3/16 是水的粗格，还要控制光照和温度。
+pub fn dampness(water_frac: f32) -> f32 {
+    if water_frac <= DRY_MIN {
+        return 0.0;
+    }
+    ((water_frac - DRY_MIN) / (SUBMERGED_MIN - DRY_MIN)).min(1.0)
+}
+
 /// 繁殖时的领地半径（切比雪夫距离）。
 pub const CROWD_RADIUS: i32 = 4;
 
@@ -486,16 +530,22 @@ pub struct LifeStats {
     /// 它涨说明基因确实在漂移；但它涨**不等于**适应度提高——
     /// 中性漂移也会让它涨。要区分这两者，得看 [`LifeStats::energy`] 是否同步上升。
     pub gene_distance: f32,
-    /// 整个身体都不挨着水的个体数（"飘在天上"）。
+    /// **一格水都够不到**的个体数（"飘在天上"或"搁在干地上"）。
     ///
-    /// 判据是"每一格的上下左右都不是水/气"。不能看格子本身的材质——
-    /// 身体格的材质永远是 `Empty`，那是材质层与生命层的互斥约定。
+    /// 判据是 [`LifeSim::submerged_frac`] `== 0`：身体的每一列头顶向上
+    /// 都扫不到水。不能看格子本身的材质——身体格的材质永远是 `Empty`，
+    /// 那是材质层与生命层的互斥约定。
     ///
-    /// 正常恒为 0：移动和出生两道门都要求"至少一格泡在水/气里"。
-    /// 它一旦不为 0，说明有谁绕过了那两道门——而这些个体既不能动也不能繁殖，
-    /// 只会坐在原地把能量晒满，从"生物数"上看完全正常。
+    /// **v0.31 换了判据。** 早先是 `!touches_water`，也就是"任何一列的
+    /// 头顶出水"就算。那条判据在"移动是开关"的时代是准的（半露出水面
+    /// 的身体根本动不了），但 v0.31 把移动换成了按水占比定价之后，
+    /// **贴着水面游成了正常且常见的事**，于是这个数字会长期停在种群的
+    /// 一半以上——它作为"有东西飘在天上"的警报就废了。
     ///
-    /// 这个指标是被一次真实的崩坏逼出来的：去掉那道门槛之后，鱼靠繁殖
+    /// 现在它只在"完全脱水"时涨。那些个体既不能动（或者极贵）也没有光合，
+    /// 只会坐在原地把能量耗光，从"生物数"上看完全正常。
+    ///
+    /// 这个指标是被一次真实的崩坏逼出来的：没有它的时候，鱼靠繁殖
     /// 一代代往上爬进天空，种群从 145 掉到 11，而能量账一分不差、画面上
     /// 也看不出异常。
     pub stranded: usize,
@@ -949,7 +999,22 @@ impl LifeSim {
             for cell in &mut org.cells {
                 cell.age += 1;
             }
-            let upkeep = org.upkeep();
+            // ---- 陆地的支撑成本 ----
+            //
+            // 水里不用撑体重（浮力就是干这个的），陆地上要。按**质量 ×
+            // 露出水面的比例**算，于是"大身体更难上岸"自动成立——不需要
+            // 写任何"如果身体大就……"的规则。
+            //
+            // 这一项和 [`LAND_COST`] 是两件事：那是"走一步多贵"，这是
+            // "站着不动也要付"。只有前者的话，一条上岸的鱼可以一动不动地
+            // 待着，搁浅于是变成一种可行的休眠策略。
+            //
+            // 完全在水里时 `dry == 0`，这一项一分钱都不加，所以水里的
+            // 能量账和 v0.30 逐 tick 相同——生态不该因为这条改动漂移。
+            let fp: Vec<(i32, i32)> = org.footprint().collect();
+            let dry = 1.0 - Self::submerged_frac(&*world, org.width, &fp);
+            let land = (org.mass() as f32 * LAND_UPKEEP * dry) as u32;
+            let upkeep = org.upkeep() + land;
             if org.age >= MAX_AGE || org.energy < upkeep {
                 // 老死与饿死走同一条埋葬路径。这里**不**动 energy：
                 // 剩下的那点（哪怕不够付一次维持成本）会随尸体进入残骸，
@@ -1034,7 +1099,13 @@ impl LifeSim {
                 .filter(|c| c.organelles.has(STING))
                 .count();
             let fp: Vec<(i32, i32)> = org.footprint().collect();
-            if !Self::touches_water(world, org.width, &fp) {
+            // **完全脱水才算搁浅。**
+            //
+            // 早先是 `!touches_water`，也就是"任何一列的头顶出水"就算。
+            // v0.31 之后贴着水面游（头露出水面、身体在水里）是一件正常
+            // 且常见的事，用那条判据会让这个数字长期停在种群的一半以上，
+            // 而它作为"有东西飘在天上"的警报就废了。
+            if Self::submerged_frac(world, org.width, &fp) <= 0.0 {
                 stranded += 1;
             }
         }
@@ -1252,7 +1323,7 @@ impl LifeSim {
                 continue;
             }
             let (ax, ay) = (org.anchor.0 as f32, org.anchor.1 as f32);
-            // **光合作用需要水。**
+            // **光合作用需要水，但不是一个开关。**
             //
             // 这一条看着像常识，但它是必需的：没有它，一条被扔在岸上的鱼
             // 会顶着满格阳光疯狂产能量，"搁浅会死"在物理上就不成立了。
@@ -1260,7 +1331,11 @@ impl LifeSim {
             //
             // 判据用粗格的水占比而不是逐格材质：身体格自己的材质是 `Empty`，
             // 问"这一格是不是水"永远得到否。
-            if self.field.water_frac(ax, ay) < SUBMERGED_MIN {
+            //
+            // **v0.31：从门槛改成斜坡**（见 [`dampness`]）。原来是
+            // `water_frac < 0.35` 直接跳过，于是"半上岸"在能量上不存在。
+            let damp = dampness(self.field.water_frac(ax, ay));
+            if damp <= 0.0 {
                 continue;
             }
             let light = self.field.light_at(ax, ay);
@@ -1268,7 +1343,7 @@ impl LifeSim {
                 continue;
             }
             let warmth = crate::field::photosynthesis(self.field.temp_at(ax, ay));
-            let gain = (PRODUCER_YIELD as f32 * light * warmth) as u32 * producers as u32;
+            let gain = (PRODUCER_YIELD as f32 * light * warmth * damp) as u32 * producers as u32;
             if gain == 0 {
                 continue;
             }
@@ -2029,13 +2104,13 @@ impl LifeSim {
         // 主动游动要花钱；**下落不花**——重力做功不是鱼在使劲。
         // 让下落扣能量会得到一个荒谬的结果：一条掉进水里的鱼因为
         // "下落太贵"而卡在半空。
-        let cost = match kind {
+        //
+        // 成本在**算完落点之后**才最终定下来：上岸要按水占比加价，
+        // 而水占比只能在新位置上量。
+        let mut cost = match kind {
             MoveKind::Swim => org.move_cost(),
             MoveKind::Fall => 0,
         };
-        if org.energy < cost {
-            return false;
-        }
 
         // 先算出**移动之后的朝向**，再算落点。
         //
@@ -2099,25 +2174,39 @@ impl LifeSim {
             }
         }
 
-        // 身体不能整个离开水（SPEC §2.0：生物默认水生）。
+        // ---- 上岸的代价：按水占比加价，不是一道墙 ----
         //
-        // 没有这一条，鱼会一路游到天上：光照按 `1 - y/height` 算，越往上越亮，
-        // 而 `passable` 对空气是放行的——于是"往上"永远有奖励、从来没有代价。
-        // 实测加大体型之后，5000 tick 就有个体停在水面上方 25 格，
-        // 能量晒满、既不能动也不能繁殖，整个种群随之冻死。
+        // 这里原来是一条硬判据：`!touches_water(...)` 直接 `return false`，
+        // 也就是"身体必须整个在水下才游得动"。它挡住了一个真实的问题
+        // （鱼会一路游到天上：光越往上越亮、空气可通行，于是"往上"永远
+        // 有奖励、从来没有代价；实测 5000 tick 就有个体停在水面上方 25 格，
+        // 能量晒满、不能动也不能繁殖，整个种群随之冻死），但**用错了手段**：
+        // 它把"上岸"变成一件不可能的事，而不是一件昂贵的事。
         //
-        // 判据见 [`Self::touches_water`]。**只查 `targets`，绝不能把旧位置
-        // 也算进去**——那是这一条上踩过的坑：合并 `old ∪ targets` 之后，
-        // 旧位置（在水里）的表面会把新位置（在空中）的表面盖过去，
-        // 于是鱼可以一格一格往上爬，每次检查时旧位置总有水。
-        // 实测这样能一路爬到水面上方十几格，而 `stranded` 指标看得一清二楚、
-        // 移动却从不被拦。
+        // 现在换成成本：水占比每少一分，这一步就贵一分。它不会退化成
+        // "免费上天"，因为另外两件事同时在管：
         //
-        // 新位置内部的邻格不用担心：它们也在 `targets` 里，
-        // `is_body` 会把它们排除掉，所以不会把厚身体的占比拉低。
-        // 水陆判据只拦**主动移动**。下落必须放行——否则一条被放在半空的鱼
-        // 永远掉不下去，而那正是"原地冻结"的成因。
-        if kind == MoveKind::Swim && !Self::touches_water(world, org.width, &targets) {
+        // 1. **光合作用要水**（[`dampness`] 按水占比给折扣），所以空气里
+        //    没有任何能量收入；
+        // 2. **陆地要付支撑成本**（代谢里那条 `LAND_UPKEEP`）。
+        //
+        // 于是"上岸"第一次是一个**能量问题**：弱个体上去立刻饿死，强个体
+        // （小、省、带够叶绿体）能撑住。这正是"陆地渐进"的定义。
+        //
+        // 判据用 `targets` 而不是 `old ∪ targets`：**旧位置不能算进去**。
+        // 合并之后旧位置（在水里）的表面会把新位置（在空中）的表面盖过去，
+        // 于是鱼可以一格一格往上爬，每次检查时旧位置总有水——实测能爬到
+        // 水面上方十几格，而 `stranded` 指标看得一清二楚、移动却从不被拦。
+        //
+        // 只拦**主动移动**。下落必须放行——否则一条被放在半空的鱼永远
+        // 掉不下去，而那正是"原地冻结"的成因。
+        if kind == MoveKind::Swim {
+            let wet = Self::submerged_frac(world, org.width, &targets);
+            if wet < 1.0 {
+                cost = (cost as f32 * (1.0 + LAND_COST * (1.0 - wet))) as u32;
+            }
+        }
+        if org.energy < cost {
             return false;
         }
 
@@ -2343,9 +2432,62 @@ impl LifeSim {
         None
     }
 
-    /// 身体是不是**在水面之下**。
+    /// 身体有多少比例的列**在水面之下**（0..=1）。
     ///
-    /// 这是"生物默认水生"（SPEC §2.0）唯一需要的那条不变量。
+    /// 每一列的判据和 [`Self::touches_water`] 一样：取这一列最高的那一格，
+    /// 从它上方往上扫，扫到 `Water` 就算这列在水下。
+    ///
+    /// ## 为什么要一个比例，而不是一个布尔
+    ///
+    /// v0.31 之前，"在水里"是一个布尔，而它被当成**移动的开关**：不满足就
+    /// 一步都走不了。那条开关把"上岸"变成了"不可能"，而陆地演化需要的
+    /// 是"很贵但可行"。于是这个比例被拿去定价：
+    ///
+    /// ```text
+    /// 移动成本 = move_cost × (1 + LAND_COST × (1 - 水占比))
+    /// ```
+    ///
+    /// 全在水下 → 原价；全在岸上 → 4 倍（`LAND_COST = 3`）。
+    ///
+    /// 用 `cells.iter().any(...)` 找每列最高的那一格，而不是先建一张
+    /// `tops` 表：身体最多 24 格，O(格数²) 是 576 次比较，比一次
+    /// `Vec` 分配便宜。
+    fn submerged_frac(world: &World, width: i32, cells: &[(i32, i32)]) -> f32 {
+        if cells.is_empty() {
+            return 0.0;
+        }
+        let (mut wet, mut total) = (0usize, 0usize);
+        for &(x, y) in cells {
+            // 只数每列最高的那一格——同一列里更低的那几格不影响露不露头。
+            if cells.iter().any(|&(ox, oy)| ox == x && oy < y) {
+                continue;
+            }
+            total += 1;
+            let xx = if width > 0 { x.rem_euclid(width) } else { x };
+            // 藻**算**水：它是水里的悬浮物，而它比水轻，会被一路顶到
+            // 水面那一行。不算的话，鱼在藻层下面时头顶是藻、扫不到水，
+            // 整批鱼会被判成"不在水里"——而它们明明就在水里。
+            //
+            // 只认藻不认气：气泡不是介质。
+            if (0..y)
+                .rev()
+                .any(|yy| world.get(xx as isize, yy as isize) == MaterialKind::Water)
+            {
+                wet += 1;
+            }
+        }
+        if total == 0 {
+            0.0
+        } else {
+            wet as f32 / total as f32
+        }
+    }
+
+    /// 身体是不是**整具都在水面之下**。
+    ///
+    /// **v0.31 之后它不再是移动的判据**——那条判据换成了按水占比定价
+    /// （见 [`Self::submerged_frac`]）。它现在只回答三件事：
+    /// 重力要不要接管、统计里算不算"脱水"、繁殖时这个位置够不够湿。
     ///
     /// ## 判据：每个 x 列的**头顶**，往上必须能扫到水
     ///
@@ -2371,34 +2513,14 @@ impl LifeSim {
     /// 因为那格水被身体借走了，向上扫就是空气）。所以投放时要把身体
     /// 往下压一格，见 [`stock_surface`]。
     fn touches_water(world: &World, width: i32, cells: &[(i32, i32)]) -> bool {
-        if cells.is_empty() {
-            return false;
-        }
-        // 每列只留最高的那一格。身体有几列就有几个采样点——比"每个细胞都查"
-        // 便宜一个数量级，而且语义更准：露不露出来只看头顶。
-        let mut tops: Vec<(i32, i32)> = Vec::new();
-        for &(x, y) in cells {
-            match tops.iter_mut().find(|(tx, _)| *tx == x) {
-                Some((_, ty)) => *ty = (*ty).min(y),
-                None => tops.push((x, y)),
-            }
-        }
-
-        for (x, top) in tops {
-            let xx = if width > 0 { x.rem_euclid(width) } else { x };
-            // 藻**算**水：它是水里的悬浮物，而它比水轻，会被一路顶到
-            // 水面那一行。不算的话，鱼在藻层下面时头顶是藻、扫不到水，
-            // 整批鱼会被判成"不在水里"——而它们明明就在水里。
-            //
-            // 只认藻不认气：气泡不是介质。
-            let submerged = (0..top)
-                .rev()
-                .any(|y| matches!(world.get(xx as isize, y as isize), MaterialKind::Water));
-            if !submerged {
-                return false;
-            }
-        }
-        true
+        // 用比例实现，保证两条判据**永远同源**。
+        //
+        // 早先它是独立实现（提前 `return false`），而比例是另一份代码——
+        // 两份判据迟早会漂开，而"哪一列露头算不算数"这种问题一旦漂开，
+        // 症状是"重力在拉它、移动却以为它还在水里"。
+        // 全在水下时比例恰好是 1.0（整数除法得 `total/total`），
+        // 所以 `>= 1.0` 和"每一列都在水下"严格等价。
+        Self::submerged_frac(world, width, cells) >= 1.0
     }
 
     /// 这个有机体的身体能不能完整落在这个位置。
@@ -4524,6 +4646,164 @@ mod tests {
             }
         }
         assert!(sim.organism(id).is_none(), "搁浅的鱼应当饿死");
+    }
+
+    // -----------------------------------------------------------------------
+    // 陆地：从"开关"改成"成本"（v0.31）
+    // -----------------------------------------------------------------------
+
+    /// 水占比 → 光合折扣的斜坡。
+    #[test]
+    fn photosynthesis_ramps_with_water_coverage() {
+        assert_eq!(dampness(0.0), 0.0, "干透的格子不该有任何产出");
+        assert_eq!(dampness(DRY_MIN), 0.0, "门槛上仍然是零");
+        assert!(
+            (dampness(0.2) - 0.5).abs() < 1e-6,
+            "半湿应当在中间，实测 {}",
+            dampness(0.2)
+        );
+        assert_eq!(dampness(SUBMERGED_MIN), 1.0, "到 SUBMERGED_MIN 应当满产");
+        assert_eq!(dampness(0.9), 1.0, "泡在水里不该有额外加成");
+    }
+
+    /// 水占比按**列**数，不按格数。
+    #[test]
+    fn water_coverage_counts_columns_not_cells() {
+        let w = pool(); // 水面 30
+        let width = 8;
+
+        // 整具身体在水下。
+        let under: Vec<(i32, i32)> = vec![(20, 33), (21, 33), (20, 32), (21, 32)];
+        assert_eq!(LifeSim::submerged_frac(&w, width, &under), 1.0);
+        assert!(LifeSim::touches_water(&w, width, &under));
+
+        // 一列露头：x=20 的头顶在 30（水面那一行被身体借走了，向上扫是空气），
+        // x=21 还在水下。
+        let half: Vec<(i32, i32)> = vec![(20, 30), (21, 31), (20, 31)];
+        let f = LifeSim::submerged_frac(&w, width, &half);
+        assert!((f - 0.5).abs() < 1e-6, "两列里一列在水下，实测 {f}");
+        assert!(
+            !LifeSim::touches_water(&w, width, &half),
+            "有一列露头就不该算'整具都在水下'"
+        );
+
+        // 全在空气里。
+        let air: Vec<(i32, i32)> = vec![(20, 10), (21, 10)];
+        assert_eq!(LifeSim::submerged_frac(&w, width, &air), 0.0);
+        assert!(!LifeSim::touches_water(&w, width, &air));
+    }
+
+    /// **v0.31 的核心行为变化**：半露出水面的身体**能游**，只是更贵。
+    ///
+    /// 旧代码在这里直接 `return false`（"身体不能整个离开水"那条硬判据），
+    /// 于是"上岸"在物理上是不可能的——而陆地演化需要的是"很贵但可行"。
+    #[test]
+    fn a_body_with_its_head_out_can_still_swim_but_it_costs_more() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // anchor y=31：x=0 那列头顶在 30（露出来了），x=1 那列还在水下。
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((20, 31), Genome::blank(), 5_000),
+            )
+            .unwrap();
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+        let base = sim.organisms[i].move_cost();
+        let before = sim.organisms[i].energy;
+
+        assert!(
+            sim.try_move(&mut w, i, 1, 0, MoveKind::Swim),
+            "半露出水面的身体应当还能游——旧的硬判据在这里会返回 false"
+        );
+        let spent = before - sim.organisms[i].energy;
+        assert!(
+            spent > base,
+            "上岸走一步应当比在水里贵：付了 {spent}，水里是 {base}"
+        );
+        // 一半的列在水下 → 加价 (1 + LAND_COST × 0.5) 倍。
+        let want = (base as f32 * (1.0 + LAND_COST * 0.5)) as u32;
+        assert_eq!(spent, want, "加价幅度不对");
+    }
+
+    /// 站在陆地上要付**支撑成本**，按质量 × 露出比例算。
+    ///
+    /// 这一项和移动加价是两件事：那是"走一步多贵"，这是"站着不动也要付"。
+    /// 只有前者的话，一条上岸的鱼可以一动不动地待着，搁浅于是变成一种
+    /// 可行的休眠策略。
+    #[test]
+    fn standing_on_land_costs_extra_upkeep_per_unit_mass() {
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 抽干水面以上的一切：石头从 y=60 开始，于是 0..60 是一整块陆地。
+        w.fill_rect(0, 0, 64, 60, MaterialKind::Empty);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((20, 55), Genome::blank(), 5_000),
+            )
+            .unwrap();
+        // 先让它掉到石头上（下落不花钱，所以能量在这一段不动）。
+        for _ in 0..20 {
+            sim.step(&mut w);
+        }
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+        let before = sim.organisms[i].energy;
+        let upkeep = sim.organisms[i].upkeep();
+        let mass = sim.organisms[i].mass();
+        assert!(mass > 0, "这条测试要求身体有质量");
+
+        sim.step(&mut w);
+
+        let spent = before - sim.organism(id).unwrap().energy;
+        let land = (mass as f32 * LAND_UPKEEP) as u32;
+        assert!(land > 0, "3 格身体应当有非零的支撑成本");
+        assert_eq!(
+            spent,
+            upkeep + land,
+            "陆地支撑成本没算进去：付了 {spent}，维持成本 {upkeep}，陆地应当再加 {land}"
+        );
+    }
+
+    /// 上岸能活多久：**身体越大，死得越快**。
+    ///
+    /// 这是 M5 的验收数字。判据不是"某条鱼死了"——那什么都说明不了，
+    /// 因为搁浅的鱼本来就会饿死。判据是**大身体比小身体死得更快**：
+    /// 那才说明 `mass` 项真的在起作用，而不是所有体型一视同仁地饿死。
+    #[test]
+    fn a_bigger_body_dies_faster_on_dry_land() {
+        fn survival(cells: i16) -> u32 {
+            let mut w = pool();
+            // 抽干水面以上：石头从 y=60 开始，于是 0..60 是一整块干陆地。
+            w.fill_rect(0, 0, 64, 60, MaterialKind::Empty);
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            let body: Vec<Cell> = (0..cells)
+                .map(|i| Cell::new(CellType::Mover, (i, 0)))
+                .collect();
+            let mut org = Organism::new(0, (20, 50), body, Genome::blank());
+            org.energy = 3_000;
+            let id = sim.spawn_injected(&mut w, org).unwrap();
+            let mut ticks = 0;
+            while sim.organism(id).is_some() && ticks < 2_000 {
+                sim.step(&mut w);
+                ticks += 1;
+            }
+            ticks
+        }
+
+        let small = survival(3);
+        let big = survival(12);
+        assert!(
+            small < 2_000 && big < 2_000,
+            "两者都该饿死：小 {small} tick、大 {big} tick"
+        );
+        assert!(
+            big < small,
+            "大身体上岸该更贵：小 {small} tick、大 {big} tick"
+        );
     }
 
     // -----------------------------------------------------------------------

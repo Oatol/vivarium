@@ -877,9 +877,12 @@ fn inspector(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     );
                     widgets::stat_row(ui, "代数", &snap.generation.to_string(), theme::TEXT);
                     widgets::stat_row(ui, "食物", &format!("{} 格", snap.food), theme::ACCENT);
+                    // "飘着"改成"离水"：v0.31 之后这个数不再只是"飘在天上"，
+                    // 它也包含搁在干地上的个体——两者在数值上是同一件事
+                    // （一格水都够不到），而"离水"把两件事都说到了。
                     widgets::stat_row(
                         ui,
-                        "飘着",
+                        "离水",
                         &snap.stranded.to_string(),
                         if snap.stranded * 2 > snap.organisms.max(1) {
                             theme::WARN
