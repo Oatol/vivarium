@@ -153,7 +153,7 @@ fn take_u64(it: &mut impl Iterator<Item = String>, flag: &str) -> Result<u64, St
 // ---------------------------------------------------------------------------
 //
 // 地貌生成在 `vivarium_core::worldgen`（SPEC 第 2.0 节：横板侧视、
-// 重力向下、海洋 + 岛屿）。这里只负责调用，不负责实现——
+// 重力向下、海岸线 + 浅海）。这里只负责调用，不负责实现——
 // 早先 sim / game / 渲染预览各有一份副本，已经开始漂移了。
 
 /// 材质的中文短名。仅用于控制台报告。
@@ -319,7 +319,7 @@ fn main() -> ExitCode {
             args.width, args.height, args.seed, args.ticks
         );
         println!(
-            "地貌：横板侧视 · 海洋 + 岛屿 · 水面线 y={} · 海床线 y={} · 陆地 {} 列",
+            "地貌：横板侧视 · 海岸线 + 浅海 · 水面线 y={} · 最深 y={} · 陆地 {} 列",
             layout.waterline,
             layout.seabed,
             layout.land_columns()
