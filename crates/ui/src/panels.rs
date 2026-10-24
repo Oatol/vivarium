@@ -805,6 +805,7 @@ fn cell_label(kind: CellType) -> &'static str {
         CellType::Killer => "杀",
         CellType::Armor => "装",
         CellType::Builder => "造",
+        CellType::Root => "根",
     }
 }
 

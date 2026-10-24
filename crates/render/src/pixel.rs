@@ -358,6 +358,40 @@ impl PixelUploader {
         self.height
     }
 
+    /// 这一块实际有多少**列**（残块小于 `CHUNK_SIZE`）。
+    ///
+    /// ## 为什么必须夹
+    ///
+    /// `chunk_cols` / `chunk_rows` 是 `div_ceil`，所以最后一块可能只覆盖
+    /// 世界的一部分。而下面两个循环原来写的是 `0..CHUNK_SIZE`——于是
+    /// **只要世界的宽或高不是 64 的倍数，它就会读到世界外面**。
+    ///
+    /// 这不是理论问题：预设里的"大 768×728"（728 不是 64 的倍数）
+    /// 一点就 panic（`index out of bounds: the len is 559104 but the index
+    /// is 559104`——那正好是第 728 行的第一格）。而滑块的取值范围
+    /// （宽 20..600、高 20..450）里**绝大多数尺寸都踩这条**，
+    /// 只是 256 / 512 恰好是 64 的倍数，所以一直没被发现。
+    #[inline]
+    pub const fn chunk_w(&self, cx: usize) -> usize {
+        let rest = self.width - cx * CHUNK_SIZE;
+        if rest < CHUNK_SIZE {
+            rest
+        } else {
+            CHUNK_SIZE
+        }
+    }
+
+    /// 这一块实际有多少**行**。见 [`Self::chunk_w`]。
+    #[inline]
+    pub const fn chunk_h(&self, cy: usize) -> usize {
+        let rest = self.height - cy * CHUNK_SIZE;
+        if rest < CHUNK_SIZE {
+            rest
+        } else {
+            CHUNK_SIZE
+        }
+    }
+
     /// 分块列数。
     pub const fn chunk_cols(&self) -> usize {
         self.chunk_cols
@@ -403,9 +437,9 @@ impl PixelUploader {
     fn chunk_changed(&self, world: &World, cx: usize, cy: usize) -> bool {
         let cells = world.cells();
         let owners = world.owners();
-        for row in 0..CHUNK_SIZE {
+        for row in 0..self.chunk_h(cy) {
             let base = (cy * CHUNK_SIZE + row) * self.width + cx * CHUNK_SIZE;
-            for col in 0..CHUNK_SIZE {
+            for col in 0..self.chunk_w(cx) {
                 let i = base + col;
                 if self.shadow[i] != visual_key(cells, owners, i) {
                     return true;
@@ -431,10 +465,14 @@ impl PixelUploader {
     pub fn build_chunk(&mut self, world: &World, cx: usize, cy: usize) -> &[u8] {
         let cells = world.cells();
         let owners = world.owners();
-        let mut out = 0usize;
-        for row in 0..CHUNK_SIZE {
+        let (cw, ch) = (self.chunk_w(cx), self.chunk_h(cy));
+        for row in 0..ch {
+            // 行距**永远是** `CHUNK_SIZE`（也就是 256 字节），哪怕这一块只有
+            // 40 列——`write_texture` 要求 `bytes_per_row` 是 256 的倍数，
+            // 而 `extent.width` 才是"真正拷多少列"。两者不能混用。
+            let mut out = row * CHUNK_SIZE * 4;
             let base = (cy * CHUNK_SIZE + row) * self.width + cx * CHUNK_SIZE;
-            for col in 0..CHUNK_SIZE {
+            for col in 0..cw {
                 let i = base + col;
                 // 上传的是**语义键**，不是颜色。颜色、形状、膜的轮廓光
                 // 全在 shader 里算——一格一像素的纹理画不出圆，
@@ -828,8 +866,10 @@ impl Blitter {
                 if !uploader.is_dirty_chunk(cx, cy) {
                     continue;
                 }
+                // 尺寸要在 `build_chunk` **之前**取：它可变借用 uploader。
+                let (cw, ch) = (uploader.chunk_w(cx), uploader.chunk_h(cy));
                 let pixels = uploader.build_chunk(world, cx, cy);
-                write_chunk(&self.queue, texture, cx, cy, pixels);
+                write_chunk(&self.queue, texture, cx, cy, cw, ch, pixels);
             }
         }
 
@@ -922,7 +962,21 @@ fn field_dims(world: &World) -> (u32, u32) {
 ///
 /// 独立成自由函数是为了让它不借用 `Blitter`——`upload` 里 uploader 已经
 /// 可变借走了，再来一个 `&mut self` 就打架了。
-fn write_chunk(queue: &wgpu::Queue, texture: &wgpu::Texture, cx: usize, cy: usize, pixels: &[u8]) {
+/// `w` / `h` 是这一块**实际**覆盖的格数（残块小于 `CHUNK_SIZE`）。
+///
+/// 拷一个完整的 64×64 到世界边缘会**越界**：纹理只有世界那么大，
+/// 而 `origin` 是块的原点。`extent` 才是"拷多少"，`bytes_per_row` /
+/// `rows_per_image` 只是缓冲区布局，两者必须分开。
+#[allow(clippy::too_many_arguments)]
+fn write_chunk(
+    queue: &wgpu::Queue,
+    texture: &wgpu::Texture,
+    cx: usize,
+    cy: usize,
+    w: usize,
+    h: usize,
+    pixels: &[u8],
+) {
     queue.write_texture(
         wgpu::TexelCopyTextureInfo {
             texture,
@@ -941,8 +995,8 @@ fn write_chunk(queue: &wgpu::Queue, texture: &wgpu::Texture, cx: usize, cy: usiz
             rows_per_image: Some(CHUNK_SIZE as u32),
         },
         wgpu::Extent3d {
-            width: CHUNK_SIZE as u32,
-            height: CHUNK_SIZE as u32,
+            width: w as u32,
+            height: h as u32,
             depth_or_array_layers: 1,
         },
     );
@@ -1636,6 +1690,59 @@ mod tests {
         }
         assert!(!w.set(5, 5, MaterialKind::Empty)); // 本来就是 Empty
         assert_eq!(u.prepare(&w), 0);
+    }
+
+    /// **残块（世界尺寸不是 64 的倍数）不能读到世界外面。**
+    ///
+    /// 这条是被一次真实的闪退逼出来的：预设"大 768×728"一点就
+    /// `index out of bounds: the len is 559104 but the index is 559104`
+    /// ——那正好是第 728 行第一格（728 × 768 = 559104），也就是世界末尾
+    /// 的**下一个**位置。`chunk_rows` 是 `div_ceil`，最后一块覆盖
+    /// 704..768，而世界只有 728 行。
+    ///
+    /// 用 67×70 而不是 600×450：三个残块方向（宽残、高残、都残）都要踩到，
+    /// 而数字小到能一眼算出边界。
+    #[test]
+    fn a_non_aligned_world_does_not_read_past_the_end() {
+        for (w, h) in [(67usize, 70usize), (70, 67), (130, 66), (600, 450)] {
+            let world = World::new(w, h).unwrap();
+            let mut u = PixelUploader::new(&world);
+            assert_eq!(u.chunk_cols(), w.div_ceil(CHUNK_SIZE));
+            assert_eq!(u.chunk_rows(), h.div_ceil(CHUNK_SIZE));
+
+            // 首帧全脏，逐个块生成一遍——这就是崩溃的那条路径。
+            assert_eq!(u.prepare(&world), u.chunk_cols() * u.chunk_rows());
+            for cy in 0..u.chunk_rows() {
+                for cx in 0..u.chunk_cols() {
+                    let (cw, ch) = (u.chunk_w(cx), u.chunk_h(cy));
+                    assert!((1..=CHUNK_SIZE).contains(&cw), "{w}×{h} 块宽 {cw}");
+                    assert!((1..=CHUNK_SIZE).contains(&ch), "{w}×{h} 块高 {ch}");
+                    u.build_chunk(&world, cx, cy);
+                }
+            }
+            // 影子副本被**全部**格子刷新过，所以再来一次是 0 脏块。
+            // 少刷一格的话这里会一直脏下去，而画面完全看不出来。
+            assert_eq!(u.prepare(&world), 0, "{w}×{h} 上传之后应当没有脏块");
+        }
+    }
+
+    /// 残块的一行仍然占满 256 字节（`bytes_per_row` 的硬要求），
+    /// 但只有前 `chunk_w` 格是有效内容。
+    #[test]
+    fn a_partial_chunk_keeps_the_row_stride() {
+        let mut w = World::new(67, 70).unwrap();
+        // 最后一列（x=66）放一格火，看它落在残块的第 2 列。
+        w.set(66, 69, MaterialKind::Fire);
+        let mut u = PixelUploader::new(&w);
+
+        let (cx, cy) = (1, 1);
+        assert_eq!((u.chunk_w(cx), u.chunk_h(cy)), (3, 6));
+        let pixels = u.build_chunk(&w, cx, cy).to_vec();
+        assert_eq!(pixels.len(), PixelUploader::chunk_byte_len());
+
+        // 块内第 5 行第 2 列（世界 69, 66）——行距必须是 CHUNK_SIZE。
+        let off = (5 * CHUNK_SIZE + 2) * 4;
+        assert_eq!(key_at(&pixels, off), MaterialKind::Fire.as_u8() as u32);
     }
 
     #[test]

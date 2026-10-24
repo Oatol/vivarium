@@ -1835,7 +1835,7 @@ mod tests {
         }
         assert_eq!(
             w.hash(),
-            0xdc1b_143b_2e69_dcfd,
+            0x52ba_3a1c_07a5_fc3d,
             "扫描顺序或规则变了：种子 7 的 128² 世界在 200 tick 后不再是原来那个"
         );
         assert_eq!(w.dirty_chunk_count(), 0, "这个世界应当已经塌稳");

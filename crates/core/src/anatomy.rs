@@ -331,6 +331,7 @@ fn glyph(k: CellType) -> u8 {
         CellType::Killer => b'S',
         CellType::Armor => b'A',
         CellType::Builder => b'B',
+        CellType::Root => b'R',
     }
 }
 
@@ -343,6 +344,7 @@ fn cell_name(k: CellType) -> &'static str {
         CellType::Killer => "杀手",
         CellType::Armor => "装甲",
         CellType::Builder => "建造",
+        CellType::Root => "根",
     }
 }
 

@@ -214,8 +214,11 @@ fn new_section(ui: &mut Ui, state: &mut UiState, now: f64) {
             )
             .clicked()
             {
-                state.world.width = pw;
-                state.world.height = ph;
+                // **预设也要夹。** 它和滑块是两条独立的赋值路径，而
+                // "尺寸合法"不能只靠其中一条守住——早先"大 768×728"就是
+                // 从这个口子把 728 塞进去的，后果是点一下闪退。
+                state.world.width = pw.clamp(MIN_SIDE, MAX_WIDTH);
+                state.world.height = ph.clamp(MIN_SIDE, MAX_HEIGHT);
             }
         }
     });

@@ -148,7 +148,7 @@ fn cell_picker(ui: &mut Ui, state: &mut UiState) {
                 ui,
                 Color32::from_rgb(r, g, b),
                 cell_label(kind),
-                Some(cell_hint(kind)),
+                Some(kind.describe()),
                 selected,
             )
             .clicked()
@@ -656,18 +656,6 @@ fn cell_label(kind: CellType) -> &'static str {
         CellType::Killer => "杀手",
         CellType::Armor => "装甲",
         CellType::Builder => "建造",
-    }
-}
-
-/// 悬停提示：这个细胞在收支上是什么。
-fn cell_hint(kind: CellType) -> &'static str {
-    match kind {
-        CellType::Mouth => "吃东西。没有嘴就吃不了任何东西。",
-        CellType::Producer => "在浅水里按光照产能。主要的收入来源。",
-        CellType::Mover => "每 4 格让每 tick 多走一格。跑得快更烧钱。",
-        CellType::Eye => "每 1 只让嗅觉射线长 4 格。",
-        CellType::Killer => "咬邻格的别的生物，能量从对方身上转移过来。",
-        CellType::Armor => "每格挡掉 8 点咬击伤害。",
-        CellType::Builder => "预留：修复相邻细胞。现在只是配重。",
+        CellType::Root => "根",
     }
 }

@@ -138,11 +138,21 @@ pub enum CellType {
     Armor,
     /// 构造器：把材质转成结构（M3）。
     Builder,
+    /// 根：贴着水就把整株的含水量补满，并让岸上的光合按**根系厚度**跑。
+    ///
+    /// v0.37 起 `ROOT` 位就已经存在（`organelles` 里能画出来），
+    /// 但它没有自己的 `CellType`——于是**预设调色板里没有它**，
+    /// 玩家只能在细胞器面板里一格一格点出来。
+    ///
+    /// 现在它是一个正常的一等细胞：底部调色板有它、工坊预设里有它、
+    /// 悬停说明里有它。**"能用"和"找得到"是两件事**，
+    /// 而一个只有老玩家知道怎么拼的细胞，等于半成品。
+    Root,
 }
 
 impl CellType {
     /// 类型总数。
-    pub const COUNT: usize = 7;
+    pub const COUNT: usize = 8;
 
     /// 一句话描述：它**能换到什么**，以及**代价是什么**。
     ///
@@ -160,6 +170,7 @@ impl CellType {
             Self::Killer => "杀手。咬邻格的别的生物，能量从对方身上**转移**过来。有装甲的话会被挡掉一部分。维持 3/tick。",
             Self::Armor => "装甲。每格挡掉 8 点咬击。只对杀手有用——没有捕食者的世界里它纯粹是配重。维持 1/tick。",
             Self::Builder => "建造。让**整个身体**的维持成本每格乘 0.8（最多降到一半）。身体越大越划算，3 格的小鱼带它是亏的。维持 6/tick。",
+            Self::Root => "根。四邻有水就把整株的含水量补满，并让岸上的光合按**根系厚度**跑——每多一格根 +0.08，五格封顶 0.60。没有它，植物一出水就断电。维持 1/tick。",
         }
     }
 
@@ -172,6 +183,7 @@ impl CellType {
         Self::Killer,
         Self::Armor,
         Self::Builder,
+        Self::Root,
     ];
 
     /// 稳定的字节表示。存档与哈希都靠它。
@@ -193,6 +205,7 @@ impl CellType {
             4 => Self::Killer,
             5 => Self::Armor,
             6 => Self::Builder,
+            7 => Self::Root,
             _ => Self::Mouth,
         }
     }
@@ -212,6 +225,10 @@ impl CellType {
             Self::Killer => 3,
             Self::Armor => 1,
             Self::Builder => 6,
+            // 根和眼、装甲一个价：它不产出，只买"离水之后还能撑多久"。
+            // 贵了就没人长（岸上本来就没有收益），而那正是 v0.37 之前
+            // 一株带根植物都没出现的原因之一。
+            Self::Root => 1,
         }
     }
 
@@ -236,6 +253,7 @@ impl CellType {
             Self::Killer => 'K',
             Self::Armor => 'A',
             Self::Builder => 'B',
+            Self::Root => 'R',
         }
     }
 }

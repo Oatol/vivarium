@@ -155,6 +155,31 @@ mod tests {
     use vivarium_core::organelle::{Organelles, GAS};
     use vivarium_core::{CellType, MaterialKind, ViewMode};
 
+    /// **每个预设都必须是合法尺寸。**
+    ///
+    /// 预设走的是和滑块**不同**的一条赋值路径（直接写 `state.world.width`），
+    /// 所以滑块上的 `clamp` 守不住它。早先"大 768×728"就是从这儿把 728
+    /// 塞进去的，而 `MAX_HEIGHT` 是 450——点一下闪退（渲染层读到世界外面）。
+    ///
+    /// 这条测试便宜得很，而它挡住的是一整类"新加一个预设就崩一次"。
+    #[test]
+    fn presets_are_within_the_limits() {
+        for (label, w, h) in crate::state::PRESETS {
+            assert!(
+                (crate::state::MIN_SIDE..=crate::state::MAX_WIDTH).contains(&w),
+                "预设「{label}」的宽 {w} 越界（{}..={}）",
+                crate::state::MIN_SIDE,
+                crate::state::MAX_WIDTH
+            );
+            assert!(
+                (crate::state::MIN_SIDE..=crate::state::MAX_HEIGHT).contains(&h),
+                "预设「{label}」的高 {h} 越界（{}..={}）",
+                crate::state::MIN_SIDE,
+                crate::state::MAX_HEIGHT
+            );
+        }
+    }
+
     fn screen() -> egui::RawInput {
         egui::RawInput {
             screen_rect: Some(egui::Rect::from_min_size(

@@ -73,6 +73,9 @@ pub const fn cell_rgb(kind: CellType) -> [u8; 3] {
         CellType::Armor => [128, 152, 176],
         // 建造：琥珀。和沙同色系，因为它处理的就是材质。
         CellType::Builder => [196, 152, 72],
+        // 根：深棕。和建造的琥珀同色系但暗得多——两者都是"结构"类细胞，
+        // 而根是埋在土里那一半，本来就不该抢眼。
+        CellType::Root => [140, 96, 60],
     }
 }
 

@@ -287,6 +287,7 @@ impl Organelles {
             CellType::Killer => Self(1 << STING_SHIFT),
             CellType::Armor => Self(ARMOR),
             CellType::Builder => Self(BUILDER),
+            CellType::Root => Self(ROOT),
         };
         // 线粒体默认打开——"默认所有细胞都带一个"。
         Self(base.0 | MITO)
@@ -315,6 +316,11 @@ impl Organelles {
             CellType::Eye
         } else if self.has(BUILDER) {
             CellType::Builder
+        } else if self.has(ROOT) {
+            // 根排在**最后**：一格"叶绿体 + 根"该画成绿色（它的主功能是产能），
+            // 而纯根细胞才画成棕色。判据是"有没有更抢眼的功能"，
+            // 和上面那一串同一条规则。
+            CellType::Root
         } else {
             CellType::Mouth
         }
