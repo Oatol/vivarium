@@ -12,13 +12,13 @@ use std::collections::HashSet;
 
 use vivarium_core::anatomy::{interpret, sensitivity};
 use vivarium_core::body::PLANS;
-use vivarium_core::grn::Grn;
+use vivarium_core::morph::Body;
 use vivarium_core::life::Genome;
 use vivarium_core::rng::Rng;
 
 fn genome_of(plan: &vivarium_core::body::BodyPlan) -> Genome {
     let mut g = Genome::blank();
-    g.grn = Grn::from_plan(plan).expect("体型应当能转成规则表");
+    g.body = Body::from_plan(plan);
     g
 }
 
@@ -27,7 +27,7 @@ fn mutated(edits: usize, seed: u64) -> Genome {
     let mut rng = Rng::new(seed);
     let mut g = genome_of(&vivarium_core::body::SILVERFISH);
     for _ in 0..edits {
-        g.grn.mutate(&mut rng, 1);
+        g.body.mutate(&mut rng, 1);
     }
     g
 }

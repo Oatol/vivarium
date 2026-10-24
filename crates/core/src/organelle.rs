@@ -110,8 +110,13 @@ impl Organelles {
     /// 越界（存了个 3）会被夹到 2——存档被改坏时宁可退化成一个合法的身体，
     /// 也不要让一次读档变成 panic。
     #[inline]
-    pub fn level(self, shift: u32) -> u8 {
-        (((self.0 >> shift) & 0b11) as u8).min(MAX_LEVEL)
+    pub const fn level(self, shift: u32) -> u8 {
+        let v = ((self.0 >> shift) & 0b11) as u8;
+        if v > MAX_LEVEL {
+            MAX_LEVEL
+        } else {
+            v
+        }
     }
 
     /// 设置等级，返回新值。越界的等级被夹到 `MAX_LEVEL`。
@@ -274,7 +279,7 @@ impl Organelles {
     ///
     /// 只有气囊 / 线粒体的细胞会落到兜底分支——它没有代表类型，
     /// 兜底返回 `Mouth` 只为了不让调用方拿到 `Option`。
-    pub fn primary_cell_type(self) -> CellType {
+    pub const fn primary_cell_type(self) -> CellType {
         if self.level(STING_SHIFT) > 0 {
             CellType::Killer
         } else if self.has(DIGEST) {

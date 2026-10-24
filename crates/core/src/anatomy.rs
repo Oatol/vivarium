@@ -94,7 +94,7 @@ pub struct Sensitivity {
 /// **确定性**：同一个基因组必然给出同一份 [`Anatomy`]——这里不掷任何骰子，
 /// 随机数只在 [`sensitivity`] 里用，而且它不改基因组。
 pub fn interpret(genome: &Genome) -> Anatomy {
-    let mut cells = genome.grn.develop();
+    let mut cells = genome.body.develop();
     // 排序让输出稳定：`develop` 是 BFS 顺序，同一层里取决于方向枚举顺序，
     // 拿它直接画图会得到"看起来随机"的行列。
     cells.sort_by_key(|c| (c.offset.1, c.offset.0));
@@ -264,7 +264,7 @@ pub fn sensitivity(genome: &Genome, rng: &mut Rng, trials: usize, samples: usize
     let base = interpret(genome);
     let base_sig = signature(&base);
     let total = base.cells.len().max(1);
-    if total == 0 {
+    if total == 0 || samples == 0 {
         return Sensitivity {
             per_slot: Vec::new(),
             mean_reach: 0.0,
@@ -272,44 +272,23 @@ pub fn sensitivity(genome: &Genome, rng: &mut Rng, trials: usize, samples: usize
         };
     }
 
-    let mut slots = genome.grn.open_slots();
-    // 再掺一些空槽：它们的 reach 应该是 0，正好当"无效变异"的对照。
-    for _ in 0..samples / 4 {
-        slots.push((
-            rng.gen_range_usize(0, crate::grn::MAX_DEPTH),
-            rng.gen_range_usize(0, CellType::COUNT),
-            rng.gen_range_usize(0, crate::grn::NO_PARENT + 1),
-            rng.gen_range_usize(0, 4),
-        ));
-    }
-    if slots.is_empty() {
-        return Sensitivity {
-            per_slot: Vec::new(),
-            mean_reach: 0.0,
-            spread: 0.0,
-        };
-    }
-    // 均匀抽 `samples` 个（有放回，重复的会自然拉低方差，可接受）。
-    let picked: Vec<_> = (0..samples)
-        .map(|_| slots[rng.gen_range_usize(0, slots.len())])
-        .collect();
-
+    // 对每一次"随机变异一次"，量它动了多少格。
+    //
+    // **这和"每一个基因位点"不是同一个东西**：`Body` 的变异算子是随机挑
+    // 位置、随机挑种类的，所以这里量的是"一次典型变异的影响范围"，
+    // 而 `Grn` 时代量的是"某个具体规则槽的影响范围"。
+    // 前者更接近"可演化性"真正关心的东西——进化不知道自己要动哪个槽。
     let mut per_slot = Vec::new();
-    for (depth, kind, from, d) in picked {
+    for i in 0..samples {
         let mut sum = 0usize;
         for _ in 0..trials {
             let mut g = genome.clone();
-            // 微扰：30% 概率清空这个槽，70% 换一个随机类型。
-            g.grn.rules[depth][kind][from][d] = if rng.next_f32() < 0.3 {
-                None
-            } else {
-                Some(random_kind(rng))
-            };
+            g.body.mutate(rng, 1);
             let a = interpret(&g);
             sum += diff_count(&base_sig, &signature(&a));
         }
         per_slot.push(SlotReach {
-            name: format!("rules[{depth}][{kind}][{from}][{d}]"),
+            name: format!("mutate #{i}"),
             reach: sum as f32 / (trials.max(1) as f32 * total as f32),
         });
     }
@@ -365,10 +344,6 @@ fn cell_name(k: CellType) -> &'static str {
         CellType::Armor => "装甲",
         CellType::Builder => "建造",
     }
-}
-
-fn random_kind(rng: &mut Rng) -> CellType {
-    CellType::ALL[rng.gen_range_usize(0, CellType::COUNT)]
 }
 
 fn bounds_of(cells: &[Cell]) -> (i16, i16, i16, i16) {
@@ -443,11 +418,10 @@ fn diff_count(a: &[(i16, i16, u8)], b: &[(i16, i16, u8)]) -> usize {
 mod tests {
     use super::*;
     use crate::body::PLANS;
-    use crate::grn::Grn;
 
     fn from_plan(plan: &crate::body::BodyPlan) -> Genome {
         let mut g = Genome::blank();
-        g.grn = Grn::from_plan(plan).expect("体型应当能转成规则表");
+        g.body = crate::morph::Body::from_plan(plan);
         g
     }
 

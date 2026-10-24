@@ -22,7 +22,7 @@ use egui::{
     Align, Color32, CornerRadius, FontId, Layout, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
-use vivarium_core::{grn::MAX_BODY_CELLS, palette, CellType};
+use vivarium_core::{morph::MAX_BODY_CELLS, palette, CellType};
 
 use crate::state::{Snapshot, UiState, DRAFT_SIZE};
 use crate::theme;

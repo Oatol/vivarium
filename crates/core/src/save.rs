@@ -78,8 +78,8 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 use crate::field::LightSource;
-use crate::grn::{Grn, RuleTable, MAX_BODY_CELLS, MAX_DEPTH, NO_PARENT};
-use crate::life::{Cell, CellType, Facing, Genome, Organism, OrganismId, ENERGY_HIST, INPUTS, OUTPUTS};
+use crate::morph::MAX_BODY_CELLS;
+use crate::life::{Cell, Facing, Genome, Organism, OrganismId, ENERGY_HIST, INPUTS, OUTPUTS};
 use crate::life_sim::{EnergyLedger, LifeSim};
 use crate::material::MaterialKind;
 use crate::organelle::Organelles;
@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 2;
+pub const VERSION: u16 = 3;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -293,56 +293,49 @@ fn put_genome(out: &mut Out, g: &Genome) {
     for w in &g.weights {
         out.f32(*w);
     }
-    out.u8(g.grn.root.as_u8());
-    out.u8(g.grn.max_cells);
-    put_rules(out, &g.grn.rules);
+    put_body(out, &g.body);
 }
 
-/// 形态发生规则表：游程编码。
+/// 写身体描述：`max_cells` + `Segment` 树（前序）+ 梯度规则。
 ///
-/// 一张表是 `16 代 × 7 类 × 5 极性 × 4 方向 = 2240` 格，而一条真实的鱼
-/// 只用到其中十几格。逐格写就是每条鱼 2 KB、1552 条鱼 3 MB；
-/// 游程之后通常是几十字节。
-fn put_rules(out: &mut Out, rules: &RuleTable) {
-    let mut flat: Vec<u8> = Vec::with_capacity(MAX_DEPTH * CellType::COUNT * (NO_PARENT + 1) * 4);
-    for gen in rules.iter() {
-        for by_mother in gen.iter() {
-            for by_polarity in by_mother.iter() {
-                for slot in by_polarity.iter() {
-                    // 0 表示"这里不长"，否则存 `类型 + 1`。
-                    flat.push(match slot {
-                        Some(k) => k.as_u8() + 1,
-                        None => 0,
-                    });
-                }
-            }
-        }
+/// ## 为什么前序而不是层序
+///
+/// 前序可以在**读到一半就知道下一个是什么**：读一个段、再读它的子段、
+/// 子段读完才回来读兄弟。层序要额外存"这一层有几个"，而段树本来就只有
+/// 几个节点（深度 ≤ 3、每段子节点 ≤ 3），多存一个计数字段纯属浪费。
+///
+/// ## 为什么不用 RLE
+///
+/// 旧的规则表是 `16 × 7 × 5 × 4 = 2240` 格，绝大多数是空的，所以要 RLE。
+/// `Body` 的"基因"只有几十个数（段的参数 + 每格的细胞器位 + 几条梯度带），
+/// 逐格写就是几十字节——**RLE 的收益还不如它自己的头部开销**。
+fn put_body(out: &mut Out, body: &crate::morph::Body) {
+    out.u8(body.max_cells);
+    put_segment(out, &body.trunk);
+    out.u16(body.gradient.bands.len() as u16);
+    for band in &body.gradient.bands {
+        out.f32(band.along.0);
+        out.f32(band.along.1);
+        out.f32(band.from_edge.0);
+        out.f32(band.from_edge.1);
+        out.u16(band.set);
+        out.u16(band.clear);
     }
-    put_rle_u8(out, &flat);
 }
 
-fn put_rle_u8(out: &mut Out, bytes: &[u8]) {
-    let mut runs = 0u32;
-    let mut i = 0;
-    while i < bytes.len() {
-        let mut j = i + 1;
-        while j < bytes.len() && bytes[j] == bytes[i] && j - i < u16::MAX as usize {
-            j += 1;
-        }
-        runs += 1;
-        i = j;
+fn put_segment(out: &mut Out, seg: &crate::morph::Segment) {
+    out.u8(seg.axis);
+    out.u8(seg.repeat);
+    out.u8(u8::from(seg.mirror));
+    out.u16(seg.cells.len() as u16);
+    for c in &seg.cells {
+        out.i16(c.offset.0);
+        out.i16(c.offset.1);
+        out.u16(c.base);
     }
-    out.u32(bytes.len() as u32);
-    out.u32(runs);
-    let mut i = 0;
-    while i < bytes.len() {
-        let mut j = i + 1;
-        while j < bytes.len() && bytes[j] == bytes[i] && j - i < u16::MAX as usize {
-            j += 1;
-        }
-        out.u16((j - i) as u16);
-        out.u8(bytes[i]);
-        i = j;
+    out.u8(seg.children.len() as u8);
+    for child in &seg.children {
+        put_segment(out, child);
     }
 }
 
@@ -518,29 +511,6 @@ fn read_materials(r: &mut In<'_>, total: usize) -> Result<Vec<MaterialCell>, Sav
     Ok(cells)
 }
 
-fn read_rle_u8(r: &mut In<'_>) -> Result<Vec<u8>, SaveError> {
-    let total = r.u32()? as usize;
-    let runs = r.u32()? as usize;
-    // 上限保护：一个坏档可以把 `total` 写成 40 亿，直接 `with_capacity` 就是
-    // 一次 OOM。按"每段至少 1 字节"反推，段数不可能超过总长。
-    if runs > total.max(1) {
-        return Err(SaveError::Corrupt("游程数超过总长度"));
-    }
-    let mut out = Vec::with_capacity(total);
-    for _ in 0..runs {
-        let len = r.u16()? as usize;
-        let v = r.u8()?;
-        if out.len() + len > total {
-            return Err(SaveError::Corrupt("游程超出总长度"));
-        }
-        out.resize(out.len() + len, v);
-    }
-    if out.len() != total {
-        return Err(SaveError::Corrupt("游程没铺满总长度"));
-    }
-    Ok(out)
-}
-
 fn read_genome(r: &mut In<'_>) -> Result<Genome, SaveError> {
     let n = r.u16()? as usize;
     if n > crate::life::WEIGHT_COUNT {
@@ -550,45 +520,72 @@ fn read_genome(r: &mut In<'_>) -> Result<Genome, SaveError> {
     for w in weights.iter_mut().take(n) {
         *w = r.f32()?;
     }
-    let root = CellType::from_u8(r.u8()?);
+    let body = read_body(r)?;
+    Ok(Genome { weights, body })
+}
+
+fn read_body(r: &mut In<'_>) -> Result<crate::morph::Body, SaveError> {
     let max_cells = r.u8()?;
-    let flat = read_rle_u8(r)?;
-    let rules = unflatten_rules(&flat)?;
-    Ok(Genome {
-        weights,
-        grn: Grn {
-            root,
-            max_cells,
-            rules,
-        },
+    if max_cells == 0 || max_cells > crate::morph::MAX_BODY_CELLS {
+        return Err(SaveError::Corrupt("体型上限越界"));
+    }
+    let trunk = read_segment(r, 0)?;
+    let n = r.u16()? as usize;
+    if n > crate::morph::MAX_BANDS {
+        return Err(SaveError::Corrupt("梯度带太多"));
+    }
+    let mut bands = Vec::with_capacity(n);
+    for _ in 0..n {
+        bands.push(crate::morph::Band {
+            along: (r.f32()?, r.f32()?),
+            from_edge: (r.f32()?, r.f32()?),
+            set: r.u16()?,
+            clear: r.u16()?,
+        });
+    }
+    Ok(crate::morph::Body {
+        trunk,
+        gradient: crate::morph::Gradient { bands },
+        max_cells,
     })
 }
 
-fn unflatten_rules(flat: &[u8]) -> Result<RuleTable, SaveError> {
-    let per_gen = CellType::COUNT * (NO_PARENT + 1) * 4;
-    if flat.len() != per_gen * MAX_DEPTH {
-        return Err(SaveError::Corrupt("形态发生规则表长度不对"));
+fn read_segment(r: &mut In<'_>, depth: u8) -> Result<crate::morph::Segment, SaveError> {
+    if depth > crate::morph::MAX_SEGMENT_DEPTH {
+        return Err(SaveError::Corrupt("段嵌套过深"));
     }
-    let mut rules: RuleTable = Vec::with_capacity(MAX_DEPTH);
-    let mut i = 0;
-    for _ in 0..MAX_DEPTH {
-        let mut row = [[[None; 4]; NO_PARENT + 1]; CellType::COUNT];
-        for by_mother in row.iter_mut() {
-            for by_polarity in by_mother.iter_mut() {
-                for slot in by_polarity.iter_mut() {
-                    let v = flat[i];
-                    i += 1;
-                    *slot = if v == 0 {
-                        None
-                    } else {
-                        Some(CellType::from_u8(v - 1))
-                    };
-                }
-            }
-        }
-        rules.push(row);
+    let axis = r.u8()?;
+    if axis > 3 {
+        return Err(SaveError::Corrupt("主轴越界"));
     }
-    Ok(rules)
+    let repeat = r.u8()?;
+    let mirror = r.u8()? != 0;
+    let n = r.u16()? as usize;
+    if n > crate::morph::MAX_BODY_CELLS as usize {
+        return Err(SaveError::Corrupt("段内格数超过上限"));
+    }
+    let mut cells = Vec::with_capacity(n);
+    for _ in 0..n {
+        cells.push(crate::morph::BodyCell {
+            offset: (r.i16()?, r.i16()?),
+            base: r.u16()?,
+        });
+    }
+    let cn = r.u8()? as usize;
+    if cn > 3 {
+        return Err(SaveError::Corrupt("子段太多"));
+    }
+    let mut children = Vec::with_capacity(cn);
+    for _ in 0..cn {
+        children.push(read_segment(r, depth + 1)?);
+    }
+    Ok(crate::morph::Segment {
+        cells,
+        axis,
+        repeat,
+        mirror,
+        children,
+    })
 }
 
 fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError> {
@@ -931,9 +928,7 @@ mod tests {
                 assert_eq!(ca.wet, cb.wet, "湿债务丢了");
             }
             assert_eq!(a.genome.weights, b.genome.weights);
-            assert_eq!(a.genome.grn.root, b.genome.grn.root);
-            assert_eq!(a.genome.grn.max_cells, b.genome.grn.max_cells);
-            assert_eq!(a.genome.grn.rules, b.genome.grn.rules, "形态发生规则表没回来");
+            assert_eq!(a.genome.body, b.genome.body, "身体描述没原样回来");
         }
     }
 

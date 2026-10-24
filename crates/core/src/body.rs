@@ -250,7 +250,7 @@ pub const PLANS: &[BodyPlan] = &[SILVERFISH, LEAFBACK, WORM, JELLY, HUNTER];
 
 /// 最大的手工体型有多少格。
 ///
-/// 它必须不大于 [`crate::grn::MAX_BODY_CELLS`]——那是**身体格数的硬上限**，
+/// 它必须不大于 [`crate::morph::MAX_BODY_CELLS`]——那是**身体格数的硬上限**，
 /// 手工体型和形态发生长出来的身体共用同一条线。
 ///
 /// 早先这里写的是"必须不大于 `SMALL_BODY_MAX`"，而那个常量是"一次移动能顶开

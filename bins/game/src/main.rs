@@ -103,13 +103,13 @@ fn print_help() {
 
 选项：
   --ascii            不开窗口，在终端里渲染（没有 GPU 时的降级路径）
-  --width <N>        世界宽度，必须是 64 的倍数（默认 {DEFAULT_SIZE}）
-  --height <N>       世界高度，必须是 64 的倍数（默认 {DEFAULT_SIZE}）
+  --width <N>        世界宽度，20–2000（默认 {DEFAULT_SIZE}）
+  --height <N>       世界高度，20–2000（默认 {DEFAULT_SIZE}）
   --seed <N>         随机种子（默认 {DEFAULT_SEED}）
   --ticks <N>        仅 --ascii：先跑多少 tick 再打印（默认 60）
   --fish <N>         启动时在水面附近投放 N 条鱼（默认 0；也可以「世界」窗口
                      新建时勾「随机投放初始生命」，或在生物工坊里画一副）
-  --morph            身体由基因组**长出来**（形态发生），而不是用手工体型表
+  --morph            身体由基因组**长出来**（段树 + 梯度），而不是用手工体型表
   -h, --help         显示这份帮助"
     );
 }

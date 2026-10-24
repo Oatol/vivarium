@@ -25,14 +25,13 @@
 pub mod anatomy;
 pub mod body;
 pub mod field;
-pub mod grn;
 pub mod life;
 pub use body::{BodyPlan, PLANS};
 pub use field::{AirField, FieldStats, LightSource, ViewMode, AIR_CELL};
-pub use grn::Grn;
 pub use life::{CellType, OrganismId};
 pub mod life_sim;
 pub mod material;
+pub mod morph;
 pub mod organelle;
 pub mod palette;
 pub mod rng;

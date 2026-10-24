@@ -26,7 +26,7 @@
 //! 而细胞级能量需要额外定义"能量怎么在细胞间流动"，那是一整套新规则。
 //! 年龄仍然记在细胞上，因为"某个部位先老死"是 M3 才要的东西。
 
-use crate::grn::Grn;
+use crate::morph::Body;
 use crate::material::MaterialKind;
 use crate::organelle::{Organelles, CHLORO_SHIFT, EYE, FLAGELLUM_SHIFT};
 use crate::world::World;
@@ -69,15 +69,16 @@ pub const BIRTH_ENERGY_PER_CELL: u32 = 67;
 /// 只起"防止权重爆炸成 NaN 的源头"的作用，不限制表达力。
 pub const WEIGHT_LIMIT: f32 = 16.0;
 
-/// 每次繁殖改几条**形态发生规则**。
+/// 每次繁殖做几个**形态变异算子**。
 ///
-/// 单独一个常数，因为规则表的变异不能用权重的变异率：规则表有几千个槽，
-/// 按概率逐槽掷会一次改掉上百条（见 `Grn::mutate`）。这里按"改几条"算。
+/// 单独一个常数，因为形态基因组的变异不能用权重的变异率：一个身体只有
+/// 几十个"基因"（段的参数 + 梯度阈值 + 每格的细胞器位），按概率逐个掷
+/// 会一次改掉一大半，形状立刻散架。这里按"做几个算子"算。
 ///
-/// 1 → 2 的理由：32000 tick 只有 39~54 代，每次只改 1 条规则，
-/// 一条谱系累计下来只有几十次改动——**远不足以"发明"一个更好的身体**。
-/// 实测形态发生只能收敛到手工体型里最好的那个，从没长出新东西。
-pub const GRN_EDITS_PER_BIRTH: usize = 2;
+/// 为什么不是 1：`Grn` 时代每次只改 1 条规则，实测一条谱系跑几十代
+/// 累计下来只有几十次改动，**远不足以"发明"一个更好的身体**。
+/// `Body` 的每个算子影响范围更小（一个段 / 一条边界），所以可以多做几个。
+pub const MORPH_OPS_PER_BIRTH: usize = 2;
 
 /// 细胞类型（SPEC §3.2）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -244,6 +245,23 @@ impl Cell {
         Self {
             kind,
             organelles: Organelles::from_cell_type(kind),
+            offset,
+            age: 0,
+            wet: false,
+        }
+    }
+
+    /// 直接从细胞器造一格。
+    ///
+    /// `kind` 由 [`Organelles::primary_cell_type`] 反推——它在过渡期是
+    /// "给渲染和统计看的代表类型"，**组合细胞（叶绿体 + 气囊）的代表类型
+    /// 是有损的**，所以任何需要精确判断功能的地方都必须读 `organelles`，
+    /// 不能读 `kind`。
+    #[inline]
+    pub const fn from_organelles(organelles: Organelles, offset: (i16, i16)) -> Self {
+        Self {
+            kind: organelles.primary_cell_type(),
+            organelles,
             offset,
             age: 0,
             wet: false,
@@ -451,8 +469,11 @@ pub const ENERGY_HIST: usize = 32;
 pub struct Genome {
     /// 行为网络权重，布局见 [`WEIGHT_COUNT`]。
     pub weights: Vec<f32>,
-    /// 形态发生：这套规则决定身体长成什么样。见 [`crate::grn`]。
-    pub grn: Grn,
+    /// 身体描述：段树 + 梯度规则。见 [`crate::morph`]。
+    ///
+    /// 它取代了旧的 `Grn` 规则表。理由见 `morph` 的模块文档：
+    /// 旧表没有"位置"维度，所以表达不了分节；而分节是多细胞身体的第一块砖。
+    pub body: Body,
 }
 
 impl Genome {
@@ -460,7 +481,7 @@ impl Genome {
     pub fn blank() -> Self {
         Self {
             weights: vec![0.0; WEIGHT_COUNT],
-            grn: Grn::default(),
+            body: Body::blank(),
         }
     }
 
@@ -472,7 +493,7 @@ impl Genome {
         w[..n].copy_from_slice(&weights[..n]);
         Self {
             weights: w,
-            grn: Grn::default(),
+            body: Body::blank(),
         }
     }
 
@@ -565,8 +586,8 @@ impl Genome {
         //
         // 规则表有上千个槽，用 `rate` 逐个掷骰子的话，一个正常的 5% 就会
         // 一次改掉几十条规则——身体立刻变成随机团。所以这里按"改几条"算，
-        // 而且一次只改 1 条（见 `Grn::mutate` 的注释）。
-        self.grn.mutate(rng, GRN_EDITS_PER_BIRTH);
+        // 而且按"做几个算子"算（见 `Body::mutate` 的注释）。
+        self.body.mutate(rng, MORPH_OPS_PER_BIRTH);
         for w in &mut self.weights {
             if rng.next_f32() < rate {
                 // Box–Muller：两个均匀分布 → 一个正态分布。

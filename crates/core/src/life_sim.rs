@@ -30,7 +30,6 @@
 
 use crate::body::{BodyPlan, PLANS};
 use crate::field::AirField;
-use crate::grn::Grn;
 use crate::life::{
     remains_of, Cell, CellType, Genome, Organism, OrganismId, INPUTS, IN_AGE, IN_ALIEN_AHEAD,
     IN_BLOCKED_AHEAD, IN_BLOCKED_LEFT, IN_BLOCKED_RIGHT, IN_BLOCKED_UP, IN_ENERGY, IN_FACING_X,
@@ -89,7 +88,7 @@ pub const PRODUCER_YIELD: u32 = 24;
 /// `Water => body <= SMALL_BODY_MAX`——**17 格以上的身体在水里，水是固体**。
 ///
 /// 那条判据的理由是"1000 格的生物移动会推走 1000 格水，行为和性能都会崩"。
-/// 但身体格数上限是 [`crate::grn::MAX_BODY_CELLS`] = 24，
+/// 但身体格数上限是 [`crate::morph::MAX_BODY_CELLS`] = 24，
 /// 所以一次移动最多 swap 24 格水——**1000 格的情形根本不可能发生**。
 /// 那个数字守的是一道已经关掉的闸门，而它自己变成了一道新的墙：
 /// 大身体出生在水腔里，一格也走不动，然后掉到海底饿死。
@@ -97,8 +96,8 @@ pub const PRODUCER_YIELD: u32 = 24;
 /// 现在这个常量只剩**注释上的作用**：它把"一次移动最多顶开多少格水"这个
 /// 上界写死在这里，好让 `try_move` 的 O(格数²) 有一个明确的天花板
 /// （24² = 576 次整数比较，可以忽略）。**它不是通行判据，也不是玩法上限。**
-/// 真正的玩法上限是 [`crate::grn::MAX_BODY_CELLS`]。
-pub const MAX_DISPLACED: usize = crate::grn::MAX_BODY_CELLS as usize;
+/// 真正的玩法上限是 [`crate::morph::MAX_BODY_CELLS`]。
+pub const MAX_DISPLACED: usize = crate::morph::MAX_BODY_CELLS as usize;
 
 /// 自然寿命上限（tick）。到点就死，不商量。
 pub const MAX_AGE: u32 = 20_000;
@@ -1856,7 +1855,7 @@ impl LifeSim {
     ///
     /// 那个常量给的理由是"1000 格的生物移动会推走 1000 格水，行为和性能都会崩"。
     /// 这个担心**当时**成立，现在不成立：身体格数上限是
-    /// [`crate::grn::MAX_BODY_CELLS`] = 24，一次移动最多 swap 24 格水
+    /// [`crate::morph::MAX_BODY_CELLS`] = 24，一次移动最多 swap 24 格水
     /// （见 [`Self::body_displaces`]），是 O(n) 不是 O(n²)。
     /// **那个数字守的是一道已经不存在的门。**
     ///
@@ -2499,7 +2498,7 @@ impl LifeSim {
     /// 差别看起来只在"多调一次 `develop()`"，但意义完全不同——
     /// 子代继承的是**规则**，不是形状，所以突变能改到身体。
     pub fn from_genome(genome: Genome, anchor: (i32, i32), energy: u32) -> Organism {
-        let cells = genome.grn.develop();
+        let cells = genome.body.develop();
         let mut org = Organism::new(0, anchor, cells, genome);
         org.energy = energy;
         org
@@ -2822,15 +2821,23 @@ pub fn stock_surface(
         // 形态发生模式：基因组里塞一份**从手工体型反推出来的生长程序**，
         // 身体由它长出来。这一步只是热启动——之后子代继承的是规则，
         // 突变改到的就是形状本身了。
-        let grn = morph.then(|| {
-            Grn::from_plan(plan)
-                .or_else(|| Grn::from_plan(&PLANS[0]))
-                .unwrap_or_default()
-        });
-        let cells = match &grn {
-            Some(g) => g.develop(),
-            None => plan.cells(),
-        };
+        // **身体描述无条件设成 `Body`，不只是形态发生模式。**
+        //
+        // 这里踩过一个坑：早先写的是 `morph.then(|| Body::from_plan(plan))`，
+        // 于是 `morph == false` 时 `genome.body` 留着 `Genome::blank()` 的
+        // 那个"一格只有线粒体"的默认值。亲代身体是 10 格，**子代却退化成 1 格**——
+        // 实测平均体型从 7.8 掉到 8.8（一半是 10 格、一半是 1 格），
+        // 而画面上看起来只是"鱼越来越小"。
+        let mut body = crate::morph::Body::from_plan(plan);
+        if morph {
+            // 形态发生模式：给身体一点**结构**变异，第一代就有可选的差异。
+            // 这和下面那份权重抖动是两件事——一个改形状，一个改行为。
+            body.mutate(
+                &mut Rng::new(0xB0D7_0000 ^ (k as u64).wrapping_mul(0x9E37_79B9)),
+                2,
+            );
+        }
+        let cells = body.develop();
 
         // 每个个体都轻微不同：给自然选择一点原材料。
         //
@@ -2851,9 +2858,7 @@ pub fn stock_surface(
             0.35,
             0.12,
         );
-        if let Some(g) = grn {
-            genome.grn = g;
-        }
+        genome.body = body;
 
         // 身体在 x 方向的左右伸出量，用来把锚点夹在界内——
         // 否则贴边的个体整个投放会失败，水面看起来"有一段没鱼"。
