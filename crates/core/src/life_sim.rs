@@ -2893,11 +2893,30 @@ pub fn stock_surface(
         let reach_right = cells.iter().map(|c| c.offset.0).max().unwrap_or(0) as i32;
         let x = ((k * step + step / 2) as i32).clamp(reach_left, width as i32 - 1 - reach_right);
 
-        let mut surface = None;
-        for y in 0..world.height() as i32 {
-            if world.get(x as isize, y as isize) == MaterialKind::Water {
-                surface = Some(y);
-                break;
+        // 找一个**有水**的列。
+        //
+        // 先看分配到的那个 x，没水就向两边找最近的有水列。早先是直接
+        // `continue`——那在"一半陆地一半海"的地形里等于**一半的鱼被丢掉**：
+        // 实测 `--fish 24` 只放下 9 条。而且被丢掉的总是靠岸那几列，
+        // 于是"水面看起来有一段没鱼"。
+        let first_water = |cx: i32| -> Option<i32> {
+            (0..world.height() as i32)
+                .find(|&y| world.get(cx as isize, y as isize) == MaterialKind::Water)
+        };
+        let mut surface = first_water(x);
+        if surface.is_none() {
+            // 环面：左右同时向外找，各走一半世界宽就一定能找到（除非没有水）。
+            for d in 1..=(width as i32 / 2) {
+                let left = (x - d).rem_euclid(width as i32);
+                if let Some(y) = first_water(left) {
+                    surface = Some(y);
+                    break;
+                }
+                let right = (x + d).rem_euclid(width as i32);
+                if let Some(y) = first_water(right) {
+                    surface = Some(y);
+                    break;
+                }
             }
         }
         let Some(y) = surface else { continue };
