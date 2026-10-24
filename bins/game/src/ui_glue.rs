@@ -260,6 +260,9 @@ impl Egui {
             Command::PlaceBody(_) => false,
             Command::SaveBody { .. } => false,
             Command::DeleteBody(_) => false,
+            // 细胞库的两条也要碰磁盘。
+            Command::SaveCell { .. } => false,
+            Command::DeleteCell(_) => false,
             // 「世界」窗口的四条同理：它们全都要碰磁盘。
             Command::NewWorld { .. } => false,
             Command::SaveWorld(_) => false,

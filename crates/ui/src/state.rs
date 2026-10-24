@@ -436,6 +436,15 @@ pub enum Command {
     SetViewMode(ViewMode),
     /// 让世界跑一批 tick 再停下（"快进 N 步"）。
     RunFor(u32),
+    /// 把当前画笔存成一个**自定义细胞**（进左侧的细胞库）。
+    SaveCell {
+        /// 名字（同时是 `cells.dat` 里的键）。
+        name: String,
+        /// 细胞器位掩码。
+        bits: u16,
+    },
+    /// 从细胞库里删掉一个。
+    DeleteCell(String),
     /// 把工坊里画好的身体放到世界的鼠标位置。
     ///
     /// 带的是**相对锚点**的细胞表，主循环负责挑落点和构造有机体——
@@ -503,8 +512,6 @@ pub struct Workshop {
     /// 而真正的功能由 `organelles` 决定（v0.26 起）。所以工坊现在画的是
     /// "这一格带哪些细胞器"——"叶绿体 + 气囊"这种组合第一次能被玩家画出来。
     pub brush: Organelles,
-    /// 是否处于擦除模式。
-    pub erasing: bool,
     /// 画布：`DRAFT_SIZE × DRAFT_SIZE`，行优先。
     pub cells: Vec<Option<Organelles>>,
     /// 名字（保存时用）。
@@ -518,7 +525,6 @@ impl Default for Workshop {
         Self {
             open: false,
             brush: Organelles::from_cell_type(CellType::Producer),
-            erasing: false,
             cells: vec![None; DRAFT_SIZE * DRAFT_SIZE],
             name: String::new(),
             hint: None,
@@ -611,6 +617,19 @@ impl Workshop {
             }
         }
     }
+}
+
+/// 细胞库里的一条：一个**自定义细胞**（细胞器组合）。
+///
+/// 为什么它和 [`LibraryEntry`] 是两个类型而不是一个带 `Option` 的类型：
+/// 一个是"一格怎么造"，一个是"一副身体长什么样"。混在一起之后，
+/// 每个用到的地方都要问"这条到底是哪一种"，而那个分支永远只有一个答案。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CellEntry {
+    /// 名字（同时是 `cells.dat` 里的键）。
+    pub name: String,
+    /// 细胞器位掩码。
+    pub bits: u16,
 }
 
 /// 生物库里的一条。
@@ -828,6 +847,10 @@ pub struct UiState {
     pub workshop: Workshop,
     /// 生物库（名字 + 细胞表）。主循环每次载入/保存后回填。
     pub library: Vec<LibraryEntry>,
+    /// **自定义细胞库**：工坊左侧那一列可以直接取用的细胞。
+    ///
+    /// 和 `library`（整具身体）分开：一个是"零件"，一个是"成品"。
+    pub cells: Vec<CellEntry>,
     /// 「世界」窗口（新建 / 保存 / 读取）。
     pub world: WorldPanel,
     /// 顶部那条"上一次操作"的提示，两秒后自己消失。
@@ -851,6 +874,7 @@ impl Default for UiState {
             console: Console::new(),
             workshop: Workshop::default(),
             library: Vec::new(),
+            cells: Vec::new(),
             world: WorldPanel::default(),
             commands: Vec::new(),
             toast: None,

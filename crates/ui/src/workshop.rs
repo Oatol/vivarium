@@ -115,7 +115,7 @@ fn header(ui: &mut Ui, _state: &mut UiState) -> bool {
         );
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("选细胞 → 画身体 → 放置或保存")
+            egui::RichText::new("左键画 · 右键擦 → 放置或保存")
                 .size(9.5)
                 .color(theme::TEXT_FAINT),
         );
@@ -128,18 +128,22 @@ fn header(ui: &mut Ui, _state: &mut UiState) -> bool {
     close
 }
 
-/// 左侧：细胞类型选择。竖排色块，当前画笔高亮。
+/// 左侧：细胞类型选择 + **自定义细胞库**。
+///
+/// 上半是七个预设（`CellType::ALL`），下半是玩家自己存下来的细胞。
+/// 两者都是"色块 + 名字 + 悬停看清单"——**零件和成品该长得一样**，
+/// 因为对使用者来说它们都是"拿起一格往画布上涂"。
 fn cell_picker(ui: &mut Ui, state: &mut UiState) {
     ui.vertical(|ui| {
         // 固定宽度：不固定的话这一列会按最长的那行标签撑开，
         // 而标签是中文、宽度随字体变化——右边两列就被挤出去了。
-        ui.set_width(62.0);
+        ui.set_width(86.0);
         widgets::section(ui, "细胞");
         ui.add_space(2.0);
         for kind in CellType::ALL {
             let [r, g, b] = palette::cell_rgb(kind);
             let preset = Organelles::from_cell_type(kind);
-            let selected = !state.workshop.erasing && state.workshop.brush == preset;
+            let selected = state.workshop.brush == preset;
             if widgets::swatch(
                 ui,
                 Color32::from_rgb(r, g, b),
@@ -150,23 +154,60 @@ fn cell_picker(ui: &mut Ui, state: &mut UiState) {
             .clicked()
             {
                 state.workshop.brush = preset;
-                state.workshop.erasing = false;
                 state.emit(Command::SetCell(kind));
             }
         }
-        ui.add_space(4.0);
-        if widgets::flat_button(
-            ui,
-            "擦除",
-            if state.workshop.erasing {
-                BtnState::Selected
-            } else {
-                BtnState::Normal
-            },
-        )
-        .clicked()
+
+        // --- 我的细胞 ---
+        ui.add_space(6.0);
+        widgets::section(ui, "我的");
+        ui.add_space(2.0);
+        if state.cells.is_empty() {
+            ui.label(
+                egui::RichText::new("调好细胞器后点＋存")
+                    .size(8.0)
+                    .color(theme::TEXT_FAINT),
+            );
+        }
+        let mut pick: Option<u16> = None;
+        let mut drop_cell: Option<String> = None;
+        for entry in &state.cells {
+            let o = Organelles(entry.bits);
+            let [r, g, b] = palette::cell_rgb(o.primary_cell_type());
+            let hint = organelle_list(o);
+            let resp = widgets::swatch(
+                ui,
+                Color32::from_rgb(r, g, b),
+                &entry.name,
+                Some(&hint),
+                state.workshop.brush == o,
+            );
+            if resp.clicked() {
+                pick = Some(entry.bits);
+            }
+            // 右键删掉一个自定义细胞。和画布上"右键擦除"是同一个手势：
+            // **右键 = 拿走**。
+            if resp.secondary_clicked() {
+                drop_cell = Some(entry.name.clone());
+            }
+        }
+        if let Some(bits) = pick {
+            state.workshop.brush = Organelles(bits);
+        }
+        if let Some(name) = drop_cell {
+            state.emit(Command::DeleteCell(name));
+        }
+
+        ui.add_space(3.0);
+        if widgets::flat_button(ui, "＋ 存为细胞", BtnState::Normal)
+            .on_hover_text("把当前画笔（右边那排细胞器）存进这一列")
+            .clicked()
         {
-            state.workshop.erasing = true;
+            let bits = state.workshop.brush.0;
+            // 自动命名：这一列很窄，塞不下输入框，而"自定义 N"够区分了
+            // ——真正的身份是悬停时那份细胞器清单。
+            let name = format!("自定义{}", state.cells.len() + 1);
+            state.emit(Command::SaveCell { name, bits });
         }
     });
 }
@@ -233,13 +274,19 @@ fn board(ui: &mut Ui, state: &mut UiState) {
     }
 
     // 落笔：按住就连续画，所以拖动可以一次涂一片。
-    if resp.is_pointer_button_down_on() {
+    //
+    // **右键 = 擦除。** 早先它是一个单独的"擦除"按钮，那要求玩家在
+    // "选颜色"和"拿橡皮"之间来回切换——而画画的人对"右键擦"是有肌肉记忆的。
+    // 于是那个按钮连同 `Workshop::erasing` 一起删掉了：**一个状态如果能由
+    // 手势表达，就不该占一个开关。**
+    let erase = ui.input(|i| i.pointer.secondary_down());
+    if resp.is_pointer_button_down_on() || erase {
         if let Some(pos) = ui.ctx().pointer_interact_pos() {
             if rect.contains(pos) {
                 let x = ((pos.x - rect.left()) / CELL).floor().max(0.0) as usize;
                 let y = ((pos.y - rect.top()) / CELL).floor().max(0.0) as usize;
                 if x < DRAFT_SIZE && y < DRAFT_SIZE {
-                    let v = if state.workshop.erasing {
+                    let v = if erase {
                         None
                     } else {
                         Some(state.workshop.brush)

@@ -28,7 +28,7 @@
 
 use crate::morph::Body;
 use crate::material::MaterialKind;
-use crate::organelle::{Organelles, CHLORO_SHIFT, EYE, FLAGELLUM_SHIFT};
+use crate::organelle::{Organelles, BUILDER, CHLORO_SHIFT, EYE, FLAGELLUM_SHIFT};
 use crate::world::World;
 
 /// 有机体编号。0 是保留值（表示"没有主人"），见 [`crate::world::CellOwner`]。
@@ -847,7 +847,17 @@ impl Organism {
         // 一条 14 格的身体带 2 个建造细胞能省下 36%，而 3 格的小鱼
         // 带 1 个只省 20%（还不够付它自己 6 点的维持）。
         // **所以建造细胞只对大身体划算**，这是刻意的权衡。
-        let builders = self.count(CellType::Builder) as u32;
+        // **按位判，不按 `kind` 判。**
+        //
+        // v0.36 之后工坊能拼任意组合，而 `kind` 是"代表类型"（`primary_cell_type`
+        // 按 刺→嘴→叶绿体→鞭毛→装甲→眼→建造 的顺序挑第一个）。
+        // 于是"建造 + 叶绿体"那格的 `kind` 是 `Producer`，按 `kind` 数就漏掉了它
+        // ——玩家画了建造细胞却拿不到折扣，而画面上完全看不出原因。
+        let builders = self
+            .cells
+            .iter()
+            .filter(|c| c.organelles.has(BUILDER))
+            .count() as u32;
         if builders == 0 {
             return raw;
         }
@@ -1222,6 +1232,42 @@ mod tests {
         a.mutate(&mut crate::rng::Rng::new(7), 0.5, 0.3);
         b.mutate(&mut crate::rng::Rng::new(7), 0.5, 0.3);
         assert_eq!(a.weights, b.weights, "同种子必须突变成同一个基因组");
+    }
+
+    /// **建造细胞按位算，不按"代表类型"算。**
+    ///
+    /// v0.36 之后工坊能拼任意组合，而 `primary_cell_type` 的顺序是
+    /// 刺 → 嘴 → 叶绿体 → 鞭毛 → 装甲 → 眼 → 建造。所以"叶绿体 + 建造"
+    /// 那一格的 `kind` 是 `Producer`——按 `kind` 数就一个建造细胞都数不到，
+    /// 玩家画了建造却拿不到折扣，而画面上完全看不出原因。
+    #[test]
+    fn a_builder_discounts_even_when_the_cell_also_photosynthesizes() {
+        let producer = |i: i16| Cell::new(CellType::Producer, (i, 0));
+        let combo = |i: i16| {
+            Cell::from_organelles(
+                Organelles::from_cell_type(CellType::Producer).with(BUILDER),
+                (i, 0),
+            )
+        };
+
+        // 12 格全生产者 vs 10 格生产者 + 2 格"生产者 + 建造"。
+        let plain = Organism::new(
+            0,
+            (0, 0),
+            (0..12).map(producer).collect(),
+            Genome::blank(),
+        );
+        let mut mixed_cells: Vec<Cell> = (0..10).map(producer).collect();
+        mixed_cells.push(combo(10));
+        mixed_cells.push(combo(11));
+        let mixed = Organism::new(0, (0, 0), mixed_cells, Genome::blank());
+
+        assert!(
+            mixed.upkeep() < plain.upkeep(),
+            "两格建造应当把 12 格身体的维持压下来：{} vs {}",
+            mixed.upkeep(),
+            plain.upkeep()
+        );
     }
 
     #[test]

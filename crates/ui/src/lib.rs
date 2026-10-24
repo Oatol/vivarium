@@ -38,7 +38,8 @@ pub mod workshop;
 pub mod world_window;
 
 pub use state::{
-    Command, Console, Level, LibraryEntry, SaveEntry, Snapshot, Tool, UiState, Workshop, WorldPanel,
+    CellEntry, Command, Console, Level, LibraryEntry, SaveEntry, Snapshot, Tool, UiState, Workshop,
+    WorldPanel,
 };
 pub use widgets::BtnState;
 

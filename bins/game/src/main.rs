@@ -430,6 +430,7 @@ impl Game {
         // 目录里只有几个小文本文件，扫一遍比维护增量状态简单得多，
         // 而且用户可能在外面手改了文件。
         ui.state.library = load_library();
+        ui.state.cells = load_cells();
 
         let mut game = Self {
             window,
@@ -1401,6 +1402,34 @@ impl Game {
                 // 只记下来，等用户在世界里点一下再落。
                 self.pending_body = Some(cells);
             }
+            C::SaveCell { name, bits } => {
+                let tick = self.world.tick();
+                match save_cell(&name, bits) {
+                    Ok(_) => {
+                        self.ui.state.cells = load_cells();
+                        self.ui.log(
+                            tick,
+                            vivarium_ui::Level::Info,
+                            format!("细胞已存进左侧：{name}"),
+                        );
+                    }
+                    Err(e) => self
+                        .ui
+                        .log(tick, vivarium_ui::Level::Error, format!("保存失败：{e}")),
+                }
+            }
+            C::DeleteCell(name) => {
+                let tick = self.world.tick();
+                match delete_cell(&name) {
+                    Ok(()) => {
+                        self.ui.state.cells = load_cells();
+                        self.ui.log(tick, vivarium_ui::Level::Info, format!("已删掉细胞 {name}"));
+                    }
+                    Err(e) => self
+                        .ui
+                        .log(tick, vivarium_ui::Level::Error, format!("删除失败：{e}")),
+                }
+            }
             C::SaveBody { name, cells } => {
                 let tick = self.world.tick();
                 match save_body(&name, &cells) {
@@ -1814,6 +1843,78 @@ fn safe_file_name(name: &str) -> String {
 ///
 /// 读不了的文件**跳过而不是报错**：目录里可能有用户手放的说明文件，
 /// 一个坏文件不该让整个库都打不开。
+/// 细胞库文件：一行一个，`位掩码<TAB>名字`。
+///
+/// **扩展名是 `.dat` 而不是 `.txt`。** 身体库的加载器会把 `bodies/` 下所有
+/// `.txt` 当身体解析，而细胞库就住在同一个目录里——用 `.txt` 的话每次启动
+/// 都会有一个"解析失败"的条目（被静默跳过，但那是靠运气）。
+fn cells_path() -> std::path::PathBuf {
+    library_dir().join("cells.dat")
+}
+
+fn load_cells() -> Vec<vivarium_ui::CellEntry> {
+    let Ok(text) = std::fs::read_to_string(cells_path()) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((bits, name)) = line.split_once('\t') else {
+            continue;
+        };
+        let (Ok(bits), name) = (bits.trim().parse::<u16>(), name.trim()) else {
+            continue;
+        };
+        if name.is_empty() {
+            continue;
+        }
+        out.push(vivarium_ui::CellEntry {
+            name: name.to_owned(),
+            bits,
+        });
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    out
+}
+
+/// 存一个细胞。同名覆盖。
+fn save_cell(name: &str, bits: u16) -> std::io::Result<()> {
+    let path = cells_path();
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    // 读-改-写整张表：这个文件只有几十行，而"同名覆盖"用追加实现不了。
+    let mut rows: Vec<(String, u16)> = load_cells()
+        .into_iter()
+        .map(|c| (c.name, c.bits))
+        .collect();
+    rows.retain(|(n, _)| n != name);
+    rows.push((name.trim().to_owned(), bits));
+    rows.sort_by(|a, b| a.0.cmp(&b.0));
+
+    let mut text = String::from("# 细胞库：位掩码<TAB>名字\n");
+    for (n, b) in rows {
+        text.push_str(&format!("{b}\t{n}\n"));
+    }
+    std::fs::write(path, text)
+}
+
+fn delete_cell(name: &str) -> std::io::Result<()> {
+    let mut rows: Vec<(String, u16)> = load_cells()
+        .into_iter()
+        .map(|c| (c.name, c.bits))
+        .collect();
+    rows.retain(|(n, _)| n != name);
+    let mut text = String::from("# 细胞库：位掩码<TAB>名字\n");
+    for (n, b) in rows {
+        text.push_str(&format!("{b}\t{n}\n"));
+    }
+    std::fs::write(cells_path(), text)
+}
+
 fn load_library() -> Vec<vivarium_ui::LibraryEntry> {
     let dir = library_dir();
     let Ok(entries) = std::fs::read_dir(&dir) else {
