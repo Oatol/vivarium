@@ -104,7 +104,20 @@ pub const MAX_DISPLACED: usize = crate::morph::MAX_BODY_CELLS as usize;
 pub const MAX_AGE: u32 = 20_000;
 
 /// 突变率：每个权重被扰动的概率。
-pub const MUTATION_RATE: f32 = 0.05;
+///
+/// ## v0.34：5% → 2%
+///
+/// 370 个权重 × 5% = **每胎改 18.5 个**。在一个 370 维空间里，一次动 18 个
+/// 坐标不是"爬坡"，是**随机游走**——子代和亲代的适应度几乎无关，
+/// 选择也就没有东西可筛。这正是"进化看着很随机"的直接来源。
+///
+/// 2% 是每胎 7.4 个。再低（1%）会让一条谱系几十代才动一次，
+/// 实测在 8000 tick（约 150 代）里就攒不出方向了。
+///
+/// **注意它和 [`crate::life::MORPH_OPS_PER_BIRTH`] 走的是相反方向**：
+/// 形态基因组只有几十个基因，2 个算子太少、6 个刚好。两者的判据不同，
+/// 不该共用一个数。
+pub const MUTATION_RATE: f32 = 0.02;
 
 /// `IN_LIGHT` 的衰减尺度：水面下多少格降到 0。
 ///
@@ -1203,15 +1216,25 @@ impl LifeSim {
             let (x, y) = org.cell_at(cell);
             let (x, y) = (x as isize, y as isize);
             world.vacate(x, y);
-            // **没借过水的细胞不留下尸体。**
-            //
-            // 出生时泡在空气里那几格从没占过水，死后也不该变成"会烂成水"的
-            // 尸体——否则凭空多出几格水（见 `Cell::wet` 的注释）。
             if cell.wet {
+                // 借过水的那几格：留**尸体**。尸体腐烂时把那一格水还回来，
+                // 所以"1 格尸体 = 1 格借来的水"是这条规则的地基。
                 world.set(x, y, remains_of(cell.kind));
                 // `set` 会把 flags 清 0，所以能量必须写在它之后。
                 world.set_flags(x, y, per_cell as u8);
                 placed += 1;
+            } else {
+                // **没借过水的细胞：留碎屑，不留尸体。**
+                //
+                // 出生在空气里的身体一格水都没占过，它的死不该还出任何水
+                // ——否则凭空多出几格水（见 `Cell::wet` 的注释）。但它**必须
+                // 留下点东西**：早先这里直接跳过，于是"往陆地上一放，鱼掉下来、
+                // 挣扎两秒、凭空消失"。玩家看到的是 bug，不是物理。
+                //
+                // 碎屑是粉末（`MoveRule::Falls`），所以半空里死的会掉到地上堆起来；
+                // 它也是 `eat_remains` 的食物——**陆地有机质的入口**就在这一行。
+                // 能量不写进去（碎屑不带能量），那一份走下面的 `dissipated`。
+                world.set(x, y, MaterialKind::Remains);
             }
         }
         // 摊不尽的零头 + **没能落到任何一格上的那份**（干细胞的份额）都要记账。
@@ -4818,6 +4841,48 @@ mod tests {
     // -----------------------------------------------------------------------
     // 身体进光场（v0.33）
     // -----------------------------------------------------------------------
+
+    /// **干死的身体必须留下点东西。**
+    ///
+    /// 出生在空气里的身体一格水都没借过，所以它的死不该还水（`Cell::wet`）。
+    /// 但早先 `bury` 把"不还水"和"不留尸体"写成了同一个 `if`，于是
+    /// **往陆地上一放，鱼掉下来、挣扎两秒、凭空消失**——玩家看到的是 bug。
+    ///
+    /// 现在干细胞留 `Remains`：它是粉末（会掉到地上堆起来），也是
+    /// `eat_remains` 的食物——陆地有机质的入口。
+    #[test]
+    fn a_body_that_dies_on_dry_land_leaves_remains() {
+        let mut w = pool();
+        // 抽干水面以上的一切，做成一块干地。
+        w.fill_rect(0, 0, 64, 60, MaterialKind::Empty);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((20, 55), Genome::blank(), 300),
+            )
+            .unwrap();
+
+        for _ in 0..400 {
+            sim.step(&mut w);
+            if sim.organism(id).is_none() {
+                break;
+            }
+        }
+        assert!(sim.organism(id).is_none(), "陆地上没有水和光，它应当饿死");
+
+        let mut remains = 0;
+        for y in 0..64isize {
+            for x in 0..64isize {
+                if w.get(x, y) == MaterialKind::Remains {
+                    remains += 1;
+                }
+            }
+        }
+        assert!(remains > 0, "干死的身体必须留下碎屑——早先它凭空消失了");
+        assert!(remains <= 3, "最多留下身体那三格，实际 {remains}");
+    }
 
     /// **身体遮挡按覆盖度走**：密实的身体挡得多，稀疏的挡得少。
     ///

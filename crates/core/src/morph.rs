@@ -479,6 +479,33 @@ impl Body {
     /// 行为网络（MLP）上有 competing conventions：两个父代的隐藏层神经元
     /// 编号不对应，交叉出来的孩子是噪声。**重组只能放在结构化基因组上**，
     /// 因为那里的"交换单位"语义完整。
+    /// 把超过 [`MAX_SEGMENT_DEPTH`] 的子树砍掉。
+    ///
+    /// ## 为什么必须砍
+    ///
+    /// `expand_segment` 本来就不展开太深的段，所以**发育**不会出错；但
+    /// **基因组**里那一层还在，而存档的 `read_segment` 会拒绝它
+    /// （"段嵌套过深"）。症状是**存出去的档读不回来**——写端能生产读端
+    /// 拒绝的东西，这是最不该出现的一类 bug，而且它只在
+    /// `MORPH_OPS_PER_BIRTH` 从 2 提到 6 之后才显形（`Duplicate` 有了
+    /// 足够多的机会把树推到第 4 层）。
+    ///
+    /// 判据和 `expand_segment` 对齐：深度 == `MAX_SEGMENT_DEPTH` 的段
+    /// **仍然会被展开**，只有它的孩子不会。所以砍的是"深度达到上限的段的
+    /// 孩子"，不是那个段本身。
+    fn prune_depth(&mut self) {
+        fn cut(seg: &mut Segment, depth: u8) {
+            if depth >= MAX_SEGMENT_DEPTH {
+                seg.children.clear();
+                return;
+            }
+            for c in &mut seg.children {
+                cut(c, depth + 1);
+            }
+        }
+        cut(&mut self.trunk, 0);
+    }
+
     pub fn mutate(&mut self, rng: &mut Rng, ops: usize) {
         for _ in 0..ops {
             let r = rng.next_f32();
@@ -516,6 +543,10 @@ impl Body {
                 MorphOp::BandEdit => self.mutate_band(rng),
             }
         }
+        // `Duplicate` / `Crossover` 都能把树推深，而存档读不回来那么深的树。
+        // 放在**最后**统一砍：每个算子各自检查的话，漏一个就又是一次
+        // "存出去的档读不回来"。
+        self.prune_depth();
     }
 
     /// 参数微扰：动一个段的 `repeat` / `mirror` / `axis`，或者 `max_cells`。
