@@ -23,7 +23,8 @@ use egui::{
 };
 
 use vivarium_core::organelle::{
-    Organelles, ARMOR, BUILDER, CHLORO_SHIFT, DIGEST, EYE, FLAGELLUM_SHIFT, GAS, MITO, STING_SHIFT,
+    Organelles, ARMOR, BUILDER, CHLORO_SHIFT, DIGEST, EYE, FLAGELLUM_SHIFT, GAS, MITO, ROOT,
+    STING_SHIFT,
 };
 use vivarium_core::{morph::MAX_BODY_CELLS, palette, CellType};
 
@@ -470,6 +471,7 @@ fn organelle_list(o: Organelles) -> String {
         (ARMOR, "装甲"),
         (GAS, "气囊"),
         (EYE, "眼"),
+        (ROOT, "根"),
         (MITO, "线粒体"),
         (BUILDER, "建造"),
     ] {
@@ -539,7 +541,21 @@ fn organelle_editor(ui: &mut Ui, state: &mut UiState) {
         }
     });
     ui.horizontal(|ui| {
-        for (flag, name) in [(EYE, "眼"), (MITO, "线粒体"), (BUILDER, "建造")] {
+        for (flag, name) in [(EYE, "眼"), (MITO, "线粒体")] {
+            let on = b.has(flag);
+            let st = if on {
+                BtnState::Selected
+            } else {
+                BtnState::Normal
+            };
+            if widgets::flat_button(ui, name, st).clicked() {
+                b = Organelles(b.0 ^ flag);
+            }
+        }
+    });
+
+    ui.horizontal(|ui| {
+        for (flag, name) in [(BUILDER, "建造"), (ROOT, "根")] {
             let on = b.has(flag);
             let st = if on {
                 BtnState::Selected

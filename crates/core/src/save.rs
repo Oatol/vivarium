@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 4;
+pub const VERSION: u16 = 5;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -348,6 +348,9 @@ fn put_organism(out: &mut Out, org: &Organism) {
     // v4：生物量。和 `energy` 分开存——它是"身体本身"的价值，
     // 尸体被吃时转移的主要是这一份（见 `life::STRUCTURE_SHARE`）。
     out.u32(org.structure);
+    // v5：含水量。它是**积分状态**（离水之后慢慢掉），不是布局的纯函数，
+    // 不存的话读档之后每一株植物都会瞬间"满水"，而画面上看不出来。
+    out.u8(org.hydration);
     out.u32(org.age);
     out.i8(org.facing.x);
     out.i8(org.facing.y);
@@ -600,6 +603,7 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
     let _saved_width = r.i32()?;
     let energy = r.u32()?;
     let structure = r.u32()?;
+    let hydration = r.u8()?;
     let age = r.u32()?;
     let facing = Facing {
         x: r.i8()?,
@@ -648,6 +652,7 @@ fn read_organism(r: &mut In<'_>, world_width: i32) -> Result<Organism, SaveError
         cells,
         energy,
         structure,
+        hydration,
         age,
         facing,
         genome,

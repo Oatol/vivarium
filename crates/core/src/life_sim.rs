@@ -40,7 +40,7 @@ use crate::life::{
     OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
-use crate::organelle::{ARMOR, CHLORO_SHIFT, DIGEST, STING};
+use crate::organelle::{ARMOR, CHLORO_SHIFT, DIGEST, ROOT, STING};
 use crate::rng::Rng;
 use crate::world::World;
 
@@ -212,6 +212,12 @@ const LIFE_SEED: u64 = 0x5EED_1F3E;
 /// 那这条规则就永远不会触发。而 0.35 让"半截露出水面的身体"仍然算湿——
 /// 贴着水面游的鱼不该因为头顶出水就断粮。
 pub const SUBMERGED_MIN: f32 = 0.35;
+
+/// 根能提供的**最低湿度**：根扎在水边时，整株植物按这个比例产能。
+///
+/// 0.35 ≈ 水里的三分之一。够慢但够活——陆生植物本来就该长得慢，
+/// 而"慢"正是它和水中植物之间该有的取舍。
+pub const LAND_DAMP: f32 = 0.35;
 
 /// 完全上岸时，每一步移动贵几倍。
 ///
@@ -987,7 +993,10 @@ impl LifeSim {
     pub fn step(&mut self, world: &mut World) {
         self.stats = LifeStats::default();
 
-        // 1) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
+        // 1) 含水量。放在太阳能**之前**：这一 tick 的光合用这一 tick 的水。
+        self.tick_hydration(world);
+
+        // 1b) 太阳能。生产者是唯一的"环境 → 生物"入口（SPEC §3.3）。
         self.inject_sunlight(world);
 
         // 1b) 尸体腐烂 + 藻的播种，见 `tick_organics`。
@@ -1329,6 +1338,41 @@ impl LifeSim {
         }
     }
 
+    /// 这具身体有没有**根贴着水**。
+    ///
+    /// 判据是"某一格根细胞的四邻里有水"——**根要够得着水，不是身体泡在水里**。
+    /// 这就是根和"整具身体泡在水里"的区别：后者要求锚点所在的粗格有水，
+    /// 前者只要求某一格根挨着一格水。
+    fn root_is_wet(world: &World, org: &Organism) -> bool {
+        for cell in &org.cells {
+            if !cell.organelles.has(ROOT) {
+                continue;
+            }
+            let (x, y) = org.cell_at(cell);
+            for (dx, dy) in [(1i32, 0i32), (-1, 0), (0, 1), (0, -1)] {
+                if world.get((x + dx) as isize, (y + dy) as isize) == MaterialKind::Water {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// 每 tick 更新含水量。
+    ///
+    /// 放在 `inject_sunlight` **之前**：光合这一 tick 用的是这一 tick 的水。
+    fn tick_hydration(&mut self, world: &World) {
+        for org in &mut self.organisms {
+            let wet = Self::root_is_wet(world, org)
+                || dampness(self.field.water_frac(org.anchor.0 as f32, org.anchor.1 as f32)) > 0.5;
+            if wet {
+                org.hydration = crate::life::HYDRATION_MAX;
+            } else {
+                org.hydration = org.hydration.saturating_sub(crate::life::HYDRATION_DRAIN);
+            }
+        }
+    }
+
     /// 生产者按**所在位置的光照**产能量。
     ///
     /// 这是世界里唯一一条"环境 → 生物"的能量入口（SPEC §3.3）。
@@ -1384,8 +1428,21 @@ impl LifeSim {
             //
             // **v0.31：从门槛改成斜坡**（见 [`dampness`]）。原来是
             // `water_frac < 0.35` 直接跳过，于是"半上岸"在能量上不存在。
-            let damp = dampness(self.field.water_frac(ax, ay));
+            let mut damp = dampness(self.field.water_frac(ax, ay));
+            // **根贴着水 → 至少 LAND_DAMP。**
+            //
+            // 这一条才是"植物能上岸"的全部：根扎在岸边的水里，
+            // 身体长在岸上，光合按三分之一跑。没有根的话 `damp` 仍然是
+            // 粗格水占比——离开水面就是 0。
+            if damp < LAND_DAMP && Self::root_is_wet(&*world, org) {
+                damp = LAND_DAMP;
+            }
             if damp <= 0.0 {
+                continue;
+            }
+            // 再乘含水量：离水之后它靠身体里存的那点水撑一阵。
+            let wet = org.hydration as f32 / crate::life::HYDRATION_MAX as f32;
+            if wet <= 0.0 {
                 continue;
             }
             let light = self.field.light_at(ax, ay);
@@ -1393,7 +1450,7 @@ impl LifeSim {
                 continue;
             }
             let warmth = crate::field::photosynthesis(self.field.temp_at(ax, ay));
-            let gain = (PRODUCER_YIELD as f32 * light * warmth * damp) as u32 * producers as u32;
+            let gain = (PRODUCER_YIELD as f32 * light * warmth * damp * wet) as u32 * producers as u32;
             if gain == 0 {
                 continue;
             }
@@ -2436,6 +2493,7 @@ impl LifeSim {
             width,
             cells,
             energy: birth_energy,
+            hydration: crate::life::HYDRATION_MAX,
             // 子代的生物量从 0 开始：它还没长大。
             // 这一条让"杀幼崽"和"杀成体"有区别——成体的尸体更肥。
             structure: 0,
@@ -4988,6 +5046,89 @@ mod tests {
         }
         assert!(remains > 0, "干死的身体必须留下碎屑——早先它凭空消失了");
         assert!(remains <= 3, "最多留下身体那三格，实际 {remains}");
+    }
+
+    /// **根能让植物在水面之上继续光合，没有根就只能干等。**
+    ///
+    /// 这条测试钉的是"离水"这件事的机制，所以**只跑 `tick_hydration`**，
+    /// 不跑 `step`——整步里重力会把身体拽回水里，而那就测不到"离水"了。
+    #[test]
+    fn a_root_refills_hydration_from_water_next_door() {
+        // 一株竖着的生产者：锚点在水面之上 5 格，最下面一格贴在水面上。
+        let plant = |root: bool| {
+            let mut cells: Vec<Cell> = (0..4)
+                .map(|dy| Cell::new(CellType::Producer, (0, dy)))
+                .collect();
+            if root {
+                cells.push(Cell::from_organelles(
+                    crate::organelle::Organelles::from_cell_type(CellType::Producer)
+                        .with(ROOT),
+                    (0, 4),
+                ));
+            } else {
+                cells.push(Cell::new(CellType::Producer, (0, 4)));
+            }
+            Organism::new(0, (20, 25), cells, Genome::blank())
+        };
+
+        // 有根：根在 y=29，四邻里 (20,30) 是水 → 含水量一直满。
+        let mut w = pool();
+        let mut sim = LifeSim::new(&mut w);
+        let id = sim.spawn_injected(&mut w, plant(true)).unwrap();
+        assert!(
+            LifeSim::root_is_wet(&w, sim.organism(id).unwrap()),
+            "根在 y=29，正下方就是水，应当算贴水"
+        );
+        for _ in 0..40 {
+            sim.tick_hydration(&w);
+        }
+        assert_eq!(
+            sim.organism(id).unwrap().hydration,
+            crate::life::HYDRATION_MAX,
+            "根贴着水，含水量应当一直是满的"
+        );
+
+        // 没根：锚点所在的粗格（y=24..27）里没有水 → 每 tick 掉一格。
+        let mut w2 = pool();
+        let mut sim2 = LifeSim::new(&mut w2);
+        let id2 = sim2.spawn_injected(&mut w2, plant(false)).unwrap();
+        assert!(
+            !LifeSim::root_is_wet(&w2, sim2.organism(id2).unwrap()),
+            "没有根细胞，不该算贴水"
+        );
+        for _ in 0..40 {
+            sim2.tick_hydration(&w2);
+        }
+        assert_eq!(
+            sim2.organism(id2).unwrap().hydration,
+            crate::life::HYDRATION_MAX - 40,
+            "没有根，离水之后应当每 tick 掉一格"
+        );
+    }
+
+    /// 含水量掉到 0 之后，光合彻底停下（不是"变慢"，是"停"）。
+    #[test]
+    fn a_dry_body_stops_photosynthesizing() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 12), Genome::blank(), 200),
+            )
+            .unwrap();
+        // 直接把它拧干：这一步跳过 `tick_hydration` 的补水。
+        let i = sim.organisms.iter().position(|o| o.id == id).unwrap();
+        sim.organisms[i].hydration = 0;
+        let before = sim.organisms[i].energy;
+        // 只跑光合那一步，避开代谢扣费。
+        sim.inject_sunlight(&mut w);
+        assert_eq!(
+            sim.organism(id).unwrap().energy,
+            before,
+            "干透的身体不该再产出任何能量"
+        );
     }
 
     /// **身体遮挡按覆盖度走**：密实的身体挡得多，稀疏的挡得少。
