@@ -151,6 +151,7 @@ impl Default for Ui {
 mod tests {
     use super::*;
     use crate::state::{CellInfo, HoverOrganism};
+    use vivarium_core::organelle::{Organelles, GAS};
     use vivarium_core::{CellType, MaterialKind, ViewMode};
 
     fn screen() -> egui::RawInput {
@@ -227,17 +228,17 @@ mod tests {
     #[test]
     fn workshop_round_trips_through_cell_table() {
         let mut w = state::Workshop::default();
-        w.set(4, 5, Some(CellType::Mover));
-        w.set(5, 5, Some(CellType::Mouth));
-        w.set(4, 4, Some(CellType::Producer));
+        w.set(4, 5, Some(Organelles::from_cell_type(CellType::Mover)));
+        w.set(5, 5, Some(Organelles::from_cell_type(CellType::Mouth)));
+        w.set(4, 4, Some(Organelles::from_cell_type(CellType::Producer)));
 
         let cells = w.to_cells();
         assert_eq!(cells.len(), 3);
         // 锚点是包围盒中心，向下取整：(4,4)-(5,5) → (4,4)。
         // 于是 (4,4) 生产者是 (0,0)、(5,5) 嘴是 (1,1)、(4,5) 移动是 (0,1)。
-        assert!(cells.contains(&(0, 0, CellType::Producer.as_u8())));
-        assert!(cells.contains(&(1, 1, CellType::Mouth.as_u8())));
-        assert!(cells.contains(&(0, 1, CellType::Mover.as_u8())));
+        assert!(cells.contains(&(0, 0, Organelles::from_cell_type(CellType::Producer).0)));
+        assert!(cells.contains(&(1, 1, Organelles::from_cell_type(CellType::Mouth).0)));
+        assert!(cells.contains(&(0, 1, Organelles::from_cell_type(CellType::Mover).0)));
 
         let mut again = state::Workshop::default();
         again.load(&cells);
@@ -266,7 +267,7 @@ mod tests {
         full.textures_delta.clear();
 
         state.workshop.open = true;
-        state.workshop.set(3, 3, Some(CellType::Producer));
+        state.workshop.set(3, 3, Some(Organelles::from_cell_type(CellType::Producer)));
         let (out, mut full) = ui.show(&mut state, &snap, screen());
         let after = full.shapes.len();
         full.textures_delta.clear();
@@ -594,4 +595,33 @@ mod tests {
             assert_eq!(*rect, first, "切到「{label}」之后世界矩形变了");
         }
     }
+    /// **工坊能画「叶绿体 + 气囊」这种组合，而且原样存回来。**
+    ///
+    /// 这是 v0.36 的核心：`CellType` 是封闭枚举，而功能由 `organelles` 决定。
+    /// 工坊从"选类型"改成"调位掩码"之后，"发明一种新细胞"才成为可能——
+    /// 而这条测试钉的是"组合不会在存/读的路上被压回枚举"。
+    #[test]
+    fn workshop_keeps_organelle_combinations() {
+        let custom = Organelles::from_cell_type(CellType::Producer).with(GAS);
+        // 先确认这个组合**真的**不等于任何预设：否则这条测试什么都没测到。
+        assert!(
+            CellType::ALL
+                .iter()
+                .all(|&k| Organelles::from_cell_type(k) != custom),
+            "「叶绿体 + 气囊」应当是一个预设里没有的组合"
+        );
+
+        let mut w = state::Workshop::default();
+        w.set(3, 3, Some(custom));
+        let cells = w.to_cells();
+        assert_eq!(cells.len(), 1);
+        assert_eq!(cells[0].2, custom.0, "细胞器组合在 to_cells 里被改了");
+
+        let mut again = state::Workshop::default();
+        again.load(&cells);
+        let back = again.to_cells();
+        assert_eq!(back.len(), 1, "读回画布时格子数不对");
+        assert_eq!(back[0].2, custom.0, "读回画布时组合丢了");
+    }
+
 }

@@ -15,6 +15,7 @@
 
 use std::collections::VecDeque;
 
+use vivarium_core::organelle::Organelles;
 use vivarium_core::{CellType, FieldStats, MaterialKind, OrganismId, TimeScale, ViewMode};
 
 // ---------------------------------------------------------------------------
@@ -439,11 +440,11 @@ pub enum Command {
     ///
     /// 带的是**相对锚点**的细胞表，主循环负责挑落点和构造有机体——
     /// 界面不知道世界长什么样，也不该知道。
-    PlaceBody(Vec<(i16, i16, u8)>),
+    PlaceBody(Vec<(i16, i16, u16)>),
     /// 把一副身体存进生物库（落盘）。
     SaveBody {
         name: String,
-        cells: Vec<(i16, i16, u8)>,
+        cells: Vec<(i16, i16, u16)>,
     },
     /// 从生物库删掉一条。
     DeleteBody(String),
@@ -496,12 +497,16 @@ pub const DRAFT_SIZE: usize = 16;
 pub struct Workshop {
     /// 是否打开。打开时它盖住整个窗口（模态）。
     pub open: bool,
-    /// 当前画笔的细胞类型。
-    pub brush: CellType,
+    /// 当前画笔的**细胞器组合**。
+    ///
+    /// 从"细胞类型"换成"细胞器位掩码"是 v0.36 的核心：`CellType` 是封闭枚举，
+    /// 而真正的功能由 `organelles` 决定（v0.26 起）。所以工坊现在画的是
+    /// "这一格带哪些细胞器"——"叶绿体 + 气囊"这种组合第一次能被玩家画出来。
+    pub brush: Organelles,
     /// 是否处于擦除模式。
     pub erasing: bool,
     /// 画布：`DRAFT_SIZE × DRAFT_SIZE`，行优先。
-    pub cells: Vec<Option<CellType>>,
+    pub cells: Vec<Option<Organelles>>,
     /// 名字（保存时用）。
     pub name: String,
     /// 上一次操作的提示（"已保存"/"没有嘴"），几秒后消失。
@@ -512,7 +517,7 @@ impl Default for Workshop {
     fn default() -> Self {
         Self {
             open: false,
-            brush: CellType::Producer,
+            brush: Organelles::from_cell_type(CellType::Producer),
             erasing: false,
             cells: vec![None; DRAFT_SIZE * DRAFT_SIZE],
             name: String::new(),
@@ -524,13 +529,13 @@ impl Default for Workshop {
 impl Workshop {
     /// 取一格。
     #[inline]
-    pub fn get(&self, x: usize, y: usize) -> Option<CellType> {
+    pub fn get(&self, x: usize, y: usize) -> Option<Organelles> {
         self.cells.get(y * DRAFT_SIZE + x).copied().flatten()
     }
 
     /// 画一格。
     #[inline]
-    pub fn set(&mut self, x: usize, y: usize, v: Option<CellType>) {
+    pub fn set(&mut self, x: usize, y: usize, v: Option<Organelles>) {
         if let Some(slot) = self.cells.get_mut(y * DRAFT_SIZE + x) {
             *slot = v;
         }
@@ -553,7 +558,7 @@ impl Workshop {
     /// 比"左上角对齐鼠标"符合直觉得多。
     ///
     /// 返回空表示画布上什么都没有。
-    pub fn to_cells(&self) -> Vec<(i16, i16, u8)> {
+    pub fn to_cells(&self) -> Vec<(i16, i16, u16)> {
         let (mut min_x, mut max_x, mut min_y, mut max_y) = (usize::MAX, 0usize, usize::MAX, 0usize);
         for y in 0..DRAFT_SIZE {
             for x in 0..DRAFT_SIZE {
@@ -574,8 +579,8 @@ impl Workshop {
         let mut out = Vec::with_capacity(self.count());
         for y in 0..DRAFT_SIZE {
             for x in 0..DRAFT_SIZE {
-                if let Some(kind) = self.get(x, y) {
-                    out.push((x as i16 - cx as i16, y as i16 - cy as i16, kind.as_u8()));
+                if let Some(o) = self.get(x, y) {
+                    out.push((x as i16 - cx as i16, y as i16 - cy as i16, o.0));
                 }
             }
         }
@@ -583,7 +588,7 @@ impl Workshop {
     }
 
     /// 从一副身体载入画布（锚点对齐到画布中心）。
-    pub fn load(&mut self, cells: &[(i16, i16, u8)]) {
+    pub fn load(&mut self, cells: &[(i16, i16, u16)]) {
         self.clear();
         if cells.is_empty() {
             return;
@@ -598,11 +603,11 @@ impl Workshop {
         let half = DRAFT_SIZE as i16 / 2;
         let ox = (min_x + max_x) / 2 - half;
         let oy = (min_y + max_y) / 2 - half;
-        for &(x, y, kind) in cells {
+        for &(x, y, bits) in cells {
             let cx = (x - ox) as usize;
             let cy = (y - oy) as usize;
             if cx < DRAFT_SIZE && cy < DRAFT_SIZE {
-                self.set(cx, cy, Some(CellType::from_u8(kind)));
+                self.set(cx, cy, Some(Organelles(bits)));
             }
         }
     }
@@ -613,8 +618,12 @@ impl Workshop {
 pub struct LibraryEntry {
     /// 名字（同时是文件名）。
     pub name: String,
-    /// 细胞表，坐标相对锚点。
-    pub cells: Vec<(i16, i16, u8)>,
+    /// 细胞表，坐标相对锚点。第三个数是**细胞器位掩码**（`u16`）。
+    ///
+    /// v0.36 之前这里是 `CellType::as_u8`。改成位掩码之后，
+    /// 生物库里的身体可以带"叶绿体 + 气囊"这种组合——而那正是
+    /// 工坊里"新建一种细胞"的载体。
+    pub cells: Vec<(i16, i16, u16)>,
 }
 
 // ---------------------------------------------------------------------------

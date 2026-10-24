@@ -226,7 +226,7 @@ fn demo_state() -> UiState {
             (9, 10, CellType::Mover),
         ];
         for &(x, y, k) in body {
-            state.workshop.set(x, y, Some(k));
+            state.workshop.set(x, y, Some(vivarium_core::organelle::Organelles::from_cell_type(k)));
         }
         state.library = vec![
             vivarium_ui::LibraryEntry {

@@ -41,6 +41,7 @@ use std::time::{Duration, Instant};
 
 use vivarium_app::{FrameBudget, TimeScale};
 use vivarium_core::life::{Cell, CellType, Organism, BIRTH_ENERGY_PER_CELL};
+use vivarium_core::organelle::Organelles;
 use vivarium_core::life::{Genome, INPUTS, OUTPUTS};
 use vivarium_core::life_sim::{handcrafted_fish_genome, stock_surface, LifeSim, Tactic, MAX_AGE};
 use vivarium_core::{save, worldgen, MaterialKind, MaterialSim, Rng, World, WorldLayout};
@@ -362,7 +363,7 @@ struct Game {
     /// 放置是**两段式**的：工坊里点"放置到世界"只记下要放什么，
     /// 然后等用户在世界里点一下决定放哪儿。一段式（直接放在屏幕中心）
     /// 看起来更省事，但"我想把它放在那片浅滩上"是最常见的诉求。
-    pending_body: Option<Vec<(i16, i16, u8)>>,
+    pending_body: Option<Vec<(i16, i16, u16)>>,
     /// 光标在窗口里的位置（物理像素）。点击时用它换算成世界格。
     cursor: Option<(f64, f64)>,
     /// 左键按着，而且当前工具会落笔。
@@ -616,7 +617,7 @@ impl Game {
     /// 落点合法性交给 `spawn`：它会检查边界和占格，失败就什么都不做。
     /// 界面那边已经把"没有嘴 / 超过体型上限 / 不连通"拦住了，但**能不能放下**
     /// 只有世界知道（可能压在石头上），所以这里仍然要处理失败。
-    fn place_body(&mut self, cells: Vec<(i16, i16, u8)>) {
+    fn place_body(&mut self, cells: Vec<(i16, i16, u16)>) {
         let tick = self.world.tick();
         let Some((cx, cy)) = self.cell_under_cursor() else {
             return;
@@ -624,9 +625,11 @@ impl Game {
         if cells.is_empty() {
             return;
         }
+        // 每一格按**细胞器位掩码**造，而不是按类型编号：
+        // 工坊现在能画出"叶绿体 + 气囊"这种组合，而 `CellType` 表达不了它。
         let body: Vec<Cell> = cells
             .iter()
-            .map(|&(dx, dy, kind)| Cell::new(CellType::from_u8(kind), (dx, dy)))
+            .map(|&(dx, dy, bits)| Cell::from_organelles(Organelles(bits), (dx, dy)))
             .collect();
         // 有没有牙决定社交倾向——和 `stock_surface` 里同一条规则。
         let tactic = if body.iter().any(|c| c.kind == CellType::Killer) {
@@ -1838,13 +1841,33 @@ fn load_library() -> Vec<vivarium_ui::LibraryEntry> {
 fn parse_body(text: &str) -> Option<vivarium_ui::LibraryEntry> {
     let mut lines = text.lines().filter(|l| !l.trim().is_empty());
     let name = lines.next()?.trim().to_owned();
+    let mut rest: Vec<&str> = lines.collect();
+    // **v2 用一个标记行，不靠"值的大小"猜版本。**
+    //
+    // 旧格式第三列是 `CellType::as_u8`（0..=6），新格式是细胞器位掩码
+    // （`Organelles(u16)`）——而位掩码完全可能也是 0..=6（比如只有气囊的格子
+    // 是 `1 << 8`，但"只有刺 1 级"是 `1 << 4` = 16，撞不上；可是"只有
+    // 线粒体"是 1024）。靠值域猜会有歧义，标记行不会有。
+    let v2 = rest.first().is_some_and(|l| l.trim() == "#v2");
+    if v2 {
+        rest.remove(0);
+    }
     let mut cells = Vec::new();
-    for line in lines {
+    for line in rest {
         let mut parts = line.split_whitespace();
         let x: i16 = parts.next()?.parse().ok()?;
         let y: i16 = parts.next()?.parse().ok()?;
-        let k: u8 = parts.next()?.parse().ok()?;
-        cells.push((x, y, k));
+        let raw: u32 = parts.next()?.parse().ok()?;
+        // v1 存的是类型编号，转成对应的细胞器；v2 直接就是位掩码。
+        let bits = if v2 {
+            u16::try_from(raw).ok()?
+        } else {
+            vivarium_core::organelle::Organelles::from_cell_type(
+                vivarium_core::CellType::from_u8(u8::try_from(raw).ok()?),
+            )
+            .0
+        };
+        cells.push((x, y, bits));
     }
     if cells.is_empty() {
         return None;
@@ -1853,15 +1876,17 @@ fn parse_body(text: &str) -> Option<vivarium_ui::LibraryEntry> {
 }
 
 /// 存一份身体。返回写到的路径。
-fn save_body(name: &str, cells: &[(i16, i16, u8)]) -> std::io::Result<std::path::PathBuf> {
+fn save_body(name: &str, cells: &[(i16, i16, u16)]) -> std::io::Result<std::path::PathBuf> {
     let dir = library_dir();
     std::fs::create_dir_all(&dir)?;
     let path = dir.join(format!("{}.txt", safe_file_name(name)));
     let mut text = String::with_capacity(32 + cells.len() * 10);
     text.push_str(name.trim());
     text.push('\n');
-    for &(x, y, k) in cells {
-        text.push_str(&format!("{x} {y} {k}\n"));
+    // v2 标记：第三列从"细胞类型编号"变成"细胞器位掩码"。
+    text.push_str("#v2\n");
+    for &(x, y, bits) in cells {
+        text.push_str(&format!("{x} {y} {bits}\n"));
     }
     std::fs::write(&path, text)?;
     Ok(path)
@@ -1884,8 +1909,8 @@ mod library_tests {
     /// 从界面上完全看不出来。
     #[test]
     fn body_round_trips_through_text() {
-        let cells = vec![(0i16, 0i16, 2u8), (1, 0, 2), (0, -1, 1), (-1, 0, 0)];
-        let mut text = String::from("三节虫\n");
+        let cells = vec![(0i16, 0i16, 2050u16), (1, 0, 4), (0, -1, 1), (-1, 0, 2)];
+        let mut text = String::from("三节虫\n#v2\n");
         for &(x, y, k) in &cells {
             text.push_str(&format!("{x} {y} {k}\n"));
         }
@@ -1902,6 +1927,10 @@ mod library_tests {
         assert!(parse_body("名字\n不是数字 0 2\n").is_none());
         // 空行不算坏：手写文件常常多一个换行。
         assert!(parse_body("名字\n\n0 0 2\n").is_some());
+        // **v1 老档仍然能读**：第三列是类型编号，解析时转成对应细胞器。
+        let old = parse_body("老鱼\n0 0 1\n1 0 2\n").expect("v1 应当还能读");
+        assert_eq!(old.cells.len(), 2);
+        assert_eq!(old.cells[0].2, Organelles::from_cell_type(CellType::Producer).0);
     }
 
     /// 名字里的非法字符被换掉，而不是报错或逃出目录。

@@ -22,6 +22,9 @@ use egui::{
     Align, Color32, CornerRadius, FontId, Layout, Rect, Sense, Stroke, StrokeKind, Ui, Vec2,
 };
 
+use vivarium_core::organelle::{
+    Organelles, ARMOR, BUILDER, CHLORO_SHIFT, DIGEST, EYE, FLAGELLUM_SHIFT, GAS, MITO, STING_SHIFT,
+};
 use vivarium_core::{morph::MAX_BODY_CELLS, palette, CellType};
 
 use crate::state::{Snapshot, UiState, DRAFT_SIZE};
@@ -134,7 +137,8 @@ fn cell_picker(ui: &mut Ui, state: &mut UiState) {
         ui.add_space(2.0);
         for kind in CellType::ALL {
             let [r, g, b] = palette::cell_rgb(kind);
-            let selected = !state.workshop.erasing && state.workshop.brush == kind;
+            let preset = Organelles::from_cell_type(kind);
+            let selected = !state.workshop.erasing && state.workshop.brush == preset;
             if widgets::swatch(
                 ui,
                 Color32::from_rgb(r, g, b),
@@ -144,7 +148,7 @@ fn cell_picker(ui: &mut Ui, state: &mut UiState) {
             )
             .clicked()
             {
-                state.workshop.brush = kind;
+                state.workshop.brush = preset;
                 state.workshop.erasing = false;
                 state.emit(Command::SetCell(kind));
             }
@@ -210,10 +214,12 @@ fn board(ui: &mut Ui, state: &mut UiState) {
     // 细胞。
     for y in 0..DRAFT_SIZE {
         for x in 0..DRAFT_SIZE {
-            let Some(kind) = state.workshop.get(x, y) else {
+            let Some(o) = state.workshop.get(x, y) else {
                 continue;
             };
-            let [r, g, b] = palette::cell_rgb(kind);
+            // 颜色按**代表类型**取：一格「叶绿体 + 气囊」画成绿色，
+            // 因为它的主功能是产能。精确功能看右侧的细胞器清单。
+            let [r, g, b] = palette::cell_rgb(o.primary_cell_type());
             let cell_rect = Rect::from_min_size(
                 egui::pos2(
                     rect.left() + x as f32 * CELL + 1.0,
@@ -255,13 +261,22 @@ fn side_panel(ui: &mut Ui, state: &mut UiState) {
         //
         // 放在最上面而不是藏在 tooltip 里：画身体的时候要反复问
         // "这一格到底干什么用"，而悬停查询会打断手上的动作。
-        widgets::section(ui, cell_label(state.workshop.brush));
+        let brush = state.workshop.brush;
+        widgets::section(ui, &organelle_list(brush));
         ui.add_space(1.0);
         ui.label(
-            egui::RichText::new(state.workshop.brush.describe())
-                .size(9.0)
-                .color(theme::TEXT_DIM),
+            egui::RichText::new(format!(
+                "维持 {}/tick · 密度 {:.2} · 效率 {:.0}%",
+                brush.upkeep(),
+                brush.density(),
+                brush.efficiency() * 100.0
+            ))
+            .size(9.0)
+            .color(theme::TEXT_DIM),
         );
+        ui.add_space(6.0);
+
+        organelle_editor(ui, state);
         ui.add_space(6.0);
 
         widgets::section(ui, "名字");
@@ -384,7 +399,7 @@ fn library_strip(ui: &mut Ui, state: &mut UiState) {
             return;
         }
         let mut delete: Option<String> = None;
-        let mut load: Option<Vec<(i16, i16, u8)>> = None;
+        let mut load: Option<Vec<(i16, i16, u16)>> = None;
         for entry in &state.library {
             if widgets::flat_button(
                 ui,
@@ -419,23 +434,125 @@ fn hint_line(ui: &mut Ui, text: &str, color: Color32) {
 }
 
 /// 数一数各类细胞。返回 `(移动, 眼, 嘴, 杀手)`。
-fn count_kinds(cells: &[(i16, i16, u8)]) -> (usize, usize, usize, usize, usize) {
-    let mut movers = 0;
-    let mut eyes = 0;
-    let mut mouths = 0;
-    let mut killers = 0;
-    let mut producers = 0;
-    for &(_, _, k) in cells {
-        match CellType::from_u8(k) {
-            CellType::Mover => movers += 1,
-            CellType::Eye => eyes += 1,
-            CellType::Mouth => mouths += 1,
-            CellType::Killer => killers += 1,
-            CellType::Producer => producers += 1,
-            _ => {}
-        }
+/// 数一遍各功能有多少**级**（不是多少格）。
+///
+/// 鞭毛和叶绿体有等级：两格 1 级鞭毛和一格 2 级鞭毛在速度上是同一件事
+/// （`speed()` 数的是 `level` 之和），所以这里也数级，统计面板才对得上。
+fn count_kinds(cells: &[(i16, i16, u16)]) -> (usize, usize, usize, usize, usize) {
+    let (mut movers, mut eyes, mut mouths, mut killers, mut producers) = (0, 0, 0, 0, 0);
+    for &(_, _, bits) in cells {
+        let o = Organelles(bits);
+        movers += o.level(FLAGELLUM_SHIFT) as usize;
+        producers += o.level(CHLORO_SHIFT) as usize;
+        eyes += usize::from(o.has(EYE));
+        mouths += usize::from(o.has(DIGEST));
+        killers += usize::from(o.level(STING_SHIFT) > 0);
     }
     (movers, eyes, mouths, killers, producers)
+}
+
+/// 把细胞器位掩码翻译成「叶绿体 ×2 + 气囊」这种短标签。
+fn organelle_list(o: Organelles) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for (shift, name) in [
+        (CHLORO_SHIFT, "叶绿体"),
+        (FLAGELLUM_SHIFT, "鞭毛"),
+        (STING_SHIFT, "刺"),
+    ] {
+        match o.level(shift) {
+            0 => {}
+            1 => parts.push(name.to_string()),
+            n => parts.push(format!("{name} ×{n}")),
+        }
+    }
+    for (flag, name) in [
+        (DIGEST, "嘴"),
+        (ARMOR, "装甲"),
+        (GAS, "气囊"),
+        (EYE, "眼"),
+        (MITO, "线粒体"),
+        (BUILDER, "建造"),
+    ] {
+        if o.has(flag) {
+            parts.push(name.to_string());
+        }
+    }
+    if parts.is_empty() {
+        "空细胞".to_string()
+    } else {
+        parts.join(" + ")
+    }
+}
+
+/// 细胞器编辑器：点一下加一级，循环 0→1→2→0。
+///
+/// 这是「新建一种细胞」的全部实现——`CellType` 是封闭枚举，而功能由
+/// `organelles` 决定，所以**能改位掩码就等于能发明新细胞**。
+/// 三个有等级的（叶绿体 / 鞭毛 / 刺）循环三档，其余五个是开关。
+fn organelle_editor(ui: &mut Ui, state: &mut UiState) {
+    widgets::section(ui, "细胞器");
+    ui.add_space(1.0);
+    ui.label(
+        egui::RichText::new("点一下加一级（0→1→2→0）")
+            .size(8.5)
+            .color(theme::TEXT_FAINT),
+    );
+    ui.add_space(2.0);
+    let mut b = state.workshop.brush;
+
+    // 三行 × 三个：前三个有等级（`level`），后六个是开关。
+    // 用「shift / flag 混在一张表里」会要一个枚举，这里直接分成两段写，
+    // 读起来比一个 `match idx` 清楚。
+    ui.horizontal(|ui| {
+        for (shift, name) in [
+            (CHLORO_SHIFT, "叶绿体"),
+            (FLAGELLUM_SHIFT, "鞭毛"),
+            (STING_SHIFT, "刺"),
+        ] {
+            let lv = b.level(shift);
+            let label = if lv == 0 {
+                name.to_string()
+            } else {
+                format!("{name} {lv}")
+            };
+            let st = if lv > 0 {
+                BtnState::Selected
+            } else {
+                BtnState::Normal
+            };
+            if widgets::flat_button(ui, &label, st).clicked() {
+                b = b.with_level(shift, (lv + 1) % 3);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        for (flag, name) in [(DIGEST, "嘴"), (ARMOR, "装甲"), (GAS, "气囊")] {
+            let on = b.has(flag);
+            let st = if on {
+                BtnState::Selected
+            } else {
+                BtnState::Normal
+            };
+            if widgets::flat_button(ui, name, st).clicked() {
+                b = Organelles(b.0 ^ flag);
+            }
+        }
+    });
+    ui.horizontal(|ui| {
+        for (flag, name) in [(EYE, "眼"), (MITO, "线粒体"), (BUILDER, "建造")] {
+            let on = b.has(flag);
+            let st = if on {
+                BtnState::Selected
+            } else {
+                BtnState::Normal
+            };
+            if widgets::flat_button(ui, name, st).clicked() {
+                b = Organelles(b.0 ^ flag);
+            }
+        }
+    });
+
+    state.workshop.brush = b;
 }
 
 /// 身体是不是连成一片（四邻连通，从任意一格出发能走到所有格）。
@@ -443,7 +560,7 @@ fn count_kinds(cells: &[(i16, i16, u8)]) -> (usize, usize, usize, usize, usize) 
 /// 断开的身体在世界上会变成两团各自为政的细胞，却只有一个锚点——
 /// 移动时一半跟着走、另一半留在原地，然后在下一 tick 被当成"别人的身体"。
 /// 那是很难从画面上看出原因的故障，所以在工坊里就拦下来。
-fn has_anchor_neighbour(cells: &[(i16, i16, u8)]) -> bool {
+fn has_anchor_neighbour(cells: &[(i16, i16, u16)]) -> bool {
     if cells.len() <= 1 {
         return true;
     }
