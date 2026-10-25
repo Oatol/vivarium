@@ -452,6 +452,7 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         temp.push(r.f32()?);
     }
 
+
     // 账与时钟
     let ledger = EnergyLedger {
         injected: r.u64()?,

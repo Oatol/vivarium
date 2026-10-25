@@ -41,6 +41,7 @@ use crate::life::{
     OUT_REPRODUCE, OUT_RIGHT, OUT_UP, REMAINS_ENERGY,
 };
 use crate::material::MaterialKind;
+use crate::moisture::Moisture;
 use crate::organelle::{ARMOR, CHLORO_SHIFT, DIGEST, ROOT, STING};
 use crate::rng::Rng;
 use crate::world::World;
@@ -234,14 +235,8 @@ pub const LAND_DAMP_PER_ROOT: f32 = 0.08;
 /// 海草 481 株吃光所有光的重演。陆地该是"能活，但更苦"。
 pub const LAND_DAMP_MAX: f32 = 0.60;
 
-/// 土壤湿度：离最近的**含水的列**多远就干透了（列数）。
-///
-/// 160 列。512 宽的世界里陆地有 180 列，所以"从海岸往里走 160 列"大致
-/// 就是"走到大陆中央"——再往里就是沙漠。
-///
-/// **这个数决定了"植物能走多远"**，而它是这一整套规则里唯一一个
-/// 关于"陆地有多宽"的数。改它等于改地图上能长植物的比例。
-const SOIL_MOISTURE_SPAN: f32 = 200.0;
+// 湿度衰减到零的距离搬到了 `crate::moisture::SPAN`——它和"距离怎么算"
+// 是同一件事，而距离怎么算现在住在那个模块里。
 
 /// 土壤湿度每多少点回充 1 点含水量。
 ///
@@ -265,15 +260,6 @@ const SOIL_REFILL_PER: u8 = 40;
 /// 唯一的观测方式是跑生态，而生态里它和十几个别的因素混在一起。
 fn producer_gain(light: f32, warmth: f32, damp: f32, wet: f32, producers: usize) -> u32 {
     (PRODUCER_YIELD as f32 * light * warmth * damp * wet * producers as f32) as u32
-}
-
-/// 从湿度表里读一列（横向环绕）。
-fn moisture_at(moisture: &[u8], x: i32) -> u8 {
-    let w = moisture.len();
-    if w == 0 {
-        return 0;
-    }
-    moisture[x.rem_euclid(w as i32) as usize]
 }
 
 /// 一株植物的根能把它在岸上的产能抬到多少。
@@ -719,20 +705,22 @@ pub struct LifeSim {
     /// 如果它住在主循环，`step` 就要多一个参数——而那个签名会被
     /// 几百个测试调用，改动成本远大于收益。
     field: AirField,
-    /// 每一列土壤的湿度（`0..=255`），**按列存，不按格存**。
+    /// 土壤湿度场（`0..=255`，**逐格**）。
     ///
-    /// ## 为什么按列
+    /// 它回答"这一格有多湿"——根从这里抽水，叶绿体按它打折。规则只有
+    /// 一条：**到最近水格的距离**。细节见 [`crate::moisture`]。
     ///
-    /// 湿度在这里只回答一个问题："离最近的水有多远"。那是一个**横向**的量，
-    /// 同一列从地表到地底一样湿。按格存要多花 262 KB（512²）买一个
-    /// 沿深度不变的常数，不值。
+    /// ## 为什么现在存进存档了
     ///
-    /// ## 为什么不存进存档
+    /// v0.41 之前它是"每列一个数"，而那个数纯粹是世界布局的函数，
+    /// 读档时重算一遍就行。换成二维之后它仍然是个纯函数，**但它会被读到旧值**：
+    /// 水会流动（材质模拟），而重算只发生在开新世界 / 读档 / 画笔落笔这三处。
+    /// 于是"存档那一刻的湿度"和"读档时重算出来的湿度"可能差一点点，
+    /// 而两条鱼会因为这个差别游向不同的方向。
     ///
-    /// 它是**世界布局的纯函数**（哪一列有水），和光场同一类东西——
-    /// 读档时重算一遍即可，存档里一个字都不用加。这也意味着玩家
-    /// 挖开一条运河之后湿度会跟着变，而不是冻在开局那一刻。
-    moisture: Vec<u8>,
+    /// 它是**积分状态**，和温度同一类：算过一次就留在那儿，直到下次重算。
+    /// 那就得存。
+    moisture: Moisture,
 }
 
 impl Default for LifeSim {
@@ -753,7 +741,7 @@ impl Default for LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
-            moisture: Vec::new(),
+            moisture: Moisture::new(),
             // 空场：0×0，所有查询都返回默认值。`new` 会按真实尺寸重建。
             field: AirField::default(),
         }
@@ -801,10 +789,31 @@ impl LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
-            moisture: Vec::new(),
+            moisture: Moisture::new(),
             field,
         }
         .with_moisture(world)
+    }
+
+    /// 立刻按世界重算湿度场。
+    ///
+    /// **玩家用画笔改了材质之后必须调这个。** 否则"在内陆挖一个湖"
+    /// 只会多出几格水，而根吸不到它、湿度视图也不变——看起来就是坏了。
+    /// 主循环在落笔那一帧调一次。
+    pub fn refresh_moisture(&mut self, world: &World) {
+        self.moisture.rebuild(world);
+    }
+
+    /// 湿度场（只读）。渲染器画"湿度"滤镜、界面显示读数都从这里取。
+    #[inline]
+    pub fn moisture(&self) -> &Moisture {
+        &self.moisture
+    }
+
+    /// 这一格有多湿（`0..=255`）。横向环绕，纵向越界返回 0。
+    #[inline]
+    pub fn moisture_at(&self, x: i32, y: i32) -> u8 {
+        self.moisture.at(x, y)
     }
 
     /// 光场与温度场（只读）。渲染器和界面从这里取。
@@ -828,87 +837,13 @@ impl LifeSim {
         self.field.refresh(world);
     }
 
-    /// 重算每一列的土壤湿度。
+    /// 按世界重算湿度场。
     ///
-    /// 判据：**这一列有没有水**。有水的列（海、湖、水洼）湿度满；
-    /// 没水的列按"到最近含水的列有多远"衰减。
-    ///
-    /// ```text
-    /// moisture(d) = 255 × (1 − d / 200)
-    /// ```
-    ///
-    /// **线性，不是平方。** 平方试过：它和"产能按湿度打折"叠在一起之后
-    /// 总效果是四次方，于是可活的那条带子窄到只有离岸十列——实测
-    /// 湿度 242 活、212 饿死。线性让"走一半路 = 一半水 = 一半产量"，
-    /// 而这句话是能被玩家理解的。
-    ///
-    /// 横向是**环面**，所以距离也是环绕的（从另一边绕过去更近就算更近）——
-    /// 和 `worldgen` 里算海岸距离时不同（那里刻意不环绕，否则海永远浅），
-    /// 因为这里问的是"水在哪儿"，环面上确实从两边都能走到。
+    /// 真正的算法在 [`crate::moisture`]：**到最近水格的二维距离**。
+    /// 这里只负责把它挂到 `LifeSim` 的生命周期上（开新世界时调一次）。
     fn with_moisture(mut self, world: &World) -> Self {
-        let w = world.width();
-        let h = world.height();
-        if w == 0 || h == 0 {
-            return self;
-        }
-        let mut wet = vec![false; w];
-        for (x, slot) in wet.iter_mut().enumerate() {
-            for y in 0..h {
-                if world.get(x as isize, y as isize) == MaterialKind::Water {
-                    *slot = true;
-                    break;
-                }
-            }
-        }
-        // 环面上的最近距离：**绕两圈**再取最小。
-        //
-        // 只绕一圈的话，跨过世界边界的那些列会算成"离水很远"——
-        // 而横向是环面，边界那一边的水确实就在隔壁。绕两圈之后
-        // 每列的左右两侧都被扫到过，`min` 自然给出环面上的真距离。
-        let mut dist = vec![usize::MAX; w];
-        let mut last: Option<usize> = None;
-        for i in 0..2 * w {
-            let x = i % w;
-            if wet[x] {
-                last = Some(i);
-            }
-            if let Some(l) = last {
-                dist[x] = dist[x].min(i - l);
-            }
-        }
-        let mut last: Option<usize> = None;
-        for i in (0..2 * w).rev() {
-            let x = i % w;
-            if wet[x] {
-                last = Some(i);
-            }
-            if let Some(l) = last {
-                dist[x] = dist[x].min(l - i);
-            }
-        }
-
-        self.moisture = dist
-            .iter()
-            .map(|&d| {
-                if d == usize::MAX {
-                    // 一滴水都没有的世界：全干。这是合法的（空世界就是这样）。
-                    return 0;
-                }
-                let t = 1.0 - (d as f32 / SOIL_MOISTURE_SPAN).min(1.0);
-                (255.0 * t).round().clamp(0.0, 255.0) as u8
-            })
-            .collect();
+        self.moisture.rebuild(world);
         self
-    }
-
-    /// 这一列的土壤湿度（`0..=255`）。没有这一列时返回 0。
-    pub fn moisture_at(&self, x: i32) -> u8 {
-        moisture_at(&self.moisture, x)
-    }
-
-    /// 整张湿度表（每列一个数）。给界面和测量用。
-    pub fn moisture(&self) -> &[u8] {
-        &self.moisture
     }
 
     /// 打开/关闭藻席生长。
@@ -982,13 +917,13 @@ impl LifeSim {
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
-            moisture: Vec::new(),
+            moisture: Moisture::new(),
             field,
         };
-        // 湿度是**布局的纯函数**，不存进档：读档时按当前世界重算。
-        // 于是"存档之后挖了一条运河"也能被读回来——湿度跟着地形走，
-        // 而不是冻在存档那一刻。
-        sim = sim.with_moisture(world);
+        // 湿度是**世界布局的纯函数**（到最近水格的距离），而且它每 tick
+        // 都跟着 `step` 重算——所以读档时算一遍就够了，存档里一个字都不用加。
+        // 存档那一刻世界是什么样，读回来就是什么样，重算的结果必然一致。
+        sim.moisture.rebuild(world);
         sim.rng.set_state(save.rng_state.0, save.rng_state.1);
 
         for org in save.organisms {
@@ -1359,6 +1294,17 @@ impl LifeSim {
             .fold((0f32, 0usize), |(s, n), o| (s + o.generation as f32, n + 1));
         self.stats.avg_generation = if n == 0 { 0.0 } else { sum / n as f32 };
         self.stats.gene_distance = self.gene_distance();
+
+        // 6) 湿度。放在**最后**，因为它必须反映"这一 tick 结束时的世界"。
+        //
+        // 代价很小（粗格 128×128，两遍扫描几十微秒），而它买到的东西
+        // 很大：**湿度永远等于当前世界的函数**。于是"水流动了但湿度停在
+        // 旧值"这一类问题根本不存在，存档也不用存它（读档时算一遍就是
+        // 同一个结果）。
+        //
+        // 放在最后而不是开头，是因为世界在 tick 里会变（尸体落地、藻被吃掉），
+        // 而"tick 结束时的世界"才是下一次存档会写下去的那一个。
+        self.moisture.rebuild(world);
     }
 
     /// 让一个有机体变成残骸。
@@ -1551,7 +1497,7 @@ impl LifeSim {
     ///
     /// 取所有根里**最湿的那一处**，不是平均：一棵树有一条根扎到了湿土，
     /// 整株就该活——根是并联的，不是串联的。
-    fn root_water(world: &World, moisture: &[u8], org: &Organism) -> Option<u8> {
+    fn root_water(world: &World, moisture: &Moisture, org: &Organism) -> Option<u8> {
         let mut best: Option<u8> = None;
         for cell in &org.cells {
             if !cell.organelles.has(ROOT) {
@@ -1565,7 +1511,10 @@ impl LifeSim {
                     MaterialKind::Water => return Some(u8::MAX),
                     // 土壤：按这一列的湿度。
                     MaterialKind::Stone | MaterialKind::Sand => {
-                        let m = moisture_at(moisture, nx);
+                        // **读那一格自己的湿度**，不是那一列的。二维场之后
+                        // 悬崖底下和悬崖顶上不是同一个数——而根扎在哪儿
+                        // 就该读哪儿。
+                        let m = moisture.at(nx, ny);
                         best = Some(best.map_or(m, |b| b.max(m)));
                     }
                     _ => {}
@@ -5453,10 +5402,12 @@ mod tests {
     fn soil_moisture_falls_off_with_distance_from_water() {
         let (mut w, shore) = flat_shore();
         let sim = LifeSim::new(&mut w);
-        let at = |d: i32| sim.moisture_at(shore + d);
-        // 最靠岸的那一列**不含水**（水到 x=19 为止），所以它的距离是 1，
-        // 湿度 255×(1−1/200) = 254。差这一格不是 bug，是"海岸线"的定义。
-        assert_eq!(at(0), 254, "紧挨着水的土几乎是满的");
+        // 土壤在 y=60（水面之下 20 格那层石头），所以这里量的是"地表"。
+        let at = |d: i32| sim.moisture_at(shore + d, 60);
+        // 最靠岸的那一列**不含水**（水到 x=19 为止），而湿度是**粗格**
+        // 之间的斜向距离（chamfer 4/3 格 × 4 格/粗格 ≈ 5.3 格），
+        // 所以是 248 而不是 255。差这几格是"粗格"的代价，不是 bug。
+        assert!(at(0) >= 245, "紧挨着水的土几乎是满的：{}", at(0));
         assert!(at(50) > at(100), "越远越干：{} vs {}", at(50), at(100));
         assert!(at(100) > at(150), "越远越干：{} vs {}", at(100), at(150));
         assert_eq!(at(210), 0, "超过跨度就干透");
@@ -5466,9 +5417,69 @@ mod tests {
         w2.fill_rect(780, 40, 20, 20, MaterialKind::Water);
         let sim2 = LifeSim::new(&mut w2);
         assert!(
-            sim2.moisture_at(20) > 200,
-            "水在另一头（环绕 40 列远）时，这一列应当很湿：{}",
-            sim2.moisture_at(20)
+            sim2.moisture_at(20, 60) > 200,
+            "水在另一头（环绕 21 列远）时，这一列应当很湿：{}",
+            sim2.moisture_at(20, 60)
+        );
+    }
+
+    /// **湿度是二维的：悬崖顶上比脚下干。**
+    ///
+    /// 这一条是 v0.42 换掉"每列一个数"的全部理由。旧模型里同一列从地表
+    /// 到地底一样湿，于是"离海 50 格、但高出海面 60 格"的悬崖顶被算成
+    /// 和海岸平地一样湿——而它实际上够不到任何水。
+    ///
+    /// 判据用同一列的两个高度，所以**横向距离完全相同**，差别只可能来自
+    /// 纵向。这样它测的就只有"二维"这一件事。
+    #[test]
+    fn a_cliff_top_is_drier_than_its_base() {
+        let mut w = World::new(200, 200).unwrap();
+        // 左边一片海（水面 y=90），右边整块陆地。
+        w.fill_rect(0, 90, 20, 20, MaterialKind::Water);
+        w.fill_rect(0, 100, 200, 100, MaterialKind::Stone);
+        // 一根柱子：x=60..64 从 y=40 一直到地底。
+        w.fill_rect(60, 40, 4, 60, MaterialKind::Stone);
+        let sim = LifeSim::new(&mut w);
+
+        let base = sim.moisture_at(61, 99);
+        let top = sim.moisture_at(61, 41);
+        assert!(
+            base > top,
+            "同一列里，柱子根应当比柱顶湿：根 {base}、顶 {top}"
+        );
+        assert!(
+            base - top > 20,
+            "差得应当明显（柱顶高出海面 50 格）：根 {base}、顶 {top}"
+        );
+    }
+
+    /// **画笔挖出来的湖也会变湿。**
+    ///
+    /// 湿度只在 `step` 末尾重算，而暂停时 `step` 不走——所以玩家用画笔
+    /// 挖一个湖之后必须显式调 `refresh_moisture`。不调的话：根吸不到
+    /// 那几格水、湿度视图也纹丝不动，看起来就是"湖白挖了"。
+    #[test]
+    fn painting_a_lake_makes_the_ground_around_it_wet() {
+        // 一滴水都没有的世界：全干。
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 40, 64, 24, MaterialKind::Stone);
+        let mut sim = LifeSim::new(&mut w);
+        assert_eq!(sim.moisture_at(32, 39), 0, "没有水的世界应当全干");
+
+        // 在中间挖一个湖，然后**显式刷新**（暂停时不会有 `step`）。
+        w.fill_rect(28, 30, 8, 10, MaterialKind::Water);
+        sim.refresh_moisture(&w);
+
+        assert!(
+            sim.moisture_at(28, 39) > 200,
+            "湖边的土应当立刻变湿：{}",
+            sim.moisture_at(28, 39)
+        );
+        assert!(
+            sim.moisture_at(32, 39) > sim.moisture_at(60, 39),
+            "离湖越远越干：近 {}、远 {}",
+            sim.moisture_at(32, 39),
+            sim.moisture_at(60, 39)
         );
     }
 
@@ -5504,9 +5515,9 @@ mod tests {
         sim.set_food_growth(false);
         let x = shore + 190;
         assert!(
-            sim.moisture_at(x) < 40,
+            sim.moisture_at(x, 60) < 40,
             "离岸 190 列的湿度应当低到回充不了：{}",
-            sim.moisture_at(x)
+            sim.moisture_at(x, 60)
         );
         let id = sim.spawn_injected(&mut w, potted_plant((x, 58))).unwrap();
         let before = sim.organism(id).unwrap().hydration;

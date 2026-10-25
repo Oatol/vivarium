@@ -31,6 +31,7 @@
 //! 是下一步。
 
 pub mod panels;
+pub mod quit_confirm;
 pub mod state;
 pub mod theme;
 pub mod widgets;
@@ -126,6 +127,10 @@ impl Ui {
             }
             modal = workshop::draw(ui, state, snap);
             modal |= world_window::draw(ui, state, snap);
+            // 退出确认**最后画**：它要盖住所有东西，包括别的模态。
+            // 它一出现，别的窗口就不该再接收点击——`modal` 是"或"起来的，
+            // 所以顺序只影响视觉，不影响判定。
+            modal |= quit_confirm::draw(ui, state);
         });
 
         let commands = state.take_commands();
@@ -151,9 +156,10 @@ impl Default for Ui {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::{CellInfo, HoverOrganism};
+    use crate::state::Hover;
+    use vivarium_core::probe::{Group, Probe, Tint, Value};
     use vivarium_core::organelle::{Organelles, GAS};
-    use vivarium_core::{CellType, MaterialKind, ViewMode};
+    use vivarium_core::{CellType, ViewMode};
 
     /// **每个预设都必须是合法尺寸。**
     ///
@@ -310,6 +316,45 @@ mod tests {
             full.shapes.iter().all(|s| s.clip_rect.width() >= 0.0),
             "有图元的裁剪矩形宽度为负——说明它被布局挤出了屏幕"
         );
+    }
+
+    /// **退出确认框：必须报 `modal`，而且它自己不会退出。**
+    ///
+    /// 这条守的是防误触的**两半**：
+    ///
+    /// 1. `modal = true` —— 否则框开着的时候点"继续"会同时在世界里落笔；
+    /// 2. **不发 `Command::Quit`** —— 框只是被打开，退出必须点按钮。
+    ///    第一半漏了会画错，第二半漏了会退出，而后者才是用户报的那个 bug。
+    #[test]
+    fn the_quit_dialog_is_modal_and_does_not_quit_by_itself() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot::default();
+
+        // 关着的时候：不报 modal、不发命令。
+        let (out, mut full) = ui.show(&mut state, &snap, screen());
+        assert!(!out.modal);
+        assert!(out.commands.is_empty(), "不该凭空冒出命令");
+        let before = full.shapes.len();
+        full.textures_delta.clear();
+
+        // 打开：报 modal，多画一堆，但仍然**不退出**。
+        state.confirm_quit = true;
+        let (out, mut full) = ui.show(&mut state, &snap, screen());
+        let after = full.shapes.len();
+        // 先清掉纹理增量再断言：`TexturesDelta` 在 drop 时会断言
+        // "必须被消费"，而断言失败时它就在栈上——那会盖掉真正的错误信息。
+        full.textures_delta.clear();
+        assert!(out.modal, "确认框开着时必须报 modal");
+        assert!(
+            after > before + 5,
+            "确认框应当画出边框、标题和两个按钮：{before} → {after}"
+        );
+        assert!(
+            !out.commands.iter().any(|c| matches!(c, Command::Quit)),
+            "**光打开框不能退出**——那正是这个框存在的理由"
+        );
+        assert!(state.confirm_quit, "框应当还开着，等着人回答");
     }
 
     /// 打开「世界」窗口会多画一堆东西，而且必须报 `modal`。
@@ -473,23 +518,26 @@ mod tests {
         );
     }
 
-    fn hover_cell() -> CellInfo {
-        CellInfo {
-            x: 214,
-            y: 137,
-            material: MaterialKind::Water,
-            organism: Some(HoverOrganism {
-                id: 312,
-                cells: 12,
-                generation: 7,
-                energy: (412, 480),
-                producers: 6,
-                cell: CellType::Producer,
-            }),
-            light: 0.71,
-            temp: 20.3,
-            depth: 42,
-        }
+    /// 一份最小的悬停读数：一个组、一条。
+    ///
+    /// 这里只需要"有内容"和"内容足够长"两件事——具体的排版和取值
+    /// 由 `panels` 自己的测试守，不在这里重复一遍。
+    fn hover_cell() -> Hover {
+        vec![Group {
+            title: "格",
+            probes: vec![
+                Probe {
+                    label: "坐标",
+                    value: Value::Text("214, 137".to_owned()),
+                    tint: Tint::Normal,
+                },
+                Probe {
+                    label: "材质",
+                    value: Value::Text("水".to_owned()),
+                    tint: Tint::Normal,
+                },
+            ],
+        }]
     }
 
     /// 悬停读数**只在有内容时画**，而且不能画到屏幕外。

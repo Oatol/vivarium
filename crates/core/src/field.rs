@@ -178,11 +178,23 @@ pub enum ViewMode {
     Light,
     /// 物种：每个个体一个色相，材质压成暗剪影。
     Species,
+    /// 土壤湿度：水满值，往陆地深处衰减。
+    ///
+    /// 和温度、光照一样是"把一层不可见的数据变成可看的图"，但它**看材质**：
+    /// 只画固体和水（空气不显示湿度——否则整根柱子连天空都是同一个颜色，
+    /// 而且"空气有多湿"这句话本身没有意义）。
+    Moisture,
 }
 
 impl ViewMode {
     /// 全部滤镜，按界面上的顺序。
-    pub const ALL: [Self; 4] = [Self::Material, Self::Temperature, Self::Light, Self::Species];
+    pub const ALL: [Self; 5] = [
+        Self::Material,
+        Self::Temperature,
+        Self::Light,
+        Self::Species,
+        Self::Moisture,
+    ];
 
     /// 按钮上的字。
     pub const fn label(self) -> &'static str {
@@ -191,6 +203,7 @@ impl ViewMode {
             Self::Temperature => "温度",
             Self::Light => "光照",
             Self::Species => "物种",
+            Self::Moisture => "湿度",
         }
     }
 
@@ -201,6 +214,9 @@ impl ViewMode {
             Self::Temperature => "热场：蓝是冷，红是热，火会烧出一团亮斑。",
             Self::Light => "光场：太阳从顶上照下来，被石头和沙挡住；点光源会照亮周围。",
             Self::Species => "物种：每个个体一个色相，材质压成暗剪影。",
+            Self::Moisture => {
+                "土壤湿度：水是满值，往陆地深处衰减；越干越暖，越湿越蓝。"
+            }
         }
     }
 
@@ -210,7 +226,8 @@ impl ViewMode {
             Self::Material => Self::Temperature,
             Self::Temperature => Self::Light,
             Self::Light => Self::Species,
-            Self::Species => Self::Material,
+            Self::Species => Self::Moisture,
+            Self::Moisture => Self::Material,
         }
     }
 
@@ -221,6 +238,7 @@ impl ViewMode {
             Self::Temperature => 1,
             Self::Light => 2,
             Self::Species => 3,
+            Self::Moisture => 4,
         }
     }
 }

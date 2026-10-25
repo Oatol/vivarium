@@ -66,10 +66,12 @@ const VIEW_MATERIAL: u32 = 0u;
 const VIEW_TEMPERATURE: u32 = 1u;
 const VIEW_LIGHT: u32 = 2u;
 const VIEW_SPECIES: u32 = 3u;
+const VIEW_MOISTURE: u32 = 4u;
 
 @group(0) @binding(0) var<uniform> u: Scene;
 @group(0) @binding(1) var world_tex: texture_2d<u32>;
-// 场纹理：r = 光照（0..1），g = 温度 / 1200（0..1）。尺寸是粗网格。
+// 场纹理：r = 光照（0..1），g = 温度 / TEMP_DISPLAY_MAX（0..1），
+// b = 湿度（0..1）。尺寸是粗网格（4×4 格一格）。
 @group(0) @binding(2) var field_tex: texture_2d<f32>;
 
 struct VsOut {
@@ -192,16 +194,16 @@ fn same_organism(a: u32, org: u32) -> bool {
 // 场：光照与温度
 // ---------------------------------------------------------------------------
 
-fn field_at(c: vec2<i32>) -> vec2<f32> {
+fn field_at(c: vec2<i32>) -> vec4<f32> {
     let n = vec2<i32>(textureDimensions(field_tex, 0));
     let p = clamp(c, vec2<i32>(0), n - vec2<i32>(1));
-    return textureLoad(field_tex, p, 0).rg;
+    return textureLoad(field_tex, p, 0);
 }
 
 // 双线性采样。场是**粗**的（4 格一格），不插值的话滤镜上是一层 4 像素的
 // 马赛克；而温度本来就该是连续的。四次 textureLoad 换掉一个采样器，
 // 顺带也不用管 `Rg32Float` 不可过滤这件事。
-fn field_smooth(world_pos: vec2<f32>) -> vec2<f32> {
+fn field_smooth(world_pos: vec2<f32>) -> vec4<f32> {
     let g = world_pos / AIR_CELL - vec2<f32>(0.5);
     let base = vec2<i32>(floor(g));
     let f = g - floor(g);
@@ -258,6 +260,33 @@ fn light_ramp(l: f32) -> vec3<f32> {
     return c * c;
 }
 
+// 湿度色带：干（赭石）→ 潮（青）→ 饱和（亮青白）。
+//
+// 为什么不复用 `light_ramp`：那个是"黑 → 蓝 → 白"，而"最干的地方"
+// 不该是黑的——它是**土**，而黑色在这个世界里的意思是"没有东西"。
+// 干湿两端都必须是"有东西"的颜色，否则一眼分不清"沙漠"和"天空"。
+//
+// 返回**线性**值（和另外两条色带一致）。
+fn moisture_ramp(m: f32) -> vec3<f32> {
+    let x = clamp(m, 0.0, 1.0);
+    var c: vec3<f32>;
+    if (x < 0.35) {
+        // 干土 #9A7F5E → 深青 #2F6F8F
+        //
+        // 暖色的那一段**拉长到 0.35**：内陆一大片都该是土色，只有靠近水的
+        // 那一小片转蓝。拉太短（0.15）的话，湿度 0.2 的土就已经是灰绿，
+        // 而"离海 160 列的干地"和"离海 60 列的草地"看起来会一模一样。
+        c = mix(vec3<f32>(0.604, 0.498, 0.369), vec3<f32>(0.184, 0.435, 0.561), x / 0.35);
+    } else if (x < 0.85) {
+        // 深青 → 亮青 #7FD8FF
+        c = mix(vec3<f32>(0.184, 0.435, 0.561), vec3<f32>(0.498, 0.847, 1.0), (x - 0.35) / 0.5);
+    } else {
+        // 亮青 → 近白 #E8FBFF（"这里是水"）
+        c = mix(vec3<f32>(0.498, 0.847, 1.0), vec3<f32>(0.910, 0.984, 1.0), (x - 0.85) / 0.15);
+    }
+    return c * c;
+}
+
 fn hsv2rgb(h: f32, s: f32, v: f32) -> vec3<f32> {
     let k = vec3<f32>(5.0, 3.0, 1.0);
     let p = abs(fract(vec3<f32>(h) + k / 6.0) * 6.0 - vec3<f32>(3.0));
@@ -298,6 +327,31 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
         let f = field_smooth(world_pos);
         return vec4<f32>(light_ramp(f.x), 1.0);
     }
+    // --- 湿度滤镜：水满值，往陆地深处衰减 -------------------------------
+    //
+    // 这个滤镜**看材质**（和温度、光照不同）：只画固体和水。
+    // 不这么做的理由是"空气有多湿"没有意义——不遮的话，一整根柱子
+    // 连天空都会染上同一个颜色，看起来像整张图糊了一层膜。
+    //
+    // 水格强制画满：湿度场在水里本来就是 255，但把这件事在着色器里
+    // 写死一次，可以让"海是一片亮青"这个读法不依赖场的数值细节。
+    if (u.view_mode == VIEW_MOISTURE) {
+        let id = key & 0xFFu;
+        if (is_cell(key)) {
+            return vec4<f32>(bg, 1.0);
+        }
+        // 1 石 / 2 沙 / 3 水 / 6 碎屑 / 7 尸体 是"有东西的格"。
+        let solid = (id == 1u) || (id == 2u) || (id == 6u) || (id == 7u);
+        if (id == 3u) {
+            return vec4<f32>(moisture_ramp(1.0), 1.0);
+        }
+        if (!solid) {
+            return vec4<f32>(bg, 1.0);
+        }
+        let f = field_smooth(world_pos);
+        return vec4<f32>(moisture_ramp(f.z), 1.0);
+    }
+
     // --- 物种滤镜：每个个体一个色相，材质压成暗剪影 ---------------------
     if (u.view_mode == VIEW_SPECIES) {
         if (!is_cell(key)) {

@@ -76,23 +76,11 @@ fn demo_snapshot() -> Snapshot {
             temp_range: (18.0, 620.0),
             avg_temp: 21.5,
         },
-        // 悬停读数要能在预览图里看到，所以给一格"有生物"的数据。
-        hover: Some(vivarium_ui::state::CellInfo {
-            x: 271,
-            y: 168,
-            material: vivarium_core::MaterialKind::Empty,
-            organism: Some(vivarium_ui::state::HoverOrganism {
-                id: 4821,
-                cells: 10,
-                generation: 37,
-                energy: (612, 1400),
-                producers: 4,
-                cell: vivarium_core::CellType::Producer,
-            }),
-            light: 0.71,
-            temp: 22.0,
-            depth: 19,
-        }),
+        // 悬停读数要能在预览图里看到，所以给一份"有生物"的探针表。
+        //
+        // 内容**手写**而不是调 `probe::cell_probes`：预览图要的是一份
+        // 长得像真实读数、且不随生态漂的数据。
+        hover: Some(demo_hover()),
         history: (0..120)
             .map(|i| {
                 let t = i as f32 / 12.0;
@@ -235,6 +223,14 @@ fn world_mode() -> bool {
     std::env::var("VIVARIUM_WORLD").is_ok()
 }
 
+/// 退出确认框模式：`VIVARIUM_QUIT=1`。
+///
+/// 这张图要回答的问题——"两个按钮会不会挤在一起""标题够不够显眼"
+/// "它盖在世界上是不是一眼就看得见"——全是看一眼就知道的。
+fn quit_mode() -> bool {
+    std::env::var("VIVARIUM_QUIT").is_ok()
+}
+
 /// 指针放哪儿：`VIVARIUM_HOVER=375,12`。
 ///
 /// 有了它就能把"悬停某个按钮时会不会有东西挡住界面"变成一张图，
@@ -282,6 +278,9 @@ fn demo_state() -> UiState {
                 cells: vec![(0, 0, 2), (1, 0, 2), (2, 0, 2)],
             },
         ];
+    }
+    if quit_mode() {
+        state.confirm_quit = true;
     }
     if world_mode() {
         state.world.open = true;
@@ -561,6 +560,8 @@ fn ui_preview_png() {
             "workshop-preview.png"
         } else if world_mode() {
             "world-preview.png"
+        } else if quit_mode() {
+            "quit-preview.png"
         } else {
             "ui-preview.png"
         });
@@ -593,7 +594,7 @@ fn ui_preview_png() {
     //
     // 「世界」窗口同理，而且是同一个判据：模态面板盖住了整张图，
     // 下面那些"哪块面板在哪儿"的断言全都失去意义。
-    if workshop_mode() || world_mode() {
+    if workshop_mode() || world_mode() || quit_mode() {
         let lit = pixels
             .chunks_exact(4)
             .filter(|p| p[0] > 24 || p[1] > 24 || p[2] > 24)
@@ -713,10 +714,19 @@ fn ui_preview_png() {
     //    正好也是面板色。实测 `PALETTE_H` 差 4px（世界区跟着挪 2px）
     //    就能让同一个点从"通过"变成"失败"——这不是布局坏了，是判据太窄。
     //    改成扫一整条竖线，要求绝大部分不是面板色。
+    //
+    //    **指针附近那一段要跳过**：悬停读数框是合法浮层，它就画在指针旁边，
+    //    底色也正好是面板色。它的高度随内容变（现在是 11 行，比早先的 5 行
+    //    高了一倍多），把它算进去等于在测"读数框有多高"。
+    //    这里跳过的范围比框本身宽一圈，所以框再长几行也不会误报。
+    let pointer_y = hover_at().y;
     let world_h = H - con - pal;
     let mut panel_like = 0u32;
     let mut total = 0u32;
     for y in (top + 2)..(world_h - 2) {
+        if (y as f32 - pointer_y).abs() < 200.0 {
+            continue;
+        }
         let c = px(W / 2, y);
         if (0..3).all(|i| c[i].abs_diff(panel[i]) <= 1) {
             panel_like += 1;
@@ -873,4 +883,89 @@ fn ui_preview_png() {
     assert!(ui.font.is_some(), "没找到中文字体，界面上的中文会变成方块");
 
     println!("界面截图：{}", path.display());
+}
+
+/// 一份"长得像真实读数"的探针表，给预览图用。
+fn demo_hover() -> vivarium_ui::state::Hover {
+    use vivarium_core::probe::{Group, Probe, Tint, Value};
+    vec![
+        Group {
+            title: "格",
+            probes: vec![
+                Probe {
+                    label: "坐标",
+                    value: Value::Text("271, 168".to_owned()),
+                    tint: Tint::Normal,
+                },
+                Probe {
+                    label: "深度",
+                    value: Value::Text("-19 格".to_owned()),
+                    tint: Tint::Dim,
+                },
+                Probe {
+                    label: "材质",
+                    value: Value::Text("空".to_owned()),
+                    tint: Tint::Normal,
+                },
+            ],
+        },
+        Group {
+            title: "场",
+            probes: vec![
+                Probe {
+                    label: "光照",
+                    value: Value::Float {
+                        v: 0.71,
+                        digits: 2,
+                        unit: "",
+                    },
+                    tint: Tint::Light,
+                },
+                Probe {
+                    label: "温度",
+                    value: Value::Float {
+                        v: 22.0,
+                        digits: 0,
+                        unit: " °C",
+                    },
+                    tint: Tint::Temp,
+                },
+                Probe {
+                    label: "湿度",
+                    value: Value::Ratio { a: 96, b: 255 },
+                    tint: Tint::Moisture,
+                },
+            ],
+        },
+        Group {
+            title: "生物",
+            probes: vec![
+                Probe {
+                    label: "个体",
+                    value: Value::Text("#4821 · 10 格 · 代 37".to_owned()),
+                    tint: Tint::Accent,
+                },
+                Probe {
+                    label: "细胞",
+                    value: Value::Text("叶绿体 ×2 + 线粒体 + 根".to_owned()),
+                    tint: Tint::Normal,
+                },
+                Probe {
+                    label: "能量",
+                    value: Value::Ratio { a: 612, b: 1400 },
+                    tint: Tint::Normal,
+                },
+                Probe {
+                    label: "生物量",
+                    value: Value::Ratio { a: 90, b: 500 },
+                    tint: Tint::Dim,
+                },
+                Probe {
+                    label: "含水量",
+                    value: Value::Ratio { a: 255, b: 255 },
+                    tint: Tint::Dim,
+                },
+            ],
+        },
+    ]
 }

@@ -516,14 +516,20 @@ impl Game {
         )
     }
 
-    fn on_key(&mut self, key: &Key, event_loop: &ActiveEventLoop) {
+    fn on_key(&mut self, key: &Key, _event_loop: &ActiveEventLoop) {
         match key {
-            // Esc 有两件事要做，**顺序不能反**。
+            // Esc 有三件事要做，**顺序不能反**。
             //
-            // 正在连续放置身体时，Esc 的语义是"停手"——这是用户唯一会
-            // 主动按 Esc 的时刻。此时直接退出程序等于"我想停手，结果
-            // 把程序关了"，而那是最让人火大的一种交互。
-            // 没在放置时，Esc 仍然是退出。
+            // 1. 正在连续放置身体 → "停手"。这是用户唯一会主动按 Esc 的时刻。
+            // 2. 退出确认框开着 → 关掉它（= 取消退出）。
+            // 3. 否则 → **打开确认框**，不退出。
+            //
+            // 第 3 条原来是 `event_loop.exit()`，而那是一个真实的误触来源：
+            // "放完一只生物 → 想取消 → 按 Esc"是一个连续动作，手一抖按第二下
+            // 程序就没了。现在 Esc **永远不退出**，退出只能点按钮。
+            //
+            // 反过来（Esc 在框里表示确认）也不行：那等于把"连按两下退出"
+            // 原样保留下来，防误触就白做了。
             Key::Named(NamedKey::Escape) => {
                 if self.pending_body.take().is_some() {
                     let tick = self.world.tick();
@@ -533,7 +539,11 @@ impl Game {
                         "停止放置（Esc）",
                     );
                 } else {
-                    event_loop.exit();
+                    // 框开着 → 关掉它（"继续"）；关着 → 打开它。
+                    //
+                    // 两件事写成一行 `!x` 而不是两个分支：它们**就是**
+                    // 同一个开关的两端，分开写会让人以为还有第三种情况。
+                    self.ui.state.confirm_quit = !self.ui.state.confirm_quit;
                 }
             }
             Key::Named(NamedKey::Space) => {
@@ -1161,12 +1171,17 @@ impl Game {
         // 玩家画了一把火、把指针放上去，读数是 22 °C——看起来完全像温度算错了。
         if self.field_dirty {
             self.life.refresh_field(&self.world);
+            // 湿度也要跟着刷：它每 tick 才重算一次，而**暂停时 tick 不走**。
+            // 不刷的话，玩家挖一个湖、指针挪过去——读数还是 0，看起来
+            // 完全像"这格水不存在"。
+            self.life.refresh_moisture(&self.world);
             self.field_dirty = false;
         }
         //
-        // 场要**先**传上去：着色器在材质 / 温度 / 光照 / 物种四种滤镜里
+        // 场要**先**传上去：着色器在材质 / 温度 / 光照 / 物种 / 湿度五种滤镜里
         // 都可能读它，而上传是按版本号跳过的，没变就什么都不做。
-        self.renderer.upload_field(self.life.field());
+        self.renderer
+            .upload_field(self.life.field(), self.life.moisture());
         self.renderer.set_view_mode(self.ui.state.view);
 
         // device / queue 先克隆出来：`render_with` 要独占 `renderer`，
@@ -1239,62 +1254,15 @@ impl Game {
         }
     }
 
-    /// 光标下面那一格的属性。
+    /// 光标下面那一格的读数。
     ///
-    /// 每帧都算一遍，因为光标每帧都可能动。成本是常数：一次 `cell_at`
-    /// 加四次查表，和"扫一遍世界"完全不是一个量级。
-    fn hover_info(&self) -> Option<vivarium_ui::state::CellInfo> {
+    /// **内容全部来自 `vivarium_core::probe`**——这里只负责"指针在哪一格"，
+    /// 而"这一格有什么值得看"是 core 的事。早先这里手写了一遍字段
+    /// （材质、光、温度、深度、生物摘要），加一项要改三个地方，
+    /// 而漏掉一处不会编译报错，只是看不见。
+    fn hover_info(&self) -> Option<vivarium_ui::state::Hover> {
         let (x, y) = self.cell_under_cursor()?;
-        let (xs, ys) = (x as isize, y as isize);
-        let material = self.world.get(xs, ys);
-
-        // 深度：先找这一列的**水面线**（最上面那一格水），再算 y - 水面线。
-        //
-        // 不能"往上数到第一个非水格就停"：站在岛上时往上数会先数到石头，
-        // 于是"离水面多高"变成了"头顶有几格石头"。按列找水面线对任何形状都成立。
-        //
-        // 单独算而不是从光照反推：站在岛的阴影里时"深度很浅而光为 0"，
-        // 这两个数必须分开显示，否则用户会以为光场算错了。
-        let waterline = (0..self.world.height() as i32)
-            .find(|yy| self.world.get(xs, *yy as isize) == MaterialKind::Water);
-        let depth = match waterline {
-            // 水面之上是负数，水面那一格是 0。
-            Some(wl) => y - wl,
-            // 整列没有水（纯陆地或纯天空），"深度"没有意义。
-            None => 0,
-        };
-
-        let owner = self.world.owner(xs, ys);
-        let organism = if owner.organism == 0 {
-            None
-        } else {
-            self.life.organism(owner.organism).map(|o| {
-                let cell = o
-                    .cells
-                    .iter()
-                    .find(|c| o.cell_at(c) == (x, y))
-                    .map(|c| c.kind)
-                    .unwrap_or(CellType::Producer);
-                vivarium_ui::state::HoverOrganism {
-                    id: o.id,
-                    cells: o.cells.len(),
-                    generation: o.generation,
-                    energy: (o.energy, o.max_energy()),
-                    producers: o.count(CellType::Producer),
-                    cell,
-                }
-            })
-        };
-
-        Some(vivarium_ui::state::CellInfo {
-            x,
-            y,
-            material,
-            organism,
-            light: self.life.field().light_at(x as f32, y as f32),
-            temp: self.life.field().temp_at(x as f32, y as f32),
-            depth,
-        })
+        Some(vivarium_core::probe::cell_probes(&self.world, &self.life, x, y))
     }
 
     /// 把"界面里选中的那个 id"翻译成一个值快照。

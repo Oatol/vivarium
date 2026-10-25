@@ -16,6 +16,7 @@
 use std::collections::VecDeque;
 
 use vivarium_core::organelle::Organelles;
+use vivarium_core::probe::Group;
 use vivarium_core::{CellType, FieldStats, MaterialKind, OrganismId, TimeScale, ViewMode};
 
 // ---------------------------------------------------------------------------
@@ -251,10 +252,10 @@ pub struct Snapshot {
     /// 光场与温度场的统计。
     pub field: FieldStats,
 
-    /// 鼠标下面那一格的属性。指针不在世界上就是 `None`。
+    /// 鼠标下面那一格的读数（分组的探针表）。指针不在世界上就是 `None`。
     ///
     /// 由主循环填：界面拿不到 `&World`，也不该拿。
-    pub hover: Option<CellInfo>,
+    pub hover: Option<Hover>,
 
     /// 种群曲线（归一化到 0..1，最新在最后）。
     pub history: Vec<f32>,
@@ -291,62 +292,12 @@ impl Default for Snapshot {
     }
 }
 
-/// 鼠标下面那一格的属性。
+/// 悬停读数的内容：一张分组的探针表。
 ///
-/// 这就是"每个像素都能储存并显示相关的属性"里**显示**的那一半：
-/// 存的部分在别处（材质在 `MaterialCell`、细胞在 `Organism`、
-/// 温度与光照在 `AirField`），这里只是把四处的东西拼成一份可以
-/// 直接画的快照。
-#[derive(Debug, Clone, PartialEq)]
-pub struct CellInfo {
-    /// 格坐标。
-    pub x: i32,
-    /// 格坐标。
-    pub y: i32,
-    /// 材质。
-    pub material: MaterialKind,
-    /// 这一格如果是生物的一部分，它的摘要。
-    pub organism: Option<HoverOrganism>,
-    /// 光照（0..1）。
-    pub light: f32,
-    /// 温度（°C）。
-    pub temp: f32,
-    /// 这一格离水面多少格（负数是水面之上）。
-    ///
-    /// 单独给出来是因为"光有多亮"和"我在多深"是两个问题：
-    /// 站在岛的阴影里，深度很浅而光是 0。
-    pub depth: i32,
-}
-
-/// 悬停时看到的生物摘要。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HoverOrganism {
-    /// 编号。
-    pub id: OrganismId,
-    /// 细胞数。
-    pub cells: usize,
-    /// 世系深度。
-    pub generation: u32,
-    /// 能量 / 上限。
-    pub energy: (u32, u32),
-    /// 生产者细胞数（决定它能晒多少能量）。
-    pub producers: usize,
-    /// 这一格是哪种细胞。
-    pub cell: CellType,
-}
-
-impl Default for HoverOrganism {
-    fn default() -> Self {
-        Self {
-            id: 0,
-            cells: 0,
-            generation: 0,
-            energy: (0, 0),
-            producers: 0,
-            cell: CellType::Producer,
-        }
-    }
-}
+/// 界面**不认识任何一个具体的量**——它只把 `Value` 排版成字符串。
+/// 所以"以后加了新信息，悬停里能自动看到"这件事，只需要在
+/// `vivarium_core::probe::cell_probes` 里加一行，这里一个字都不用改。
+pub type Hover = Vec<Group>;
 
 /// 检查器里显示的那一个个体。
 ///
@@ -540,7 +491,10 @@ pub enum Command {
     /// 打开"世界"窗口时发一次，存完档再发一次。刻意不做自动刷新：
     /// 每帧扫目录在 2000² 的档上是几十毫秒，而这个列表只在用户看的时候才有意义。
     RefreshSaves,
-    /// 退出。
+    /// 退出程序。
+    ///
+    /// 只由**退出确认框**发出。Esc 不发它——Esc 只负责把那个框打开，
+    /// 因为"取消放置身体"和"退出程序"共用同一个键，误触代价完全不同。
     Quit,
 }
 
@@ -924,6 +878,11 @@ pub struct UiState {
     pub view: ViewMode,
     /// 选中的个体。主循环据此填 `Snapshot::selected`。
     pub selected: Option<OrganismId>,
+    /// 退出确认框是不是开着。
+    ///
+    /// 它住在 `UiState` 而不是主循环里，因为**画它的是界面**，而主循环
+    /// 只回答一个布尔问题："Esc 现在该干什么"。
+    pub confirm_quit: bool,
     /// 检视面板里**被点中的那一格**：`(属于哪个个体, 第几格)`。
     ///
     /// 带上编号是为了"换了选中对象就自动失效"——不需要任何事件通知，
@@ -963,6 +922,7 @@ impl Default for UiState {
             cell: CellType::Producer,
             view: ViewMode::Material,
             selected: None,
+            confirm_quit: false,
             picked_cell: None,
             show_inspector: true,
             show_console: true,

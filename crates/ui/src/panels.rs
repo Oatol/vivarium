@@ -39,8 +39,9 @@ use vivarium_core::organelle::{Organelles, MITO};
 use vivarium_core::{palette, CellType, MaterialKind, TimeScale, ViewMode};
 
 use crate::state::{
-    CellInfo, Command, Level, MorphView, SelectedOrganism, Snapshot, Tool, UiState,
+    Command, Hover, Level, MorphView, SelectedOrganism, Snapshot, Tool, UiState,
 };
+use vivarium_core::probe::Tint;
 use crate::theme;
 use crate::widgets::{self, BtnState, Icon};
 
@@ -85,7 +86,7 @@ pub fn draw(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) -> egui::Rect {
 /// 正右下方会盖住"接下来要看的下一格"——鼠标往右下走的时候，
 /// 框永远压着它。贴右上，指针前进的方向始终是空的。
 fn hover_readout(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::Rect) {
-    let Some(info) = snap.hover.as_ref() else {
+    let Some(hover) = snap.hover.as_ref() else {
         return;
     };
     let Some(pos) = ui.ctx().pointer_latest_pos() else {
@@ -100,18 +101,50 @@ fn hover_readout(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::R
         return;
     }
 
-    let lines = cell_lines(info);
-    let font = egui::FontId::new(9.5, egui::FontFamily::Proportional);
-    let mut width: f32 = 96.0;
-    let mut galleys = Vec::with_capacity(lines.len());
-    for (text, color) in &lines {
-        let g = ui
-            .painter()
-            .layout_no_wrap(text.clone(), font.clone(), *color);
-        width = width.max(g.size().x + 14.0);
-        galleys.push(g);
+    let rows = probe_rows(hover);
+    if rows.is_empty() {
+        return;
     }
-    let line_h = 13.0;
+    let font = egui::FontId::new(9.5, egui::FontFamily::Proportional);
+    let head_font = egui::FontId::new(8.5, egui::FontFamily::Proportional);
+
+    // 先排版，再量尺寸：**宽度由内容决定**，写死一个宽度会让"细胞器清单"
+    // 那一行（"叶绿体 ×2 + 气囊 + 根"）被截掉半截。
+    let mut galleys: Vec<LaidOutRow> = Vec::new();
+    let mut width: f32 = 104.0;
+    for row in &rows {
+        match row {
+            Row::Header(text) => {
+                let g = ui.painter().layout_no_wrap(
+                    text.clone(),
+                    head_font.clone(),
+                    theme::TEXT_FAINT,
+                );
+                width = width.max(g.size().x + 16.0);
+                galleys.push((Some(g), None));
+            }
+            Row::Pair {
+                label,
+                value,
+                tint,
+                num,
+            } => {
+                let lg = ui.painter().layout_no_wrap(
+                    label.clone(),
+                    font.clone(),
+                    theme::TEXT_DIM,
+                );
+                let vg = ui.painter().layout_no_wrap(
+                    value.clone(),
+                    font.clone(),
+                    tint_color(*tint, *num),
+                );
+                width = width.max(lg.size().x + vg.size().x + 26.0);
+                galleys.push((Some(lg), Some(vg)));
+            }
+        }
+    }
+    let line_h = 12.5;
     let height = line_h * galleys.len() as f32 + 8.0;
 
     // 贴指针的右上角；放不下就翻到另一边。
@@ -144,52 +177,118 @@ fn hover_readout(ui: &mut Ui, state: &UiState, snap: &Snapshot, central: egui::R
         Stroke::new(1.0, theme::LINE_STRONG),
         egui::StrokeKind::Inside,
     );
-    for (i, g) in galleys.into_iter().enumerate() {
-        p.galley(
-            egui::pos2(rect.left() + 6.0, rect.top() + 4.0 + i as f32 * line_h),
-            g,
-            theme::TEXT,
-        );
+    for (i, (lg, vg)) in galleys.into_iter().enumerate() {
+        let top = rect.top() + 4.0 + i as f32 * line_h;
+        if let Some(lg) = lg {
+            p.galley(egui::pos2(rect.left() + 6.0, top), lg, theme::TEXT);
+        }
+        // 值**右对齐**：左对齐的话，"光照 0.71" 和 "能量 412/480" 的
+        // 数字会各起一行，扫一眼对不上。
+        if let Some(vg) = vg {
+            let w = vg.size().x;
+            p.galley(egui::pos2(rect.right() - 6.0 - w, top), vg, theme::TEXT);
+        }
     }
 }
 
-/// 读数的内容。颜色分开给，因为"这是材质"和"这是生物"得一眼分得开。
-fn cell_lines(info: &CellInfo) -> Vec<(String, Color32)> {
-    let mut out = Vec::with_capacity(8);
-    out.push((
-        format!("({}, {})  ·  深 {} 格", info.x, info.y, info.depth),
-        theme::TEXT_FAINT,
-    ));
-    match &info.organism {
-        Some(o) => out.push((
-            format!(
-                "#{} {} · {} 格 · {} 代",
-                o.id,
-                cell_label(o.cell),
-                o.cells,
-                o.generation
-            ),
-            theme::ACCENT,
-        )),
-        None => out.push((material_label(info.material).to_owned(), theme::TEXT)),
+/// 排好版的一行：`(左边, 右边)`。标题行右边是 `None`。
+type LaidOutRow = (Option<std::sync::Arc<egui::Galley>>, Option<std::sync::Arc<egui::Galley>>);
+
+/// 读数的一行。
+enum Row {
+    /// 组标题（"格" / "场" / "生物"）。
+    Header(String),
+    /// 标签 + 值。
+    Pair {
+        label: String,
+        value: String,
+        tint: Tint,
+        /// 数值本身（`0..1` 的归一化量）。`Tint` 里那三条色带要用它取色，
+        /// 其余语气忽略它。
+        num: Option<f32>,
+    },
+}
+
+/// 把探针表摊成"一行一条"的列表。
+///
+/// **这里是界面唯一认识探针的地方**：它不知道"湿度"是什么，
+/// 只知道"有一个标签、一个值、一个语气"。以后 `core` 里多一个探针，
+/// 这个函数一个字都不用改。
+fn probe_rows(hover: &Hover) -> Vec<Row> {
+    let mut out = Vec::new();
+    for group in hover {
+        let mut any = false;
+        let mut rows = Vec::new();
+        for probe in &group.probes {
+            let Some(text) = format_value(&probe.value) else {
+                continue; // `Missing`：这一项不适用于这一格
+            };
+            rows.push(Row::Pair {
+                label: probe.label.to_owned(),
+                value: text,
+                tint: probe.tint,
+                num: ramp_input(&probe.value),
+            });
+            any = true;
+        }
+        // 整组都 `Missing` 时不画标题——空的"生物"小标题只会让人以为
+        // 界面漏了东西。
+        if any {
+            out.push(Row::Header(group.title.to_owned()));
+            out.extend(rows);
+        }
     }
-    if let Some(o) = &info.organism {
-        out.push((
-            format!("能量 {}/{} · 生产者 {}", o.energy.0, o.energy.1, o.producers),
-            theme::TEXT_DIM,
-        ));
-    } else {
-        out.push((info.material.describe().to_owned(), theme::TEXT_DIM));
-    }
-    out.push((
-        format!("光照 {:.2}", info.light),
-        light_color(info.light),
-    ));
-    out.push((format!("温度 {:.0}°C", info.temp), temp_color(info.temp)));
     out
 }
 
-/// 光照值 → 一个小色块用的颜色。和滤镜的色带同一个意图，只是简化了。
+/// 一个值怎么念。返回 `None` 表示"这一行不画"。
+fn format_value(v: &vivarium_core::probe::Value) -> Option<String> {
+    use vivarium_core::probe::Value;
+    Some(match v {
+        Value::Int(n) => n.to_string(),
+        Value::Float { v, digits, unit } => format!("{v:.*}{unit}", *digits),
+        Value::Ratio { a, b } => format!("{a}/{b}"),
+        Value::Text(s) => s.clone(),
+        Value::Flag(true) => "是".to_owned(),
+        Value::Flag(false) => "否".to_owned(),
+        Value::Missing => return None,
+    })
+}
+
+/// 从探针的值里取出"给色带用的那个数"。
+///
+/// 三条色带各自归一化：
+/// - 光照本来就是 `0..1`；
+/// - 温度除以 600（和温度滤镜同一个量纲，这样读数和滤镜的颜色能对上）；
+/// - 湿度是 `a/b`，取 `a/b`。
+fn ramp_input(v: &vivarium_core::probe::Value) -> Option<f32> {
+    use vivarium_core::probe::Value;
+    match v {
+        Value::Float { v, .. } => Some(*v),
+        Value::Ratio { a, b } if *b > 0 => Some(*a as f32 / *b as f32),
+        _ => None,
+    }
+}
+
+/// 语气 → 颜色。
+///
+/// **颜色是读数的第二语言**：光照越亮那一行越绿、温度越高越红、
+/// 湿度越高越蓝。扫一眼就知道"这格在暗处"，不用去读 `0.03` 那个数字。
+fn tint_color(tint: Tint, num: Option<f32>) -> Color32 {
+    match tint {
+        Tint::Faint => theme::TEXT_FAINT,
+        Tint::Normal => theme::TEXT,
+        Tint::Dim => theme::TEXT_DIM,
+        Tint::Accent => theme::ACCENT,
+        Tint::Danger => theme::DANGER,
+        Tint::Light => light_color(num.unwrap_or(0.5)),
+        // 温度那一路的 `num` 是**摄氏度**，而 `temp_color` 期望的就是摄氏度。
+        Tint::Temp => temp_color(num.unwrap_or(20.0)),
+        Tint::Moisture => moisture_color(num.unwrap_or(0.5)),
+    }
+}
+
+/// 光照值 → 颜色。和光照滤镜同一个意图，只是简化了。
 fn light_color(light: f32) -> Color32 {
     let t = light.clamp(0.0, 1.0);
     let v = (40.0 + 215.0 * t) as u8;
@@ -212,6 +311,26 @@ fn temp_color(temp: f32) -> Color32 {
             (160.0 + 95.0 * k) as u8,
             (240.0 - 200.0 * k) as u8,
             (190.0 - 190.0 * k) as u8,
+        )
+    }
+}
+
+/// 湿度 → 颜色。和湿度滤镜的色带同一个意图（干=土色，湿=蓝）。
+fn moisture_color(m: f32) -> Color32 {
+    let t = m.clamp(0.0, 1.0);
+    if t < 0.35 {
+        let k = t / 0.35;
+        Color32::from_rgb(
+            (154.0 - 107.0 * k) as u8,
+            (127.0 - 16.0 * k) as u8,
+            (94.0 + 49.0 * k) as u8,
+        )
+    } else {
+        let k = ((t - 0.35) / 0.65).min(1.0);
+        Color32::from_rgb(
+            (47.0 + 120.0 * k) as u8,
+            (111.0 + 136.0 * k) as u8,
+            (143.0 + 112.0 * k) as u8,
         )
     }
 }
@@ -1571,74 +1690,184 @@ fn console(ui: &mut Ui, state: &mut UiState, _snap: &Snapshot) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::HoverOrganism;
+    use vivarium_core::probe::{Group, Probe, Value};
 
-    fn cell() -> CellInfo {
-        CellInfo {
-            x: 214,
-            y: 137,
-            material: MaterialKind::Water,
-            organism: None,
-            light: 0.71,
-            temp: 20.3,
-            depth: 42,
-        }
+    /// 一份和 `core::probe::cell_probes` 同构的读数。
+    ///
+    /// **刻意手写而不是调 `cell_probes`**：这一层测的是"界面能不能把一张
+    /// 探针表排版出来"，不是"core 给的探针对不对"。掺进一个真世界之后，
+    /// 断言就会跟着生态漂——而那和排版没有关系。
+    fn hover() -> Hover {
+        vec![
+            Group {
+                title: "格",
+                probes: vec![
+                    Probe {
+                        label: "坐标",
+                        value: Value::Text("214, 137".to_owned()),
+                        tint: Tint::Normal,
+                    },
+                    Probe {
+                        label: "深度",
+                        value: Value::Text("+42 格".to_owned()),
+                        tint: Tint::Dim,
+                    },
+                    Probe {
+                        label: "材质",
+                        value: Value::Text("水".to_owned()),
+                        tint: Tint::Normal,
+                    },
+                ],
+            },
+            Group {
+                title: "场",
+                probes: vec![
+                    Probe {
+                        label: "光照",
+                        value: Value::Float {
+                            v: 0.71,
+                            digits: 2,
+                            unit: "",
+                        },
+                        tint: Tint::Light,
+                    },
+                    Probe {
+                        label: "温度",
+                        value: Value::Float {
+                            v: 20.0,
+                            digits: 0,
+                            unit: " °C",
+                        },
+                        tint: Tint::Temp,
+                    },
+                    Probe {
+                        label: "湿度",
+                        value: Value::Ratio { a: 200, b: 255 },
+                        tint: Tint::Moisture,
+                    },
+                ],
+            },
+            Group {
+                title: "生物",
+                probes: vec![
+                    Probe {
+                        label: "个体",
+                        value: Value::Text("#312 · 12 格 · 代 7".to_owned()),
+                        tint: Tint::Accent,
+                    },
+                    Probe {
+                        label: "能量",
+                        value: Value::Ratio { a: 412, b: 480 },
+                        tint: Tint::Normal,
+                    },
+                ],
+            },
+        ]
     }
 
-    /// 读数必须真的说出"这里是哪儿、是什么、多亮、多热"。
+    /// 读数必须真的说出"这里是哪儿、是什么、多亮、多热、多湿"。
     ///
-    /// 这条守的是**四类信息各自都有来源**：坐标来自拾取、材质来自材质表、
-    /// 光照和温度来自空气场。少了任何一条，读数就退化成"这里有个东西"。
+    /// 这条守的是**每一类信息都有自己的来源**：坐标来自拾取、材质来自
+    /// 材质表、光照/温度/湿度来自各自的场。少了任何一条，读数就退化成
+    /// "这里有个东西"。
     #[test]
     fn the_readout_names_the_cell() {
-        let lines = cell_lines(&cell());
-        assert_eq!(lines.len(), 5, "五行：坐标 / 材质 / 描述 / 光照 / 温度");
-        let text: Vec<&str> = lines.iter().map(|(s, _)| s.as_str()).collect();
-        assert_eq!(text[0], "(214, 137)  ·  深 42 格");
-        assert_eq!(text[1], "水");
-        assert!(text[3].starts_with("光照 0.71"), "{}", text[3]);
-        assert_eq!(text[4], "温度 20°C");
-        // 材质那一行用的是它自己的说明，不是"水"这个名字重复一遍。
-        assert!(text[2].contains("往下流"), "{}", text[2]);
+        let rows = probe_rows(&hover());
+        assert_eq!(rows.len(), 11, "三条标题 + 八条读数");
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Header(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, ["格", "场", "生物"]);
+
+        let pairs: Vec<(&str, &str)> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Pair { label, value, .. } => Some((label.as_str(), value.as_str())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(pairs[0], ("坐标", "214, 137"));
+        assert_eq!(pairs[2], ("材质", "水"));
+        assert_eq!(pairs[3], ("光照", "0.71"), "光照两位小数");
+        assert_eq!(pairs[4], ("温度", "20 °C"), "温度带单位、零位小数");
+        assert_eq!(pairs[5], ("湿度", "200/255"));
+        assert_eq!(pairs[7], ("能量", "412/480"));
     }
 
-    /// 指针下面是个生物时，第二、三行换成"个体"而不是"材质"。
+    /// **空组不画标题。**
     ///
-    /// 这一条容易写错成"两个都显示"——但生物占住的那格**材质是水**
-    /// （借的），同时说"水"和"#312 叶背鱼"会让人以为那一格既是水又是鱼。
+    /// 一整组都是 `Missing` 时（比如"这一格不是生物"），留下一个空标题
+    /// 会让人以为界面漏了东西——而那正是"读数不可信"的起点。
     #[test]
-    fn the_readout_prefers_the_organism_over_the_material() {
-        let mut info = cell();
-        info.organism = Some(HoverOrganism {
-            id: 312,
-            cells: 12,
-            generation: 7,
-            energy: (412, 480),
-            producers: 6,
-            cell: CellType::Mover,
+    fn a_group_with_nothing_to_say_draws_no_header() {
+        let mut h = hover();
+        h.push(Group {
+            title: "空组",
+            probes: vec![Probe {
+                label: "年龄",
+                value: Value::Missing,
+                tint: Tint::Dim,
+            }],
         });
-        let lines = cell_lines(&info);
-        let text: Vec<&str> = lines.iter().map(|(s, _)| s.as_str()).collect();
-        assert!(text[1].starts_with("#312"), "{}", text[1]);
-        assert!(text[1].contains("12 格"), "{}", text[1]);
-        assert!(text[1].contains("7 代"), "{}", text[1]);
-        assert_eq!(text[2], "能量 412/480 · 生产者 6");
-        assert!(!text[1].contains('水'), "不能同时说是水又是鱼");
+        let rows = probe_rows(&h);
+        let headers: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                Row::Header(t) => Some(t.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(headers, ["格", "场", "生物"], "空组不该多出一个标题");
     }
 
-    /// 光照越亮，读数里那一行越亮；温度越高越偏红。
+    /// 光照越亮那一行越亮；温度越高越红；湿度越高越蓝。
     ///
     /// 颜色是读数的第二语言：扫一眼就知道"这格在暗处"，
     /// 不用去读 `0.03` 那个数字。
     #[test]
-    fn the_readout_colours_track_light_and_heat() {
-        let dark = light_color(0.0);
-        let bright = light_color(1.0);
+    fn the_readout_colours_track_the_field() {
+        let dark = tint_color(Tint::Light, Some(0.0));
+        let bright = tint_color(Tint::Light, Some(1.0));
         assert!(bright.r() > dark.r() && bright.g() > dark.g());
 
-        let cold = temp_color(20.0);
-        let hot = temp_color(900.0);
+        let cold = tint_color(Tint::Temp, Some(20.0));
+        let hot = tint_color(Tint::Temp, Some(900.0));
         assert!(hot.r() > cold.r(), "高温必须更红");
         assert!(cold.b() > hot.b(), "低温必须更蓝");
+
+        let dry = tint_color(Tint::Moisture, Some(0.0));
+        let wet = tint_color(Tint::Moisture, Some(1.0));
+        // 判据是**冷暖**（r−b），不是"谁的红分量更高"：饱和那一端是近白，
+        // 红分量也很高——用 `r` 比会得出"湿比干更暖"这种反直觉的结论。
+        let warmth = |c: Color32| i32::from(c.r()) - i32::from(c.b());
+        assert!(warmth(dry) > warmth(wet), "干土该偏暖：{dry:?} vs {wet:?}");
+        assert!(wet.b() > dry.b(), "湿土该更蓝：{dry:?} vs {wet:?}");
+    }
+
+    /// 三条色带的输入是从 `Value` 里取的，不是从格式化后的字符串里解析的。
+    ///
+    /// 这一条守的是"先格式化再解析"那条弯路——它一旦出现，
+    /// 改一下单位（`"20 °C"` 改成 `"20°C"`）就会让颜色悄悄失效。
+    #[test]
+    fn ramp_input_comes_from_the_value_not_the_text() {
+        assert_eq!(
+            ramp_input(&Value::Float {
+                v: 0.71,
+                digits: 2,
+                unit: "",
+            }),
+            Some(0.71)
+        );
+        assert_eq!(ramp_input(&Value::Ratio { a: 51, b: 255 }), Some(0.2));
+        assert_eq!(ramp_input(&Value::Text("200/255".to_owned())), None);
+        assert_eq!(
+            ramp_input(&Value::Ratio { a: 1, b: 0 }),
+            None,
+            "除以零不能崩"
+        );
     }
 }

@@ -31,7 +31,9 @@
 
 #[cfg(test)]
 use vivarium_core::organelle::{Organelles, GAS};
-use vivarium_core::{field, AirField, CellOwner, MaterialCell, ViewMode, World, CHUNK_SIZE};
+use vivarium_core::{
+    field, AirField, CellOwner, MaterialCell, Moisture, ViewMode, World, CHUNK_SIZE,
+};
 
 use crate::{palette, RenderError, Renderer};
 
@@ -536,12 +538,20 @@ struct Blitter {
 
     texture: Option<wgpu::Texture>,
     view: Option<wgpu::TextureView>,
-    /// 场纹理：`Rg32Float`，尺寸是**粗网格**（世界 / `AIR_CELL`）。
+    /// 场纹理：`Rgba32Float`，尺寸是**粗网格**（世界 / `AIR_CELL`）。
+    ///
+    /// `r` = 光照，`g` = 温度 / `TEMP_DISPLAY_MAX`，`b` = 湿度。
+    /// 三个通道都是"一层不可见的场"，而它们的格子尺寸恰好一样
+    /// （湿度的粗格边长就定义成 `AIR_CELL`），所以共用一张纹理最省。
     field_texture: Option<wgpu::Texture>,
     field_view: Option<wgpu::TextureView>,
     field_size: (u32, u32),
     /// 上一次上传的场版本号。相同就跳过上传。
     field_revision: u64,
+    /// 上一次上传的湿度版本号。湿度和场的更新节奏不同（场每 8 tick，
+    /// 湿度每 tick），所以**要分开记**——共用一个版本号会让其中一个
+    /// 变化永远传不上去。
+    moisture_revision: u64,
     bind_group: Option<wgpu::BindGroup>,
     uploader: Option<PixelUploader>,
     world_size: (u32, u32),
@@ -609,9 +619,9 @@ impl Blitter {
                     binding: 2,
                     visibility: wgpu::ShaderStages::FRAGMENT,
                     ty: wgpu::BindingType::Texture {
-                        // 场纹理：r = 光照，g = 温度（0..1）。
+                        // 场纹理：r = 光照，g = 温度，b = 湿度（都是 0..1）。
                         //
-                        // `filterable: false` 是因为 `Rg32Float` 在核心 WebGPU 里
+                        // `filterable: false` 是因为 `Rgba32Float` 在核心 WebGPU 里
                         // 不可过滤。这不是限制：着色器自己用四次 `textureLoad`
                         // 做双线性插值，比采样器更可控，而且粗网格的插值
                         // 本来就该由我们自己定义。
@@ -684,6 +694,7 @@ impl Blitter {
             field_view: None,
             field_size: (0, 0),
             field_revision: u64::MAX,
+            moisture_revision: u64::MAX,
             bind_group: None,
             uploader: None,
             world_size: (0, 0),
@@ -771,7 +782,7 @@ impl Blitter {
             mip_level_count: 1,
             sample_count: 1,
             dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rg32Float,
+            format: wgpu::TextureFormat::Rgba32Float,
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
@@ -809,39 +820,58 @@ impl Blitter {
         }));
     }
 
-    /// 把场推上 GPU。版本号没变就什么都不做。
+    /// 把场（光、温度、湿度）推上 GPU。三个版本号都没变就什么都不做。
     ///
     /// 为什么按版本号而不是每帧都传：场每 8 tick 才算一次，而界面是 60 fps。
-    /// 每帧传 128×128×8 字节 = 128 KB 看起来不多，但那是每秒 7.7 MB 的
+    /// 每帧传 128×128×16 字节 = 256 KB 看起来不多，但那是每秒 15 MB 的
     /// 无谓带宽，而且它会把"场到底有没有更新"这件事藏起来。
-    fn upload_field(&mut self, field: &AirField) -> Result<(), RenderError> {
+    ///
+    /// **两个版本号分开比，但只写一次。** 光和温度由 `AirField` 管
+    /// （每 8 tick），湿度由 `Moisture` 管（每 tick）——节奏差两个数量级。
+    /// 共用一个版本号的话，其中一个的变化会永远传不上去；而分别写两次
+    /// 又会白传一遍另外两个通道。
+    fn upload_field(&mut self, field: &AirField, moisture: &Moisture) -> Result<(), RenderError> {
         let size = (field.cols() as u32, field.rows() as u32);
         if size.0 == 0 || size.1 == 0 {
             return Ok(());
         }
         self.ensure_field_texture(size);
-        if self.field_revision == field.revision() {
+        let fresh = self.field_revision != field.revision()
+            || self.moisture_revision != moisture.revision();
+        if !fresh {
             return Ok(());
         }
         let Some(texture) = self.field_texture.as_ref() else {
             return Ok(());
         };
 
-        // 每行必须补齐到 256 字节：`write_texture` 的硬要求，
-        // 而 128 列 × 8 字节 = 1024 刚好够、16 列 × 8 = 128 就不够。
-        // 不补齐在 64² 的世界里会直接 panic。
-        let row_bytes = size.0 as usize * 8;
+        // 每行必须补齐到 256 字节：`write_texture` 的硬要求。
+        // 128 列 × 16 字节 = 2048 刚好够，而 16 列 × 16 = 256 也刚好够；
+        // 但 8 列的粗网格只有 128 字节，不补齐会直接 panic。
+        let texel = 16usize;
+        let row_bytes = size.0 as usize * texel;
         let padded = row_bytes.div_ceil(256) * 256;
         let mut bytes = vec![0u8; padded * size.1 as usize];
+        let (mc, _) = moisture.dims();
         for y in 0..size.1 as usize {
             for x in 0..size.0 as usize {
                 let i = y * size.0 as usize + x;
-                let o = y * padded + x * 8;
+                let o = y * padded + x * texel;
                 let light = field.light().get(i).copied().unwrap_or(0.0);
                 let temp = field.temp().get(i).copied().unwrap_or(0.0);
                 bytes[o..o + 4].copy_from_slice(&light.clamp(0.0, 1.0).to_le_bytes());
                 let t = (temp / field::TEMP_DISPLAY_MAX).clamp(0.0, 1.0);
                 bytes[o + 4..o + 8].copy_from_slice(&t.to_le_bytes());
+                // 湿度**逐粗格**取，不插值：两张图的格子边长都是 `AIR_CELL`，
+                // 所以这里天然是 1:1 的。插值交给着色器（`field_smooth`）。
+                let m = if mc == size.0 as usize {
+                    moisture.cells().get(i).copied().unwrap_or(0)
+                } else {
+                    0
+                };
+                bytes[o + 8..o + 12]
+                    .copy_from_slice(&(m as f32 / 255.0).clamp(0.0, 1.0).to_le_bytes());
+                // 第四个通道留空（`Rgba32Float` 要求 16 字节对齐）。
             }
         }
 
@@ -865,6 +895,7 @@ impl Blitter {
             },
         );
         self.field_revision = field.revision();
+        self.moisture_revision = moisture.revision();
         Ok(())
     }
 
@@ -1212,8 +1243,8 @@ impl PixelRenderer {
     /// 由调用方在 `render_with` **之前**调。做成独立的一步而不是塞进
     /// `render_with` 的参数里，是因为场住在生命层：`render_with` 只认识
     /// `&World`，让它去认识 `&AirField` 就把渲染层和生命层绑死了。
-    pub fn upload_field(&mut self, field: &AirField) {
-        if let Err(e) = self.blitter.upload_field(field) {
+    pub fn upload_field(&mut self, field: &AirField, moisture: &Moisture) {
+        if let Err(e) = self.blitter.upload_field(field, moisture) {
             eprintln!("场上传失败：{e}");
         }
     }
@@ -2674,7 +2705,7 @@ mod tests {
         for mode in ViewMode::ALL {
             blitter.view_mode = mode;
             blitter
-                .upload_field(life.field())
+                .upload_field(life.field(), life.moisture())
                 .expect("场上传不该失败");
             let (px, _) = blit_and_read(&device, &queue, &mut blitter, &target, &target_view, &world);
             shots.push((mode, px));
@@ -2685,13 +2716,14 @@ mod tests {
                 ViewMode::Temperature => "view-temperature.png",
                 ViewMode::Light => "view-light.png",
                 ViewMode::Species => "view-species.png",
+                ViewMode::Moisture => "view-moisture.png",
             };
             write_png(name, px);
         }
 
         // --- 光照滤镜：天空亮、深海暗 -----------------------------------
         //
-        // 索引照 `ViewMode::ALL` 的顺序：0 材质 / 1 温度 / 2 光照 / 3 物种。
+        // 索引照 `ViewMode::ALL` 的顺序：0 材质 / 1 温度 / 2 光照 / 3 物种 / 4 湿度。
         // 写错一位的症状是"断言全过但看的是另一张图"——而两张图都很像"一片蓝"。
         let light = &shots[2].1;
         let sky = at(light, sx(ocean_x), sy(layout.waterline - 12));
@@ -2720,7 +2752,55 @@ mod tests {
             "物种滤镜里的石头应当比材质视图暗得多：{bed:?}"
         );
 
-        // --- 四张图必须互不相同 -----------------------------------------
+        // --- 湿度滤镜：海最湿、内陆最干、天空不画 -----------------------
+        //
+        // 三条一起断言，因为单独任何一条都能被"整屏一个颜色"骗过去：
+        //   - 海 vs 内陆：证明湿度**有梯度**；
+        //   - 内陆 vs 天空：证明它**按材质遮罩**（天空必须是背景色，
+        //     否则整根柱子连天空都染色，看起来像糊了一层膜）。
+        let wet = &shots[4].1;
+        let ocean = at(wet, sx(ocean_x), sy(layout.waterline + 40));
+        // **取"全场最干的那一格固体"**，而不是"离海最远的那一列"。
+        //
+        // 后者依赖这张图的形状（岛屿多的话，任何一列都离水很近），
+        // 而前者问的是这张图本身——判据要指向它真正想说的那件事。
+        let (mc, mrows) = life.moisture().dims();
+        let mut driest = (255u8, (0usize, 0usize));
+        for cy in 0..mrows {
+            for cx in 0..mc {
+                let v = life.moisture().cells()[cy * mc + cx];
+                if v >= driest.0 {
+                    continue;
+                }
+                // 只考虑**固体**：天空里也有湿度数值，但那个不画。
+                let (wx, wy) = (cx * 4 + 2, cy * 4 + 2);
+                if world
+                    .get(wx as isize, wy as isize)
+                    .is_solid()
+                {
+                    driest = (v, (cx, cy));
+                }
+            }
+        }
+        assert!(driest.0 < 120, "这张图里应当有干土：最干 {}", driest.0);
+        let (dcx, dcy) = driest.1;
+        let inland = at(wet, sx(dcx * 4 + 2), sy(dcy * 4 + 2));
+        let sky_wet = at(wet, sx(ocean_x), sy(layout.waterline - 40));
+        assert!(
+            luma(ocean) > luma(inland) + 120,
+            "海应当明显比干土亮：海 {ocean:?} 干土 {inland:?}（湿度 {}）",
+            driest.0
+        );
+        assert!(
+            u32::from(ocean[2]) > u32::from(inland[2]) + 20,
+            "海应当明显更蓝：海 {ocean:?} 干土 {inland:?}"
+        );
+        assert!(
+            luma(sky_wet) < luma(inland),
+            "天空不该画湿度（应当是背景色）：天空 {sky_wet:?} 干土 {inland:?}"
+        );
+
+        // --- 五张图必须互不相同 -----------------------------------------
         //
         // 这是这条测试的核心判据。少了它，"滤镜接上了但没生效"会
         // 安安静静地退化成材质视图，而画面上看起来只是"点了没反应"。
@@ -2734,7 +2814,7 @@ mod tests {
             }
         }
         eprintln!(
-            "四张滤镜图已写出：天空 {sky:?} / 深海 {deep:?} / 海水温度色 {sea:?}"
+            "五张滤镜图已写出：天空 {sky:?} / 深海 {deep:?} / 海水温度色 {sea:?} /              湿度 海 {ocean:?} 内陆 {inland:?} 天空 {sky_wet:?}"
         );
     }
 }
