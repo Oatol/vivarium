@@ -1796,6 +1796,7 @@ impl LifeSim {
                 // 代价是"水面之上的尸体会烂出一格水然后落下来"——那不是 bug，
                 // 那是体积守恒本身：水不会凭空消失，只会换个地方待着。
                 world.set(xs, ys, MaterialKind::Water);
+                world.set_flags(xs, ys, crate::material::water_src::ROT);
             }
         }
 
@@ -2128,6 +2129,24 @@ impl LifeSim {
     #[inline]
     pub fn water_moved(&self) -> u64 {
         self.water_moved
+    }
+
+    /// **海平面以上的水，来源分布**（见 [`crate::material::water_src`]）。
+    ///
+    /// 这是"繁殖门一开，表层水就涨"这个问题的仪器：前四次猜原因都没被
+    /// 一个数否掉过，所以先量"这些水是谁弄来的"。
+    pub fn water_above_sources(&self, world: &World) -> [usize; 6] {
+        let sea = self.moisture.sea_level().max(0) as isize;
+        let mut out = [0usize; 6];
+        for y in 0..sea {
+            for x in 0..world.width() as isize {
+                if world.get(x, y) == MaterialKind::Water {
+                    let src = (world.flags(x, y) & 0x0F) as usize;
+                    out[src.min(out.len() - 1)] += 1;
+                }
+            }
+        }
+        out
     }
 
     /// 现在有多少格水在**海平面以上**。
@@ -2573,6 +2592,7 @@ impl LifeSim {
                 org.release(world);
                 for (x, y) in wet {
                     world.set(x as isize, y as isize, MaterialKind::Water);
+                    world.set_flags(x as isize, y as isize, crate::material::water_src::ERASE);
                 }
             }
         }
@@ -2769,7 +2789,12 @@ impl LifeSim {
             next_vacated += 1;
             // 小生物顶开水：水被挤到身体刚让出来的那一格。
             // 用 `swap` 而不是"复制 + 清空"，水才不会凭空消失。
+            let was_water = world.get(x as isize, y as isize) == MaterialKind::Water;
             world.swap(ox as isize, oy as isize, x as isize, y as isize);
+            // **仪器**：这一格水是被身体顶过来的，记下来（见 `material::water_src`）。
+            if was_water {
+                world.set_flags(ox as isize, oy as isize, crate::material::water_src::SWAP);
+            }
         }
 
         {
@@ -3052,9 +3077,19 @@ impl LifeSim {
 
     /// 这个有机体的身体能不能完整落在这个位置。
     ///
-    /// 比 [`Self::can_place`] 多两条：**水格上方必须有空气**（子代出生时
-    /// 那一格的水要被推走，见 [`displace_fluid`]），以及**子代必须站得住**
-    /// （见 [`Self::can_stand`]）。
+    /// 比 [`Self::can_place`] 多一条：**水格上方必须有空气**（子代出生时
+    /// 那一格的水要被推走，见 [`displace_fluid`]），以及**子代必须整具
+    /// 泡在水里**（见 [`Self::touches_water`]）。
+    ///
+    /// ## 那道"整具在水下"的门，五次尝试都没能放宽
+    ///
+    /// v0.44~v0.48 试了五次（放宽判据 / 压身体 / 挤身体 …），每次都
+    /// "单元测试全绿、内陆植物真的能生、生态炸掉"。
+    ///
+    /// v0.49 的仪器（[`crate::material::water_src`]）把账算清了：门开着时
+    /// 海平面以上那 2549 格水，**62% 是被身体顶上去的**、38% 是尸体
+    /// （同样是被身体顶上去的尸体）在原地烂出来的。两条路都要堵，
+    /// 而那要动"身体能把东西往上顶"这条规则本身。
     ///
     /// 玩家手动投放不受这条限制——想往海沟里扔鱼是玩家的自由，
     /// 那条鱼会因为没有光而饿死，那本身就是要展示的东西。
@@ -3067,26 +3102,6 @@ impl LifeSim {
             }
             cells.push((x, y));
         }
-        // **仍然要求"整具身体都在水下"。**
-        //
-        // 五次尝试（v0.44 ~ v0.48），前四次都不是判据错，是**世界还容不下
-        // 陆地生命**。而 v0.48 那条"让水把身体挤开一格"也没修好，反而更糟：
-        //
-        // | 版本 | 改动 | 水上水（门开着） |
-        // |---|---|---|
-        // | v0.44 | 放宽判据 | 悬空 887 |
-        // | v0.45 | 加仪器 | 8420 |
-        // | v0.46 | `plugs_water` | 2549 |
-        // | v0.47 | `is_in_stable_water` | 29683 |
-        // | v0.48 | `water_push_dir`（水挤开身体） | 8272（t=4000） |
-        //
-        // **而且 v0.48 暴露出一个矛盾：门开着时动物更少（387 vs 1017），
-        // 泵却更狠。** 所以"密集的表层生命就是水泵"这个模型**是错的**——
-        // 泵的强度和动物数不成正比，它和"门开没开"相关。
-        //
-        // 下一次不要再猜机制了：先把"水是在哪个 tick、被谁挪到海平面以上"
-        // 逐格记录下来（每格水记一次"上一个动它的东西"），再谈修法。
-        // 详见 `阶段目标.md` 的 M16.5。
         Self::touches_water(world, org.width, &cells)
     }
 
@@ -3155,14 +3170,14 @@ impl LifeSim {
             //   于是体积会随生态活跃度单调减少（实测就是这么漂了几百格）。
             // - 天然碎屑：它不是从身体借来的，也不是水，吃掉之后只留下空位。
             //   早先三者都还水，于是水位随"吃了多少碎屑"漂移了二十格。
-            world.set(
-                x,
-                y,
-                match kind {
-                    MaterialKind::Corpse => MaterialKind::Water,
-                    _ => MaterialKind::Empty,
-                },
-            );
+            let back = match kind {
+                MaterialKind::Corpse => MaterialKind::Water,
+                _ => MaterialKind::Empty,
+            };
+            world.set(x, y, back);
+            if back == MaterialKind::Water {
+                world.set_flags(x, y, crate::material::water_src::EAT);
+            }
         } else {
             // 留一部分在尸体上，下一顿再来。
             world.set_flags(x, y, (gain - taken) as u8);
@@ -5504,6 +5519,34 @@ mod tests {
             !LifeSim::plugs_water(&w3, &cells),
             "身体自己的下一格不算空位——算的话整具身体会一路沉底"
         );
+    }
+
+    /// **海平面以上的水记得自己是谁弄来的。**
+    ///
+    /// 这是 v0.49 的仪器（`material::water_src`）：前四次猜"表层水为什么涨"
+    /// 都没被一个数否掉过，所以改成给每一格水打来源码。
+    #[test]
+    fn water_above_the_sea_remembers_who_made_it() {
+        use crate::material::water_src;
+        let mut w = World::new(40, 40).unwrap();
+        // 一片海（水面在 y=20），海平面因此是 20。
+        w.fill_rect(0, 20, 40, 20, MaterialKind::Water);
+        let sim = LifeSim::new(&mut w);
+        assert_eq!(sim.moisture().sea_level(), 20, "海平面应当是 20");
+        assert_eq!(sim.water_above(&w), 0, "一开始水上没有水");
+
+        // 海平面以上造一格水，标成"腐烂还的"。
+        w.set(10, 10, MaterialKind::Water);
+        w.set_flags(10, 10, water_src::ROT);
+        // 再一格，标成"被身体顶"。
+        w.set(11, 10, MaterialKind::Water);
+        w.set_flags(11, 10, water_src::SWAP);
+
+        let src = sim.water_above_sources(&w);
+        assert_eq!(sim.water_above(&w), 2);
+        assert_eq!(src[water_src::ROT as usize], 1, "腐烂那格应当被记到 ROT");
+        assert_eq!(src[water_src::SWAP as usize], 1, "顶上来那格应当被记到 SWAP");
+        assert_eq!(src[water_src::UNKNOWN as usize], 0);
     }
 
     /// **"浮着"和"吊着"是两件事。**
