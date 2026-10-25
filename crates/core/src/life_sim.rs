@@ -1307,6 +1307,47 @@ impl LifeSim {
         self.moisture.rebuild(world);
     }
 
+    /// 玩家刚画上去的有机物**要带能量**。
+    ///
+    /// ## 为什么需要这一步
+    ///
+    /// `world.set` 会把 `flags` 清零，而 `flags` 正是残骸/尸体的能量
+    /// （`eat_remains` 读它）。于是**画笔画的碎屑和尸体是一格 0 能量的东西**
+    /// ——能吃，但吃了等于没吃。用户把一具全身是嘴的生物埋进自己画的
+    /// 碎屑堆里，它饿死，而画面上完全看不出原因。
+    ///
+    /// `LifeSim::new` 里有一段"给所有 `flags == 0` 的残骸补能量"，
+    /// 但它只在**开世界那一刻**跑一次。玩家在运行中画的东西赶不上那一趟。
+    ///
+    /// ## 为什么要记进账本
+    ///
+    /// 那 25 点能量是新进世界的（画笔凭空造物，和画水一样）。不记进
+    /// `ledger.injected` 的话，`audit()` 会在下一次统计时报"多出 N 点"
+    /// ——而那个报错会指向生命层，查起来毫无头绪。
+    ///
+    /// 返回补了多少格。
+    pub fn adopt_organics(&mut self, world: &mut World, cells: &[(i32, i32)]) -> u32 {
+        let mut n = 0u32;
+        for &(x, y) in cells {
+            let (xs, ys) = (x as isize, y as isize);
+            if !matches!(
+                world.get(xs, ys),
+                MaterialKind::Remains | MaterialKind::Corpse
+            ) {
+                continue;
+            }
+            // **只补"刚画上去的"**：`world.set` 清过 flags，所以刚画的那一格
+            // 必然是 0。已经带能量的（天然碎屑、别人吃剩的）保持原值。
+            if world.flags(xs, ys) != 0 {
+                continue;
+            }
+            world.set_flags(xs, ys, REMAINS_ENERGY as u8);
+            self.ledger.injected += REMAINS_ENERGY as u64;
+            n += 1;
+        }
+        n
+    }
+
     /// 让一个有机体变成残骸。
     ///
     /// **尸体携带的是它死时还剩的能量，没有额外的基础值。**
@@ -5260,6 +5301,58 @@ mod tests {
         assert!(
             best > 0,
             "饿死的身体也该留下有能量的尸体——它值的是身体，不是脂肪"
+        );
+    }
+
+    /// **画上去的有机物要带能量，而且要能吃到。**
+    ///
+    /// `world.set` 会把 `flags` 清零，而 `flags` 就是残骸/尸体的能量。
+    /// 于是画笔画的碎屑是"能吃但吃了等于没吃"——用户把一具全身是嘴的
+    /// 生物埋进自己画的碎屑堆里，它饿死，而画面上完全看不出原因。
+    ///
+    /// 两条一起断言：**能吃**（能量涨了）**且账平**（那 25 点记进了注入）。
+    /// 只断言前者的话，"凭空造能量"会被漏掉。
+    #[test]
+    fn painted_remains_carry_energy_and_the_ledger_notices() {
+        let mut w = shallow_pool();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let before = sim.ledger().injected;
+
+        // 模拟画笔：`world.set` 之后 flags 是 0。
+        w.set(20, 20, MaterialKind::Remains);
+        assert_eq!(w.flags(20, 20), 0, "`set` 应当把 flags 清零");
+
+        let n = sim.adopt_organics(&mut w, &[(20, 20)]);
+        assert_eq!(n, 1, "一格有机物应当被补上能量");
+        assert_eq!(
+            w.flags(20, 20),
+            crate::life::REMAINS_ENERGY as u8,
+            "补的应当就是标称能量"
+        );
+        assert_eq!(
+            sim.ledger().injected,
+            before + crate::life::REMAINS_ENERGY as u64,
+            "凭空多出来的能量必须记账，否则 audit 会报漏"
+        );
+
+        // 已经带能量的不动（否则反复涂同一片会一直加能量）。
+        let n2 = sim.adopt_organics(&mut w, &[(20, 20)]);
+        assert_eq!(n2, 0, "已经有能量的不该再加一次");
+
+        // 真的能吃。
+        let cells = vec![Cell::new(CellType::Mouth, (0, 0))];
+        let mut org = Organism::new(0, (20, 21), cells, Genome::blank());
+        org.energy = 10;
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+        let ok = sim.eat_remains(&mut w, id, 20, 20);
+        assert!(ok, "画上去的碎屑应当能吃");
+        let org = sim.organism(id).unwrap();
+        assert!(
+            org.energy + org.structure > 10,
+            "吃到了应当有进账：{} + {}",
+            org.energy,
+            org.structure
         );
     }
 

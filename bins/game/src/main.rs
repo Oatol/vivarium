@@ -381,6 +381,12 @@ struct Game {
     /// 上一次落笔的格子。用来把"这一帧的鼠标位置"和"上一帧的"连成一条线——
     /// 鼠标快的时候两帧之间能跨十几格，只在当前位置盖一个圆会画出虚线。
     last_paint: Option<(i32, i32)>,
+    /// 上一次落笔的**时刻**。按住不动时靠它决定"该不该再盖一次"。
+    ///
+    /// 没有它的话，画笔只跟着 `CursorMoved` 走：**手一停，笔就停**。
+    /// 而"按住不放"在画图软件里就是"一直画"——用户按住水笔不动，
+    /// 期待的是水持续从笔尖冒出来（流走了就补），而不是"只冒一下"。
+    last_stamp: Instant,
     /// 右键 / 中键拖拽的锚点（上一个光标位置）。`None` = 没在拖。
     pan_anchor: Option<(f64, f64)>,
 
@@ -452,6 +458,7 @@ impl Game {
             field_dirty: false,
             erased: 0,
             last_paint: None,
+            last_stamp: Instant::now(),
             pan_anchor: None,
             scale: TimeScale::X1,
             budget: FrameBudget::default(),
@@ -689,6 +696,7 @@ impl Game {
             Tool::Brush | Tool::EraseLife | Tool::EraseMatter => {
                 self.painting = true;
                 self.last_paint = None;
+                self.last_stamp = Instant::now();
                 self.stroke_to_cursor();
             }
             Tool::Fill => {
@@ -829,8 +837,12 @@ impl Game {
     /// 在 `(x, y)` 盖一个圆形的笔刷。
     fn stamp(&mut self, x: i32, y: i32, kind: MaterialKind) {
         let r = self.ui.state.brush as i32;
-        stamp_circle(&mut self.world, x, y, r, kind);
-        self.field_dirty = true;
+        let mut touched = Vec::new();
+        let n = stamp_circle(&mut self.world, x, y, r, kind, &mut touched);
+        // 画上去的有机物要带能量，否则它是一格"能吃但吃了等于没吃"的东西
+        // （`world.set` 会把 `flags` 清零，而 `flags` 就是能量）。
+        self.life.adopt_organics(&mut self.world, &touched);
+        self.field_dirty |= n > 0;
     }
 
     /// 生物橡皮：把圆里的**有机体**整个抹掉。
@@ -872,7 +884,11 @@ impl Game {
             vivarium_ui::state::Tool::EraseMatter => MaterialKind::Empty,
             _ => self.ui.state.material,
         };
-        let (filled, capped) = flood_fill_region(&mut self.world, x, y, kind, FILL_CAP);
+        let mut touched = Vec::new();
+        let (filled, capped) =
+            flood_fill_region(&mut self.world, x, y, kind, FILL_CAP, &mut touched);
+        // 油漆桶同理：一整片画出来的有机物也要带能量。
+        self.life.adopt_organics(&mut self.world, &touched);
         self.field_dirty |= filled > 0;
         let tick = self.world.tick();
         if capped {
@@ -1126,6 +1142,20 @@ impl Game {
     }
 
     fn frame(&mut self, event_loop: &ActiveEventLoop) {
+        // 按住不放 = 一直画。
+        //
+        // 落笔原来只跟着 `CursorMoved` 走，所以手一停笔就停——而"按住"
+        // 在任何画图软件里都是"持续"。更实际的是：水会流走、沙会塌下来，
+        // 所以同一格反复盖**不是空转**，它是"补上流走的那部分"，
+        // 也就是"笔尖一直在出水"。
+        //
+        // 20 Hz 而不是每帧一次：60 Hz 下一个半径 5 的笔刷每秒能盖
+        // 四千多格，两秒就把整个世界填满，而人手根本跟不上那个速度。
+        if self.painting && self.last_stamp.elapsed() >= PAINT_REPEAT {
+            self.last_stamp = Instant::now();
+            self.stroke_to_cursor();
+        }
+
         let tick_start = Instant::now();
         let ticks = self.budget.plan_ticks(self.scale, self.last_tick_cost);
         for _ in 0..ticks {
@@ -1564,6 +1594,12 @@ fn scale_label(scale: TimeScale) -> &'static str {
 // 没有 GPU 的情况下被测。画笔逻辑（哪些格该涂、哪些不能涂）是纯数据操作，
 // 和窗口没有半点关系——把它挂在 `Game` 上，就意味着它只能靠"人点一下试试"来验证。
 
+/// 按住画笔时，两次落笔之间至少隔多久。
+///
+/// 50 ms（20 Hz）：这个速度下"水从笔尖冒出来"看得出来，而不会一按就
+/// 把半个世界填满。它和渲染帧率无关——60 fps 下是每三帧落一次笔。
+const PAINT_REPEAT: Duration = Duration::from_millis(50);
+
 /// 油漆桶一次最多涂多少格。
 ///
 /// 一片水在 512² 里有三万多格，涂完要几十毫秒——可以接受。但"把整个世界
@@ -1572,8 +1608,19 @@ const FILL_CAP: usize = 60_000;
 
 /// 在 `(x, y)` 盖一个半径 `r` 的圆。
 ///
-/// 返回改了几格（测试用它判断"到底有没有落笔"）。
-fn stamp_circle(world: &mut World, x: i32, y: i32, r: i32, kind: MaterialKind) -> usize {
+/// 返回改了几格（测试用它判断"到底有没有落笔"），并把改过的坐标推进
+/// `touched`——主循环要拿它去 [`LifeSim::adopt_organics`] 补能量。
+///
+/// 为什么不在这里直接补：这一层只认识 `World`，而"一格有机物带多少能量"
+/// 是生命层的规则（它要记账）。把账本扯进来会让这个纯函数没法单测。
+fn stamp_circle(
+    world: &mut World,
+    x: i32,
+    y: i32,
+    r: i32,
+    kind: MaterialKind,
+    touched: &mut Vec<(i32, i32)>,
+) -> usize {
     let mut n = 0;
     for dy in -r..=r {
         for dx in -r..=r {
@@ -1593,6 +1640,7 @@ fn stamp_circle(world: &mut World, x: i32, y: i32, r: i32, kind: MaterialKind) -
                 continue;
             }
             world.set(xs, ys, kind);
+            touched.push((x + dx, y + dy));
             n += 1;
         }
     }
@@ -1610,6 +1658,7 @@ fn flood_fill_region(
     y: i32,
     kind: MaterialKind,
     cap: usize,
+    touched: &mut Vec<(i32, i32)>,
 ) -> (usize, bool) {
     let target = world.get(x as isize, y as isize);
     if target == kind {
@@ -1631,6 +1680,7 @@ fn flood_fill_region(
             continue;
         }
         world.set(xs, ys, kind);
+        touched.push((cx, cy));
         filled += 1;
         stack.push((cx + 1, cy));
         stack.push((cx - 1, cy));
@@ -1739,7 +1789,7 @@ mod tests {
     #[test]
     fn a_round_brush_paints_a_disc_not_a_square() {
         let mut w = pool_with_wall();
-        let n = stamp_circle(&mut w, 10, 10, 3, MaterialKind::Stone);
+        let n = stamp_circle(&mut w, 10, 10, 3, MaterialKind::Stone, &mut Vec::new());
         assert!(n > 20, "半径 3 的圆至少二十几格，实际 {n}");
 
         // 圆内。
@@ -1769,7 +1819,7 @@ mod tests {
         assert!(!spots.is_empty());
 
         // 把整条鱼连周围一起涂成石头。
-        stamp_circle(&mut w, 10, 10, 6, MaterialKind::Stone);
+        stamp_circle(&mut w, 10, 10, 6, MaterialKind::Stone, &mut Vec::new());
 
         for (x, y) in spots {
             assert!(
@@ -1783,7 +1833,8 @@ mod tests {
     #[test]
     fn flood_fill_stops_at_a_wall() {
         let mut w = pool_with_wall();
-        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, FILL_CAP);
+        let (n, capped) =
+            flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, FILL_CAP, &mut Vec::new());
         assert!(!capped);
         assert_eq!(n, 32 * 64, "左半边是 32×64 格水");
 
@@ -1798,7 +1849,8 @@ mod tests {
     fn flood_fill_gives_up_at_the_cap() {
         // 上限存在的理由：一次点击不该让整个程序停一秒。
         let mut w = pool_with_wall();
-        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, 100);
+        let (n, capped) =
+            flood_fill_region(&mut w, 5, 5, MaterialKind::Sand, 100, &mut Vec::new());
         assert!(capped, "超过上限时必须报出来");
         assert_eq!(n, 100);
         assert_eq!(w.get(5, 5), MaterialKind::Sand, "涂过的那些要真的涂上");
@@ -1807,7 +1859,8 @@ mod tests {
     #[test]
     fn flood_fill_into_the_same_material_does_nothing() {
         let mut w = pool_with_wall();
-        let (n, capped) = flood_fill_region(&mut w, 5, 5, MaterialKind::Water, FILL_CAP);
+        let (n, capped) =
+            flood_fill_region(&mut w, 5, 5, MaterialKind::Water, FILL_CAP, &mut Vec::new());
         assert_eq!(n, 0);
         assert!(!capped);
     }
