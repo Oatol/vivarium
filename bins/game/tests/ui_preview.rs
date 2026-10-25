@@ -68,6 +68,7 @@ fn demo_snapshot() -> Snapshot {
         generation: 54,
         stranded: 4,
         food: 318,
+        vapor: 96,
         census,
         field: vivarium_core::FieldStats {
             sources: 3,

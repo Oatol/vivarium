@@ -23,6 +23,7 @@
 //! 它管着材质规则、并行扫描顺序和生物的运动方式。
 
 pub mod anatomy;
+pub mod climate;
 pub mod body;
 pub mod field;
 pub mod life;

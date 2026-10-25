@@ -48,14 +48,49 @@ fn flatness(sim: &LifeSim) -> f64 {
     }
 }
 
+/// **海平面以上陆地表面的平均湿度**（`0..=255`）。
+///
+/// 水循环唯一能直接改善的东西就是这个：雨落在岸上 → 那一带的水格变多 →
+/// 湿度场在陆地上抬高 → 根吸水更快。**"雨有没有让陆地变湿"只能看这个数**，
+/// 看总水量是看不出来的（水会流回海里，总量几乎不变）。
+fn land_surface_moisture(world: &World, sim: &LifeSim) -> f64 {
+    let sea = sim.moisture().sea_level();
+    let (mut sum, mut n) = (0.0f64, 0u32);
+    for x in 0..world.width() as i32 {
+        // 这一列最高的非空材质格 = 地表。
+        for y in 0..world.height() as i32 {
+            if world.get(x as isize, y as isize) == MaterialKind::Empty {
+                continue;
+            }
+            if y < sea {
+                sum += sim.moisture().at(x, y) as f64;
+                n += 1;
+            }
+            break;
+        }
+    }
+    if n == 0 {
+        0.0
+    } else {
+        sum / n as f64
+    }
+}
+
 fn run(seed: u64) -> String {
     let mut world = World::new(512, 512).unwrap();
     let mut rng = Rng::new(seed);
     worldgen::sea_and_islands(&mut world, &mut rng);
     let mut sim = LifeSim::new(&mut world);
+    // 水循环默认关（见 `LifeSim::water_cycle` 的字段说明），测量里显式打开。
+    // `M7_RAIN=0` 做对照。
+    let rain = std::env::var("M7_RAIN").map(|v| v != "0").unwrap_or(true);
+    sim.set_water_cycle(rain);
     let mut mat = MaterialSim::new();
     mat.set_threads(1);
     stock_surface(&mut world, &mut sim, 16, 300, false);
+    // 水的基线。**必须在 `stock_surface` 之后取**：投放时每个细胞都要借走
+    // 它占住的那一格水，提前取会把"借"算成"漏"。
+    let water_start = world.count_of(MaterialKind::Water);
     // 累计"吃掉尸体"的格数。这是食腐生态位的**唯一直接证据**：
     // 尸体存量会同时受死亡率、腐烂、材质模拟影响，掉了分不清是谁干的。
     let mut scavenged = 0u64;
@@ -102,7 +137,7 @@ fn run(seed: u64) -> String {
     };
 
     format!(
-        "seed {seed:>5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  水上 {:4} 搬水 {:6}",
+        "seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:4}  搬水 {:6}  销毁 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}",
         st.organisms,
         st.plankton,
         st.species,
@@ -118,15 +153,27 @@ fn run(seed: u64) -> String {
         corpse_mean,
         scavenged,
         st.corpses_rotted,
+        world.count_of(MaterialKind::Water),
         sim.water_above(&world),
         sim.water_moved(),
+        sim.water_vented(),
+        sim.climate().evaporated(),
+        sim.climate().rained(),
+        sim.climate().vapor(),
+        land_surface_moisture(&world, &sim),
     )
 }
 
 #[test]
 #[ignore = "测量用：release 下几分钟，不是回归测试"]
 fn three_seeds_of_the_same_world() {
-    for seed in [11u64, 2026, 7] {
+    // 只跑一个种子调试时用 `M7_SEEDS=11`，省掉两次三分钟。
+    let seeds: Vec<u64> = std::env::var("M7_SEEDS")
+        .ok()
+        .map(|s| s.split(',').filter_map(|t| t.trim().parse().ok()).collect())
+        .filter(|v: &Vec<u64>| !v.is_empty())
+        .unwrap_or_else(|| vec![11, 2026, 7]);
+    for seed in seeds {
         println!("{}", run(seed));
     }
 }

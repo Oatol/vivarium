@@ -90,7 +90,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 6;
+pub const VERSION: u16 = 7;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -181,6 +181,16 @@ pub struct LifeSave {
     pub temp: Vec<f32>,
     /// 光源。
     pub sources: Vec<LightSource>,
+    /// 土壤湿度场（**有状态**，见 [`crate::moisture`]）。
+    ///
+    /// `None` 表示这份档来自 v6 及更早——那时候湿度是"世界的纯函数"，
+    /// 读档时算一遍就行。现在它有了记忆（雨落在哪儿、多久之前），
+    /// **算不出来**，所以必须存。
+    pub moisture: Option<crate::moisture::Moisture>,
+    /// 水汽与蒸发/降水计数。
+    pub climate: crate::climate::Climate,
+    /// 水循环开不开。存进档里，否则读档之后雨会停。
+    pub water_cycle: bool,
 }
 
 /// 一条存档列表项。界面"读取"那一栏直接吃它。
@@ -244,8 +254,77 @@ pub fn encode(world: &World, sim: &LifeSim) -> Vec<u8> {
         put_organism(&mut out, org);
     }
 
+    // v7 新增：湿度场与水汽。**两者都是有记忆的量**，算不出来。
+    put_moisture(&mut out, sim.moisture());
+    let climate = sim.climate();
+    out.u64(climate.vapor());
+    out.u64(climate.evaporated());
+    out.u64(climate.rained());
+    out.u8(u8::from(sim.water_cycle()));
+
     out.0.extend_from_slice(&TRAILER);
     out.0
+}
+
+/// 湿度场：游程编码。
+///
+/// 和材质表用同一套理由——湿度场在绝大多数时刻是**大片同值**（整片 0、
+/// 整片 255、海边的等值带），逐格写 1 字节等于把 16384 个 0 一个个写进
+/// 磁盘。512² 的世界编码后通常只有几百字节到几 KB。
+fn put_moisture(out: &mut Out, moisture: &crate::moisture::Moisture) {
+    let (cols, rows) = moisture.dims();
+    let cells = moisture.cells();
+    out.u8(u8::from(!cells.is_empty()));
+    if cells.is_empty() {
+        return;
+    }
+    out.u32(cols as u32);
+    out.u32(rows as u32);
+    out.i32(moisture.sea_level());
+
+    let mut i = 0;
+    while i < cells.len() {
+        let v = cells[i];
+        let mut n = 1usize;
+        while i + n < cells.len() && cells[i + n] == v {
+            n += 1;
+        }
+        out.u32(n as u32);
+        out.u8(v);
+        i += n;
+    }
+}
+
+/// 读湿度场。长度必须正好等于 `cols * rows`，否则当损坏处理。
+fn read_moisture(
+    r: &mut In<'_>,
+    width: usize,
+    height: usize,
+) -> Result<Option<crate::moisture::Moisture>, SaveError> {
+    if r.u8()? == 0 {
+        return Ok(None);
+    }
+    let cols = r.u32()? as usize;
+    let rows = r.u32()? as usize;
+    let sea_level = r.i32()?;
+    let expect_cols = width.div_ceil(crate::moisture::CELL);
+    let expect_rows = height.div_ceil(crate::moisture::CELL);
+    if cols != expect_cols || rows != expect_rows {
+        return Err(SaveError::Corrupt("湿度场尺寸对不上世界"));
+    }
+    let total = cols * rows;
+    let mut cells = Vec::with_capacity(total);
+    while cells.len() < total {
+        let n = r.u32()? as usize;
+        let v = r.u8()?;
+        if n == 0 || cells.len() + n > total {
+            return Err(SaveError::Corrupt("湿度场的游程铺不满"));
+        }
+        cells.resize(cells.len() + n, v);
+    }
+    Ok(crate::moisture::Moisture::from_parts(
+        cols, rows, cells, sea_level,
+    ))
 }
 
 /// 材质表：游程编码。
@@ -476,6 +555,16 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         organisms.push(read_organism(&mut r, header.width as i32)?);
     }
 
+    // v7：湿度场与水汽。更早的档没有这一节——那时候湿度是世界的纯函数，
+    // `LifeSim::restore` 会重新播种一遍（和当时的行为一致）。
+    let (moisture, climate, water_cycle) = if header.version >= 7 {
+        let moisture = read_moisture(&mut r, header.width, header.height)?;
+        let climate = crate::climate::Climate::from_parts(r.u64()?, r.u64()?, r.u64()?);
+        (moisture, climate, r.u8()? != 0)
+    } else {
+        (None, crate::climate::Climate::new(), false)
+    };
+
     // 尾标记
     let tail = r.take(8)?;
     if tail != TRAILER {
@@ -491,6 +580,9 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         food_growth,
         temp,
         sources,
+        moisture,
+        climate,
+        water_cycle,
     };
     let sim = LifeSim::restore(&mut world, save);
     Ok((world, sim))
@@ -984,6 +1076,55 @@ mod tests {
         assert_eq!(s2.organisms().len(), sim.organisms().len());
         assert_eq!(s2.ledger(), sim.ledger(), "能量账分叉了");
         assert_eq!(s2.next_id(), sim.next_id());
+        // v7：湿度是**有记忆的量**，算不出来，必须原样带回来。
+        assert_eq!(
+            s2.moisture().cells(),
+            sim.moisture().cells(),
+            "湿度场没带回来（读档会丢掉整场雨）"
+        );
+        assert_eq!(s2.moisture().sea_level(), sim.moisture().sea_level());
+    }
+
+    /// **湿度与水汽必须原样穿过存档。**
+    ///
+    /// 这一条是 v0.52 的核心：湿度从"世界的纯函数"变成"有记忆的量"之后，
+    /// 读档时**不能再算一遍**——算出来的是初值，不是当前值。所以它必须
+    /// 进存档，而"存了"这件事只能靠"存之前和读回来之后逐格相同"来证明。
+    ///
+    /// 顺带钉住 `water_cycle`：不存它的话，读档之后雨会无声地停掉。
+    #[test]
+    fn moisture_and_vapor_survive_a_roundtrip() {
+        let mut world = World::new(160, 120).unwrap();
+        let mut rng = Rng::new(9);
+        sea_and_islands(&mut world, &mut rng);
+        let mut sim = LifeSim::new(&mut world);
+        sim.set_food_growth(false);
+        sim.set_water_cycle(true);
+
+        let mut mat = MaterialSim::new();
+        mat.set_threads(1);
+        run(&mut world, &mut sim, &mut mat, 400);
+
+        // 跑过之后湿度必须**已经偏离初值**，否则这条测的是"存了一张
+        // 原封不动的场"，那随便怎么实现都能过。
+        let mut fresh = LifeSim::new(&mut world);
+        fresh.set_food_growth(false);
+        assert_ne!(
+            sim.moisture().cells(),
+            fresh.moisture().cells(),
+            "400 tick 之后湿度还和初值一样，说明演化没在跑"
+        );
+        assert!(sim.climate().vapor() > 0, "水循环开着，天上却没有水汽");
+
+        let bytes = encode(&world, &sim);
+        let (_, s2) = decode(&bytes).unwrap();
+
+        assert_eq!(s2.moisture().cells(), sim.moisture().cells(), "湿度没带回来");
+        assert_eq!(s2.moisture().sea_level(), sim.moisture().sea_level());
+        assert_eq!(s2.climate().vapor(), sim.climate().vapor(), "水汽没带回来");
+        assert_eq!(s2.climate().evaporated(), sim.climate().evaporated());
+        assert_eq!(s2.climate().rained(), sim.climate().rained());
+        assert!(s2.water_cycle(), "读档之后水循环被关掉了，雨会无声地停");
     }
 
     #[test]

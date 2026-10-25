@@ -245,6 +245,11 @@ pub struct Snapshot {
     pub stranded: usize,
     /// 含能量的食物格数。
     pub food: usize,
+    /// 天上存着多少格水汽（`Climate::vapor`）。
+    ///
+    /// 水循环是**唯一**能让这个数动的东西：蒸发让它涨、降水让它落。
+    /// 它停在一个平衡点上，所以"这个数在抖"就是"循环在跑"。
+    pub vapor: u64,
 
     /// 各材质的格数，下标是 `MaterialKind::as_u8`。
     pub census: [usize; MaterialKind::COUNT],
@@ -282,6 +287,7 @@ impl Default for Snapshot {
             body_range: (0, 0),
             generation: 0,
             stranded: 0,
+            vapor: 0,
             food: 0,
             census: [0; MaterialKind::COUNT],
             field: FieldStats::default(),

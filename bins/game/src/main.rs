@@ -79,6 +79,8 @@ struct Options {
     /// 启动时在水面附近投放多少条鱼。0 表示不放。
     fish: usize,
     morph: bool,
+    /// 水循环（蒸发 → 水汽 → 降水）。默认开，`--no-rain` 关掉。
+    rain: bool,
 }
 
 impl Default for Options {
@@ -91,6 +93,7 @@ impl Default for Options {
             ticks: 60,
             fish: 0,
             morph: false,
+            rain: true,
         }
     }
 }
@@ -111,6 +114,8 @@ fn print_help() {
   --fish <N>         启动时在水面附近投放 N 条鱼（默认 0；也可以「世界」窗口
                      新建时勾「随机投放初始生命」，或在生物工坊里画一副）
   --morph            身体由基因组**长出来**（段树 + 梯度），而不是用手工体型表
+  --no-rain          关掉水循环（蒸发 / 降水）。用来做对照实验：
+                     开了之后海面会蒸发、天上会下雨，土壤湿度跟着变
   -h, --help         显示这份帮助"
     );
 }
@@ -128,6 +133,7 @@ fn parse_args() -> Result<Options, String> {
             "--ticks" => opts.ticks = take_number(&mut args, "--ticks")?,
             "--fish" => opts.fish = take_number(&mut args, "--fish")? as usize,
             "--morph" => opts.morph = true,
+            "--no-rain" => opts.rain = false,
             "-h" | "--help" => {
                 print_help();
                 std::process::exit(0);
@@ -348,6 +354,11 @@ struct Game {
     ///
     /// 现在只有「世界」窗口新建世界时用它（`L` 放鱼和 `G` 点火已经删掉了）。
     morph: bool,
+    /// 水循环开不开。跟着命令行开关走，中途不变。
+    ///
+    /// 每次 `LifeSim::new` 之后都要重新设一遍——`LifeSim` 的默认值是**关**
+    /// （理由见 `LifeSim::water_cycle` 字段），所以这里是"产品决定"的落点。
+    rain: bool,
 
     /// 界面。它的 GPU 资源在 `create` 里建，因为它要拿到渲染器的 device。
     ui: ui_glue::Egui,
@@ -426,6 +437,7 @@ impl Game {
         let layout = worldgen::sea_and_islands(&mut world, &mut rng);
         // 建生命层时会扫一遍地形，把天然碎屑折成"初始能量"记进账。
         let mut life = LifeSim::new(&mut world);
+        life.set_water_cycle(opts.rain);
         if opts.fish > 0 {
             let ids = stock_surface(&mut world, &mut life, opts.fish, 300, opts.morph);
             println!("启动时投放 {} 条鱼", ids.len());
@@ -449,6 +461,7 @@ impl Game {
             rng,
             seed: opts.seed,
             morph: opts.morph,
+            rain: opts.rain,
             ui,
             history: Vec::with_capacity(160),
             history_tick: 0,
@@ -975,6 +988,7 @@ impl Game {
         // 生命层也要重建：旧世界里的有机体都站在已经不存在的格子上，
         // 占格表还指着它们——不重建的话，新地形里会凭空多出一堆幽灵细胞。
         self.life = LifeSim::new(&mut self.world);
+        self.life.set_water_cycle(self.rain);
         // 地形换了，光场也得跟着重算——`LifeSim::new` 已经刷过一次，
         // 但那只覆盖了光；温度场是新初始化的，这里不用再动。
         self.renderer.set_view_mode(self.ui.state.view);
@@ -1019,6 +1033,7 @@ impl Game {
             worldgen::scan(&world)
         };
         let mut next_life = LifeSim::new(&mut world);
+        next_life.set_water_cycle(self.rain);
         let spawned = if life {
             stock_surface(&mut world, &mut next_life, 8, 300, self.morph).len()
         } else {
@@ -1083,6 +1098,10 @@ impl Game {
             Ok((world, next_life)) => {
                 self.world = world;
                 self.life = next_life;
+                // 存档里带着 `water_cycle`（不存的话读档之后雨会无声地停），
+                // 但**命令行开关是这一局的话事人**：用 `--no-rain` 启动的人
+                // 不该因为读了一份"有雨"的档就突然下起雨来。
+                self.life.set_water_cycle(self.rain);
                 self.sim = MaterialSim::new();
                 // 存档里没有"当初用的生成种子"，只能从材质反推地表形状。
                 self.layout = worldgen::scan(&self.world);
@@ -1283,6 +1302,7 @@ impl Game {
             generation: life.max_generation,
             stranded: life.stranded,
             food: self.life.food_cells(&self.world),
+            vapor: self.life.climate().vapor(),
             census: self.world.census(),
             field: self.life.field().stats(),
             hover: self.hover_info(),

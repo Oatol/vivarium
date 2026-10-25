@@ -1165,6 +1165,19 @@ fn inspector(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     );
                     widgets::stat_row(ui, "代数", &snap.generation.to_string(), theme::TEXT);
                     widgets::stat_row(ui, "食物", &format!("{} 格", snap.food), theme::ACCENT);
+                    // 水汽：蒸发让它涨、降水让它落。**它是唯一一个能看见
+                    // 水循环在跑的数**——总水量几乎不变（水只是从海里搬到
+                    // 天上再搬回去），所以看总水量看不出循环。
+                    widgets::stat_row(
+                        ui,
+                        "水汽",
+                        &format!("{} 格", snap.vapor),
+                        if snap.vapor == 0 {
+                            theme::TEXT_FAINT
+                        } else {
+                            theme::TEXT_DIM
+                        },
+                    );
                     // "飘着"改成"离水"：v0.31 之后这个数不再只是"飘在天上"，
                     // 它也包含搁在干地上的个体——两者在数值上是同一件事
                     // （一格水都够不到），而"离水"把两件事都说到了。
