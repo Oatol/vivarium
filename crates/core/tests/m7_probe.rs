@@ -102,7 +102,7 @@ fn run(seed: u64) -> String {
     };
 
     format!(
-        "seed {seed:>5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}",
+        "seed {seed:>5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}",
         st.organisms,
         st.plankton,
         st.species,
@@ -113,6 +113,7 @@ fn run(seed: u64) -> String {
         distinct_shapes,
         flatness(&sim),
         st.stranded,
+        st.shallowest,
         corpses,
         corpse_mean,
         scavenged,

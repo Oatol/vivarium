@@ -2937,9 +2937,9 @@ impl LifeSim {
 
     /// 这个有机体的身体能不能完整落在这个位置。
     ///
-    /// 比 [`Self::can_place`] 多一条：**水格上方必须有空气**。
-    /// 繁殖出来的子代必须遵守它，因为子代出生时那一格的水要被推走
-    /// （见 [`displace_fluid`]），而水下没有空位。
+    /// 比 [`Self::can_place`] 多两条：**水格上方必须有空气**（子代出生时
+    /// 那一格的水要被推走，见 [`displace_fluid`]），以及**子代必须站得住**
+    /// （见 [`Self::can_stand`]）。
     ///
     /// 玩家手动投放不受这条限制——想往海沟里扔鱼是玩家的自由，
     /// 那条鱼会因为没有光而饿死，那本身就是要展示的东西。
@@ -2952,8 +2952,22 @@ impl LifeSim {
             }
             cells.push((x, y));
         }
-        // 生下来的身体必须贴着水——见 [`Self::touches_water`] 的注释，
-        // 这一条就是拦住"靠繁殖一代代爬进天空"的那道门。
+        // **暂时回到"整具身体都在水下"。**
+        //
+        // v0.44 试过换成 `can_stand`（够得着水 **或** 脚下有实体），
+        // 单元测试全绿，而生态里炸了：
+        //
+        //   | | 基线（本判据） | can_stand |
+        //   |---|---|---|
+        //   | 悬空个体 | **0** | **887** |
+        //   | 动物数 | 482 | **1230** |
+        //
+        // 病根**不在这道门**：陆地生物死后，尸体在原地烂成水
+        // （`tick_organics`），而**身体会挡住水不让它落下来**——于是
+        // 水托着身体、身体托着水，形成悬空水柱；水柱里能出生，就自持了。
+        //
+        // 也就是说：先得回答"尸体的水该去哪儿"，这道门才谈得上放宽。
+        // 详见 `阶段目标.md` 的 M16。
         Self::touches_water(world, org.width, &cells)
     }
 
@@ -5301,6 +5315,128 @@ mod tests {
         assert!(
             best > 0,
             "饿死的身体也该留下有能量的尸体——它值的是身体，不是脂肪"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 繁殖门（v0.44 · 已回滚，见阶段目标 M16）
+    // -----------------------------------------------------------------------
+
+    /// 一片"岸"：左边是水，右边是平地。
+    fn shore() -> (World, i32) {
+        let mut w = World::new(120, 80).unwrap();
+        w.fill_rect(0, 60, 120, 20, MaterialKind::Stone);
+        w.fill_rect(0, 40, 20, 20, MaterialKind::Water);
+        (w, 20)
+    }
+
+    /// **陆地繁殖还没打通，这条测试记的是"目标"，不是"现状"。**
+    ///
+    /// v0.44 把繁殖门从"整具身体都在水下"换成"够得着水 **或** 脚下有实体"，
+    /// 单元测试全绿、这条也确实通过了（内陆植物能生）。**但生态里炸了**：
+    /// 陆地尸体在原地烂成水，而身体挡着水不让它落下——水托身体、身体托水，
+    /// 形成悬空水柱；水柱里能出生，于是自持。实测悬空个体 0 → 887、
+    /// 动物数 482 → 1230。
+    ///
+    /// 所以判据已经回滚，这条先 `#[ignore]`。它同时是**下一轮的验收**：
+    /// 等"尸体的水该去哪儿"有了答案，把它打开。
+    #[test]
+    #[ignore = "等 M16 的病根（尸体水 + 水被身体托住）修好"]
+    fn a_land_plant_can_reproduce() {
+        let (mut w, shore) = shore();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+
+        let mut cells = Vec::new();
+        for dx in 0..4i16 {
+            cells.push(Cell::new(CellType::Producer, (dx, -1)));
+        }
+        for dx in 0..2i16 {
+            cells.push(Cell::from_organelles(
+                crate::organelle::Organelles(ROOT),
+                (dx, 0),
+            ));
+        }
+        let mut genome = handcrafted_fish_genome(Tactic::Ignore);
+        genome.body = crate::morph::Body::from_cells(
+            &cells
+                .iter()
+                .map(|c| (c.offset.0, c.offset.1, c.organelles.0))
+                .collect::<Vec<_>>(),
+        );
+        let mut plant = Organism::new(0, (shore + 3, 59), cells, genome);
+        plant.energy = 1_500;
+        let id = sim.spawn_injected(&mut w, plant).unwrap();
+
+        let mut born = 0;
+        for _ in 0..400 {
+            let before = sim.organisms().len();
+            sim.step(&mut w);
+            if sim.organisms().len() > before {
+                born += 1;
+            }
+        }
+        assert!(
+            born > 0,
+            "内陆的植物应当能繁殖（能量 {:?}、门槛 {:?}）",
+            sim.organism(id).map(|o| o.energy),
+            sim.organism(id).map(|o| o.reproduction_energy())
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // 停步（v0.44）
+    // -----------------------------------------------------------------------
+
+    /// **没有鞭毛就一步也走不了。**
+    ///
+    /// 原来是 `1 + movers/2`（下限 1）：任何身体每 tick 都能走一格。
+    /// 而手工基因组给了 `OUT_RIGHT = 0.7` 的巡航偏置，于是工坊里拼出来的
+    /// "植物"会一直往右爬——岸上每步 ×4，8 质量的身体每 tick 付 32 点，
+    /// 比它光合挣的还多。症状是"能量在正常获取却一直掉"。
+    #[test]
+    fn a_body_without_flagella_does_not_move() {
+        let (mut w, shore) = shore();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+
+        // 基因组只留"想往右走"这一条：**不带繁殖**，否则它会立刻把能量
+        // 花在生孩子上，而这条测试测的是"挪不挪窝"。
+        let mut walker = Genome::blank();
+        walker.weights[Genome::b_o(OUT_RIGHT)] = 0.7;
+
+        // 生产者 + 根，一根鞭毛都没有。
+        let cells = vec![
+            Cell::new(CellType::Producer, (0, -1)),
+            Cell::from_organelles(crate::organelle::Organelles(ROOT), (0, 0)),
+        ];
+        let mut org = Organism::new(0, (shore + 4, 59), cells.clone(), walker.clone());
+        org.energy = 900;
+        let id = sim.spawn_injected(&mut w, org).unwrap();
+        assert_eq!(sim.organism(id).unwrap().speed(), 0, "没鞭毛速度应当是 0");
+
+        // 对照组：同一具身体，多一格鞭毛。
+        let mut with_flagellum = cells;
+        with_flagellum[0] = Cell::new(CellType::Mover, (0, -1));
+        let mut swimmer = Organism::new(0, (shore + 20, 59), with_flagellum, walker);
+        swimmer.energy = 900;
+        let sid = sim.spawn_injected(&mut w, swimmer).unwrap();
+        assert_eq!(sim.organism(sid).unwrap().speed(), 1, "一格鞭毛 = 一格/tick");
+
+        let before = sim.organism(id).unwrap().anchor;
+        let s_before = sim.organism(sid).unwrap().anchor;
+        for _ in 0..30 {
+            sim.step(&mut w);
+        }
+        assert_eq!(
+            sim.organism(id).map(|o| o.anchor),
+            Some(before),
+            "没鞭毛的身体不该挪窝"
+        );
+        assert_ne!(
+            sim.organism(sid).map(|o| o.anchor),
+            Some(s_before),
+            "**有鞭毛的必须还能走**——否则这一条就把所有移动都关掉了"
         );
     }
 

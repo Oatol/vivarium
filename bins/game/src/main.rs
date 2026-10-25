@@ -655,7 +655,14 @@ impl Game {
         } else {
             Tactic::Ignore
         };
-        let mut org = Organism::new(0, (cx, cy), body, handcrafted_fish_genome(tactic));
+        // **把拼出来的身体写进基因组。**
+        //
+        // 不写的话，子代长的是基因组里那个默认的一格身体——"我拼的植物
+        // 传不下去"，而画面上看不出原因（子代确实出生了，只是长得完全
+        // 不一样，然后因为没有根、没有水而死）。
+        let mut genome = handcrafted_fish_genome(tactic);
+        genome.body = vivarium_core::morph::Body::from_cells(&cells);
+        let mut org = Organism::new(0, (cx, cy), body, genome);
         // 启动能量按格数算：刚好够它活到能繁殖。给多了等于凭空注能。
         let n = org.cells.len().max(1) as u32;
         org.energy = BIRTH_ENERGY_PER_CELL * n * 6 / 5;

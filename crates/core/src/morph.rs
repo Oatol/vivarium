@@ -285,6 +285,42 @@ impl Body {
         }
     }
 
+    /// 从一组**运行期**的格子造一个身体（工坊拼出来的身体走这条）。
+    ///
+    /// 和 [`Body::from_plan`] 是同一件事，区别只在于那份格子是编译期的
+    /// `'static` 表，还是玩家现拼的。**整具身体作为一个段、梯度为空**——
+    /// 于是每一格的细胞器就是它自己，不做任何解释。
+    ///
+    /// ## 为什么需要它
+    ///
+    /// 工坊里拼的身体原来只写进 `Organism::cells`，而**基因组里那个 `body`
+    /// 还是默认的一格**。于是子代长出来的是一格，不是父母的样子——
+    /// "我拼的植物传不下去"，而画面上完全看不出原因（子代确实出生了，
+    /// 只是长得完全不一样，然后因为没有根、没有水而死）。
+    ///
+    /// 这一条让"工坊做的生物"第一次真的可遗传。
+    pub fn from_cells(cells: &[(i16, i16, u16)]) -> Self {
+        let cells: Vec<BodyCell> = cells
+            .iter()
+            .map(|&(x, y, bits)| BodyCell {
+                offset: (x, y),
+                base: bits,
+            })
+            .collect();
+        let n = cells.len().clamp(1, MAX_BODY_CELLS as usize) as u8;
+        Self {
+            trunk: Segment {
+                cells,
+                axis: 0,
+                repeat: 1,
+                mirror: false,
+                children: Vec::new(),
+            },
+            gradient: Gradient::default(),
+            max_cells: n,
+        }
+    }
+
     /// 发育：展开 + 位置解释。
     ///
     /// **确定性**：全程不掷骰子。同一个身体必然长成同一个样子——

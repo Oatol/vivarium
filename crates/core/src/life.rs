@@ -1090,6 +1090,21 @@ impl Organism {
             .iter()
             .map(|c| c.organelles.level(FLAGELLUM_SHIFT) as usize)
             .sum();
+        // **没有鞭毛 = 一步也走不了。**
+        //
+        // 原来是 `1 + movers/2`，也就是**下限 1**：任何身体每 tick 都能走
+        // 一格，哪怕它一根鞭毛都没有。而手工基因组给了 `OUT_RIGHT = 0.7`
+        // 的巡航偏置，于是工坊里拼出来的"植物"会一直往右爬——岸上每步 ×4，
+        // 8 质量的身体每 tick 付 32 点，比它光合挣的（~45）还多。
+        //
+        // 症状极具欺骗性：那株植物看起来"在正常获取能量"，能量却一直往下掉，
+        // 因为它**每一 tick 都在付一笔看不见的走路钱**。
+        //
+        // 这一条同时让"固着"第一次成立：没鞭毛就是不动，而不是"免费走一格"。
+        // 重力不走这里（`MoveKind::Fall` 是另一条路），所以不会掉不下去。
+        if movers == 0 {
+            return 0;
+        }
         let extra = movers / MOVERS_PER_EXTRA_STEP;
         (1 + extra as i32).min(MAX_STEPS)
     }
