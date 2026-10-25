@@ -136,19 +136,29 @@ impl Moisture {
         // 不能用最小值：玩家在内陆高处挖一个小水洼，最小值就成了那个水洼，
         // 于是整个世界的高度基准被一格水抬走。而海是最大的一片水面，
         // 众数一定是它。
-        self.sea_level = {
+        //
+        // **只在第一次建场时定死，之后不再更新。**
+        //
+        // 这条是 v0.45 修的：众数会随水面被搅动而漂（生物在表层出生、
+        // 死亡、挤水，都会让"最上面那格水"在 127/128/129 之间来回），
+        // 于是"海平面"这个基准自己会动。而它一旦往下漂一格，
+        // `water_above` 就会把整个表层（~500 列）都算成"水面以上"——
+        // 实测过 0 → 663 的假增长。**基准必须是常数，否则量出来的全是噪声。**
+        if self.sea_level == 0 {
+            self.sea_level = {
             let mut hist = vec![0u32; h];
             for &t in &top_water {
                 if t != usize::MAX {
                     hist[t] += 1;
                 }
             }
-            hist.iter()
-                .enumerate()
-                .max_by_key(|&(y, &n)| (n, std::cmp::Reverse(y)))
-                .map(|(y, _)| y)
-                .unwrap_or(0) as i32
-        };
+                hist.iter()
+                    .enumerate()
+                    .max_by_key(|&(y, &n)| (n, std::cmp::Reverse(y)))
+                    .map(|(y, _)| y)
+                    .unwrap_or(0) as i32
+            };
+        }
 
         // --- 2. 两遍 chamfer 距离变换（单位：粗格） ---
         //

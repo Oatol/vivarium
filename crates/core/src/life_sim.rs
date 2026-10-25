@@ -684,6 +684,15 @@ pub struct LifeSim {
     /// 大部分 tick 在转身、被挡、或者刚出生）。累计值才能回答
     /// "垂直方向到底有没有在用"。
     moved_total: [u64; 4],
+    /// 累计有多少格**湿细胞在水面之上死亡**——也就是"水被从海里搬到岸上"
+    /// 的总量。
+    ///
+    /// 这个数存在的原因是：**"水在变多还是变少"这件事一直看不见**。
+    /// 实测 8000 tick 里 `Water` 格数掉了 8.7%，我第一反应是"漏了"，
+    /// 其实是**被活着的身体借走了**（1000 个动物 × 几格）。
+    /// 于是这里记两件事：搬了多少（这个数）、现在有多少水在水面以上
+    /// （[`Self::water_above`]）。**没有仪器就没有结论。**
+    water_moved: u64,
     /// 累计下落次数。
     fell_total: u64,
     /// 当前所有藻的 id，**升序**。
@@ -738,6 +747,7 @@ impl Default for LifeSim {
             stats: LifeStats::default(),
             food_growth: true,
             moved_total: [0; 4],
+            water_moved: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -786,6 +796,7 @@ impl LifeSim {
             stats: LifeStats::default(),
             food_growth: true,
             moved_total: [0; 4],
+            water_moved: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -914,6 +925,7 @@ impl LifeSim {
             stats: LifeStats::default(),
             food_growth: save.food_growth,
             moved_total: [0; 4],
+            water_moved: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -1386,7 +1398,11 @@ impl LifeSim {
                 let (x, y) = org.cell_at(cell);
                 let (x, y) = (x as isize, y as isize);
                 world.vacate(x, y);
-                if cell.wet {
+                // "水面以上的湿细胞死亡" = 水被搬到岸上了。记一笔，见 `water_moved`。
+            if cell.wet && (y as i32) < self.moisture.sea_level() {
+                self.water_moved += 1;
+            }
+            if cell.wet {
                     world.set(x, y, MaterialKind::Water);
                 }
             }
@@ -2017,7 +2033,22 @@ impl LifeSim {
         for i in 0..self.organisms.len() {
             let cells: Vec<(i32, i32)> = self.organisms[i].footprint().collect();
             let width = self.organisms[i].width;
-            if Self::touches_water(world, width, &cells) {
+            // **泡在水里 ≠ 浮得住。**
+            //
+            // 原来只要 `touches_water` 就跳过重力，于是一团"水 + 身体"能
+            // 互相托住：身体挡着水不让它落下，水又托着身体不让它掉——
+            // 一个悬空水柱能自己撑住自己（实测过 887 个个体挂在半空）。
+            //
+            // 现在多问一句：**身体最下面那格的下面，是空位吗？**
+            // 是空位就说明它不是"浮在水上"，是"吊在空中"——那种情况重力
+            // 照常接管，它会掉下去。
+            //
+            // 判据只看**一格**，因为整团会自己塌：最低那块掉下去之后，
+            // 上面的水就跟着落，然后上面那块又有水可浮了——一层层往下搬，
+            // 直到落到实地上。所以"只抓最底下那块"就够了，不需要每具身体
+            // 都去扫一整列（那会是 O(水深) 的开销）。
+            if Self::touches_water(world, width, &cells) && Self::floats_on_something(world, &cells)
+            {
                 continue;
             }
             // 往下掉一格。`MoveKind::Fall` 会跳过水陆判据、也不扣能量。
@@ -2025,10 +2056,57 @@ impl LifeSim {
         }
     }
 
+    /// 这具身体是"浮着"还是"吊着"。
+    ///
+    /// 判据：最下面那格的正下方，**不是空位**（是水、是固体、或者是世界底）。
+    /// 空位意味着它脚下什么都没有——那不是浮力，那是挂在半空。
+    fn floats_on_something(world: &World, cells: &[(i32, i32)]) -> bool {
+        let Some(lowest) = cells.iter().max_by_key(|&&(_, y)| y) else {
+            return false;
+        };
+        // 取最下面那一行里**任意一列**：只要有一列脚下有东西，它就撑得住。
+        let row = lowest.1;
+        cells
+            .iter()
+            .filter(|&&(_, y)| y == row)
+            .any(|&(x, _)| {
+                let (xs, ys) = (x as isize, (row + 1) as isize);
+                if !world.in_bounds(xs, ys) {
+                    // 世界底 = 有底。
+                    return true;
+                }
+                world.get(xs, ys) != MaterialKind::Empty
+            })
+    }
+
     /// 累计下落次数。这是"重力有没有在工作"的直接证据。
     #[inline]
     pub fn fell_total(&self) -> u64 {
         self.fell_total
+    }
+
+    /// 累计有多少格湿细胞在**水面之上**死亡（= 水被从海里搬到岸上）。
+    ///
+    /// 和 [`Self::water_above`] 一起看：前者是流量，后者是存量。
+    #[inline]
+    pub fn water_moved(&self) -> u64 {
+        self.water_moved
+    }
+
+    /// 现在有多少格水在**海平面以上**。
+    ///
+    /// 只在测量里调，不在 tick 循环里调——它要扫一遍世界。
+    pub fn water_above(&self, world: &World) -> usize {
+        let sea = self.moisture.sea_level().max(0) as isize;
+        let mut n = 0;
+        for y in 0..sea {
+            for x in 0..world.width() as isize {
+                if world.get(x, y) == MaterialKind::Water {
+                    n += 1;
+                }
+            }
+        }
+        n
     }
 
     fn act(&mut self, world: &mut World) {
@@ -2952,22 +3030,23 @@ impl LifeSim {
             }
             cells.push((x, y));
         }
-        // **暂时回到"整具身体都在水下"。**
+        // **仍然要求"整具身体都在水下"。**
         //
-        // v0.44 试过换成 `can_stand`（够得着水 **或** 脚下有实体），
-        // 单元测试全绿，而生态里炸了：
+        // v0.44 / v0.45 试过两次换成 `can_stand`（整具在水下 **或** 脚下有实体），
+        // 两次单元测试全绿、内陆植物真的能生，而两次生态都炸了。第二次把
+        // 病根挖清楚了（见 `阶段目标.md` 的 M16）：
         //
-        //   | | 基线（本判据） | can_stand |
-        //   |---|---|---|
-        //   | 悬空个体 | **0** | **887** |
-        //   | 动物数 | 482 | **1230** |
+        // **不是尸体造水，是"身体和水交换位置"。**
         //
-        // 病根**不在这道门**：陆地生物死后，尸体在原地烂成水
-        // （`tick_organics`），而**身体会挡住水不让它落下来**——于是
-        // 水托着身体、身体托着水，形成悬空水柱；水柱里能出生，就自持了。
+        //   - `bury` 的"水面以上还水"实测 **0 次**（`water_moved`）；
+        //   - 但"海平面以上的水"从 0 涨到 **8420 格**。
         //
-        // 也就是说：先得回答"尸体的水该去哪儿"，这道门才谈得上放宽。
-        // 详见 `阶段目标.md` 的 M16。
+        // 来源是 `try_move` 里那句 `world.swap`：身体往下一格，就把那一格的
+        // 水换到它刚让出来的位置——**身体往下游 = 水被顶上去**。而水绕不过
+        // 身体（`yields_to` 把被占的格算成墙），于是顶上去的水回不来。
+        // 密集的表层生命就是一个泵。
+        //
+        // 所以这道门要放宽，先得让"水能绕过身体流动"。那是材质层的事。
         Self::touches_water(world, org.width, &cells)
     }
 
@@ -5330,18 +5409,72 @@ mod tests {
         (w, 20)
     }
 
+    /// **"浮着"和"吊着"是两件事。**
+    ///
+    /// 判据只看**最下面那格的正下方**：是水/固体 = 浮着；是空位 = 吊着。
+    ///
+    /// 这一条是 v0.45 修的：原来只要 `touches_water` 就跳过重力，于是一团
+    /// "水 + 身体"能互相托住——身体挡着水不让它落下，水又托着身体不让它掉，
+    /// 悬空水柱能自己撑住自己（实测过 887 个个体挂在半空）。
+    #[test]
+    fn floating_needs_something_underneath() {
+        let (mut w, shore) = shore();
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+
+        // 水里：脚下是水 → 浮得住。
+        let in_water = [(10, 50)];
+        assert!(
+            LifeSim::floats_on_something(&w, &in_water),
+            "脚下是水就该浮得住"
+        );
+
+        // 半空里：脚下是空位 → 吊着，重力要接管。
+        let in_air = [(shore + 4, 20)];
+        assert!(
+            !LifeSim::floats_on_something(&w, &in_air),
+            "**脚下什么都没有就不是浮，是吊着**"
+        );
+
+        // 岸上：脚下是石头 → 撑得住（这一条和"浮着"无关，但同一个函数要答对）。
+        let on_land = [(shore + 4, 59)];
+        assert!(
+            LifeSim::floats_on_something(&w, &on_land),
+            "踩在实地上当然撑得住"
+        );
+
+        // 一排身体：只要**任意一列**脚下有东西，就撑得住。
+        let mut w2 = World::new(40, 40).unwrap();
+        w2.set(21, 21, MaterialKind::Stone);
+        let row = [(20, 20), (21, 20)];
+        assert!(
+            LifeSim::floats_on_something(&w2, &row),
+            "两格里有一格踩着石头，整排就撑得住"
+        );
+    }
+
     /// **陆地繁殖还没打通，这条测试记的是"目标"，不是"现状"。**
     ///
-    /// v0.44 把繁殖门从"整具身体都在水下"换成"够得着水 **或** 脚下有实体"，
-    /// 单元测试全绿、这条也确实通过了（内陆植物能生）。**但生态里炸了**：
-    /// 陆地尸体在原地烂成水，而身体挡着水不让它落下——水托身体、身体托水，
-    /// 形成悬空水柱；水柱里能出生，于是自持。实测悬空个体 0 → 887、
-    /// 动物数 482 → 1230。
+    /// 繁殖门试过两次（v0.44 / v0.45），两次都是"单元测试全绿、内陆植物
+    /// 真的能生、生态炸掉"。第二次把病根挖清楚了：
     ///
-    /// 所以判据已经回滚，这条先 `#[ignore]`。它同时是**下一轮的验收**：
-    /// 等"尸体的水该去哪儿"有了答案，把它打开。
+    /// **不是尸体造水，是"身体和水交换位置"。**
+    ///
+    /// | | 门关着 | 门开着 |
+    /// |---|---|---|
+    /// | `water_moved`（水面以上还了几格水） | **0** | **0** |
+    /// | `water_above`（海平面以上的水） | 8 | **8420** |
+    /// | 悬空个体 | 0 | 635 |
+    ///
+    /// 水不是尸体还的（流量是 0），是 `try_move` 里那句 `world.swap` 顶上来的：
+    /// 身体往下一格，那一格的水就被换到它刚让出的位置。而水绕不过身体
+    /// （`yields_to` 把被占的格算成墙），顶上去的水回不来。**密集的表层生命
+    /// 就是一个水泵**，而门一开，表层就密了。
+    ///
+    /// 所以要先让"水能绕过身体流动"（材质层的事），这道门才谈得上放宽。
+    /// 这条测试是那一轮的验收。
     #[test]
-    #[ignore = "等 M16 的病根（尸体水 + 水被身体托住）修好"]
+    #[ignore = "等材质层支持\"水绕过身体流动\"之后再打开（见阶段目标 M16）"]
     fn a_land_plant_can_reproduce() {
         let (mut w, shore) = shore();
         let mut sim = LifeSim::new(&mut w);
