@@ -71,6 +71,7 @@
 //! u8                 water_cycle
 //! u8                 land_reproduction（v8）
 //! u8                 share_water（v10）
+//! u8                 compact_remains（v11）
 //! "ENDVIVAR"  8B     尾标记
 //! ```
 //!
@@ -97,7 +98,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 10;
+pub const VERSION: u16 = 11;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -216,6 +217,12 @@ pub struct LifeSave {
     ///
     /// 两种错法都不会报错，只会让读档后的世界"跟存的时候不太一样"。
     pub share_water: bool,
+    /// 碎屑压实开不开（v11）。
+    ///
+    /// **必须存**，理由比前面几个更直接：它改的是**地形**。关着时碎屑永远
+    /// 不减少（`Remains` 是吸收态）；开着时碎屑会缓慢变成沙。读档悄悄关掉，
+    /// 那个世界会从"水位正在下降"变成"水位继续上涨"，而界面上没有任何提示。
+    pub compact_remains: bool,
 }
 
 /// 一条存档列表项。界面"读取"那一栏直接吃它。
@@ -289,6 +296,7 @@ pub fn encode(world: &World, sim: &LifeSim) -> Vec<u8> {
     out.u8(u8::from(sim.water_cycle()));
     out.u8(u8::from(sim.land_reproduction()));
     out.u8(u8::from(world.shares_water()));
+    out.u8(u8::from(sim.compact_remains()));
 
     out.0.extend_from_slice(&TRAILER);
     out.0
@@ -593,7 +601,8 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
 
     // v7：湿度场与水汽。更早的档没有这一节——那时候湿度是世界的纯函数，
     // `LifeSim::restore` 会重新播种一遍（和当时的行为一致）。
-    let (moisture, climate, water_cycle, land_reproduction, share_water) = if header.version >= 7 {
+    let (moisture, climate, water_cycle, land_reproduction, share_water, compact) =
+        if header.version >= 7 {
         let moisture = read_moisture(&mut r, header.width, header.height)?;
         let climate = crate::climate::Climate::from_parts(r.u64()?, r.u64()?, r.u64()?);
         let water_cycle = r.u8()? != 0;
@@ -605,9 +614,14 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         } else {
             false
         };
-        (moisture, climate, water_cycle, land, share)
+        let compact = if header.version >= 11 {
+            r.u8()? != 0
+        } else {
+            false
+        };
+        (moisture, climate, water_cycle, land, share, compact)
     } else {
-        (None, crate::climate::Climate::new(), false, false, false)
+        (None, crate::climate::Climate::new(), false, false, false, false)
     };
 
     // 尾标记
@@ -631,6 +645,7 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         water_cycle,
         land_reproduction,
         share_water,
+        compact_remains: compact,
     };
     let sim = LifeSim::restore(&mut world, save);
     Ok((world, sim))
@@ -1221,6 +1236,31 @@ mod tests {
         let bytes = encode(&world, &sim);
         let (w2, _) = decode(&bytes).unwrap();
         assert!(!w2.shares_water(), "旧模型的世界不该被读成共格模型");
+    }
+
+    /// **碎屑压实开关必须原样穿过存档**（v11）。
+    ///
+    /// 它改的是**地形**。读档之后悄悄关掉，那个世界会从"水位正在下降"
+    /// 变成"水位继续上涨"，而界面上没有任何提示——症状只会在几万 tick
+    /// 之后以"海怎么又涨了"的形式出现，那时早就查不到原因了。
+    #[test]
+    fn a_compacting_world_comes_back_compacting() {
+        let mut world = World::new(64, 64).unwrap();
+        let mut sim = LifeSim::new(&mut world);
+        sim.set_compact_remains(true);
+        let bytes = encode(&world, &sim);
+        let (_, s2) = decode(&bytes).unwrap();
+        assert!(s2.compact_remains(), "读档之后碎屑压实被关掉了");
+    }
+
+    /// 反面：默认关着的世界读回来也是关着的。
+    #[test]
+    fn an_ordinary_world_comes_back_without_compacting() {
+        let mut world = World::new(64, 64).unwrap();
+        let sim = LifeSim::new(&mut world);
+        let bytes = encode(&world, &sim);
+        let (_, s2) = decode(&bytes).unwrap();
+        assert!(!s2.compact_remains(), "默认关的世界不该被读成压实开着");
     }
 
     #[test]

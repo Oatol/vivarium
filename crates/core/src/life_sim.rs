@@ -350,6 +350,32 @@ pub const CORPSE_ROT_PERCENT: u32 = 20;
 /// 实测 8000 tick 堆了 4.3 万格。
 pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 
+/// 每次清扫时，**一对**被埋住的碎屑压实成地形（一格 `Sand` + 一格 `Empty`）
+/// 的概率（百分比）。
+///
+/// ## 为什么是"两格变一格"
+///
+/// 压实的物理含义就是**体积减小**。网格模型里一格碎屑改成一格沙，
+/// 体积一点没变 —— 排水效应也就一点没少，水位该涨还是涨，只是把
+/// "碎屑"这个名字换成了"沙"。**那样做等于什么都没做。**
+///
+/// 所以必须删掉一格：左边那格压成 `Sand`，右边那格变空，让上面的碎屑
+/// 塌下来。**沉积物压实是这一层唯一能真正减少体积的机制。**
+///
+/// ## 为什么只有"被埋住的"才算
+///
+/// 表面的碎屑是刚落下的、还没被压过。被埋住（上方有固体或碎屑）才是
+/// "上面压着东西"，才有压实的前提。这条同时保证了压实只发生在碎屑堆
+/// **内部**——一堆碎屑会从底下开始变实，而不是表面莫名其妙地结晶。
+///
+/// ## 为什么是 2%
+///
+/// `ORGANICS_INTERVAL = 25`，8000 tick 扫 320 次。2% ⇒ 一对被埋的碎屑
+/// 平均 50 次扫描后压实，也就是 1250 tick。碎屑的生成速率是"每次死亡
+/// 一格"，这个速率足够跟上而不会一夜之间把海底全变成沙。
+pub const COMPACT_PERCENT: u32 = 2;
+
+
 /// 浮游藻撒在水面以下多少格之内。
 ///
 /// 用"离水面多深"而不是"光照阈值"：光照是 `1 - y/世界高`，它把**世界尺寸**
@@ -419,6 +445,11 @@ const NEIGHBORS_4: [(i32, i32); 4] = [(0, -1), (-1, 0), (1, 0), (0, 1)];
 
 /// 尸体腐烂用的位置派生随机盐。必须和材质层的盐不同。
 const SALT_CORPSE_ROT: u32 = 0xDEAD;
+
+/// 碎屑压实用的位置派生随机盐。**和腐烂分开**：两者都跑在同一次清扫里，
+/// 共用盐会让"同一格既腐烂又压实"的相关性变成隐形的耦合——
+/// 那种耦合不会报错，只会让速率对不上。
+const SALT_COMPACT: u32 = 0xC0DE;
 
 // ---------------------------------------------------------------------------
 // 捕食
@@ -702,6 +733,19 @@ pub struct LifeSim {
     /// 六次尝试全是"改完跑一遍"，而没有开关就只能改源码再改回来——
     /// 那种流程里"我到底测的是哪个版本"永远说不清。
     land_reproduction: bool,
+    /// 碎屑会不会**压实成地形**（见 [`Self::compact_buried_remains`]）。
+    ///
+    /// **默认关**。它改的是"世界里有几格固体"，也就是地形本身——比
+    /// `water_cycle` 和 `land_reproduction` 更底层。关着时逐 tick 行为不变。
+    ///
+    /// ## 为什么需要它（v0.56 量出来的）
+    ///
+    /// `Remains` 是一条**吸收态**：它只能被吃掉，而吃碎屑的生态位远不够
+    /// （`食腐` 吃的是 `Corpse`）。于是碎屑单调累积 —— 8000 tick 从 50 格涨到
+    /// 15918 格。而碎屑是粉末，堆在海里就**排开同体积的水**，水位跟着涨：
+    /// 水上水 168 → 27137。追到底的判决是"落固 11460 格里地形贡献 **0**"，
+    /// 全是碎屑 7086 + 尸体 4374。**没有水柱，是碎屑在排水。**
+    compact_remains: bool,
     /// 四个方向的累计移动次数 `[左, 右, 上, 下]`。
     ///
     /// 和 `stats.moved` 的区别是**它不清零**：`stats` 每 tick 重建，
@@ -743,6 +787,12 @@ pub struct LifeSim {
     ///
     /// 不进存档——和 `water_vented` 一样是本次会话的诊断计数。
     water_vaporized: u64,
+    /// 累计有多少**对**碎屑被压成了地形（一格 `Sand` + 一格空）。
+    ///
+    /// 一格 `Sand` 的净效果是"固体多一格、碎屑少两格"——也就是
+    /// **碎屑体积减半**。这个计数存在的意义是回答"压实到底有没有在动"：
+    /// 少了它，`水上水` 没降下来时分不清"规则没生效"和"规则生效了但不够"。
+    compacted: u64,
     /// 累计下落次数。
     fell_total: u64,
     /// 当前所有藻的 id，**升序**。
@@ -799,10 +849,12 @@ impl Default for LifeSim {
             water_cycle: false,
             climate: Climate::new(),
             land_reproduction: false,
+            compact_remains: false,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
             water_vaporized: 0,
+            compacted: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -853,10 +905,12 @@ impl LifeSim {
             water_cycle: false,
             climate: Climate::new(),
             land_reproduction: false,
+            compact_remains: false,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
             water_vaporized: 0,
+            compacted: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -960,6 +1014,27 @@ impl LifeSim {
         self.land_reproduction
     }
 
+    /// 打开/关闭**碎屑压实**，见 [`Self::compact_buried_remains`]。
+    ///
+    /// **默认关**：它改地形，比水位更底层。开着时被埋住的碎屑对会按
+    /// [`COMPACT_PERCENT`] 压成一格 `Sand` + 一格空，体积减半。
+    ///
+    /// ## 为什么这是"水位"问题的正解，而不是"碎屑太多"的权宜
+    ///
+    /// v0.56 的判决是：水上那 2.7 万格水**不是被搬上去的**，是碎屑堆在
+    /// 海里排开的（落固 11460 格里地形贡献 0，全是碎屑 7086 + 尸体 4374）。
+    /// 所以只要碎屑总体积不再单调增长，排水就会停止，水位就不再涨。
+    /// 而"把碎屑改名成沙"做不到这件事——**必须减少格数**。
+    pub fn set_compact_remains(&mut self, on: bool) {
+        self.compact_remains = on;
+    }
+
+    /// 碎屑压实是否开着。
+    #[inline]
+    pub fn compact_remains(&self) -> bool {
+        self.compact_remains
+    }
+
     /// 水汽与蒸发/降水计数（只读）。
     #[inline]
     pub fn climate(&self) -> &Climate {
@@ -1035,10 +1110,12 @@ impl LifeSim {
             water_cycle: save.water_cycle,
             climate: save.climate,
             land_reproduction: save.land_reproduction,
+            compact_remains: save.compact_remains,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
             water_vaporized: 0,
+            compacted: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -1931,6 +2008,14 @@ impl LifeSim {
         for y in 0..h {
             for x in 0..w {
                 let (xs, ys) = (x as isize, y as isize);
+                // **碎屑压实**（v0.57）：塞进同一次清扫里，不额外扫一遍。
+                //
+                // 放在 `Corpse` 判断之前：两者互斥（材质不同），
+                // 而压实的判据要读右邻居，越早跳过越省。
+                if self.compact_remains && world.get(xs, ys) == MaterialKind::Remains {
+                    self.compact_pair(world, x, y, tick);
+                    continue;
+                }
                 if world.get(xs, ys) != MaterialKind::Corpse {
                     continue;
                 }
@@ -2039,6 +2124,71 @@ impl LifeSim {
         if self.food_growth {
             self.seed_plankton(world);
         }
+    }
+
+    /// 这一格上面是不是压着东西（碎屑、沙、石、尸体，或者被身体占着）。
+    ///
+    /// 压实只发生在**被埋住**的碎屑上：表面的碎屑是刚落下的，还没有被压过。
+    /// 这条同时保证了压实从堆的内部开始，而不是表面莫名其妙地结晶。
+    fn is_buried(world: &World, x: usize, y: usize) -> bool {
+        if y == 0 {
+            // 世界最上面一行上面没有东西，压不着。
+            return false;
+        }
+        let xs = x as isize;
+        let above = (y - 1) as isize;
+        if matches!(
+            world.get(xs, above),
+            MaterialKind::Remains
+                | MaterialKind::Sand
+                | MaterialKind::Stone
+                | MaterialKind::Corpse
+        ) {
+            return true;
+        }
+        // 身体也是墙（`yields_to` 把它当障碍），被它压着同样算埋住。
+        world.is_occupied(xs, above)
+    }
+
+    /// 试着把 `(x, y)` 和它右邻这一**对**碎屑压成地形。
+    ///
+    /// ## 为什么必须是"一对"
+    ///
+    /// 压实的物理含义是**体积减小**。一格碎屑改成一格沙，体积一点没变——
+    /// 排水效应一点没少，水位该涨还是涨，只是把"碎屑"这个名字换成了"沙"。
+    /// **那样做等于什么都没做。** 所以这里删掉一格：左格压成 `Sand`，
+    /// 右格变空，让上面的碎屑塌下来。
+    ///
+    /// ## 为什么只认右邻
+    ///
+    /// 每对只处理一次。处理完右格已经变成 `Empty`，外层循环走到它时
+    /// `world.get` 拿到的不是 `Remains`，自然跳过——不需要额外的"已处理"标记。
+    ///
+    /// ## 为什么不用记账
+    ///
+    /// 碎屑的 `flags` 一定是 0：能量在腐烂那一步就记进 `dissipated` 了
+    /// （见 `tick_organics` 里那段"能量守恒的账必须先立住"）。所以
+    /// `world.set` 清零 flags 不会丢掉任何一笔能量。
+    fn compact_pair(&mut self, world: &mut World, x: usize, y: usize, tick: u64) {
+        let (xs, ys) = (x as isize, y as isize);
+        if world.get(xs + 1, ys) != MaterialKind::Remains {
+            return;
+        }
+        if !Self::is_buried(world, x, y) || !Self::is_buried(world, x + 1, y) {
+            return;
+        }
+        if !Rng::at_percent(x, y, tick, SALT_COMPACT, COMPACT_PERCENT) {
+            return;
+        }
+        world.set(xs, ys, MaterialKind::Sand);
+        world.set(xs + 1, ys, MaterialKind::Empty);
+        self.compacted += 1;
+    }
+
+    /// 累计被压实的**对数**（每对 = 碎屑 -2、沙 +1）。
+    #[inline]
+    pub fn compacted(&self) -> u64 {
+        self.compacted
     }
 
     /// 播种浮游藻：在水里撒几个**单细胞生产者**。
@@ -5159,6 +5309,101 @@ mod tests {
 
         let left = w.count_of(MaterialKind::Corpse);
         assert!(left < 5, "堆到水面之上的尸体也必须分解，实际还剩 {left} 格");
+    }
+
+    /// **被埋住的碎屑会压成地形**（v0.57）。
+    ///
+    /// 判据是"碎屑少了、沙多了"——**不能只看 `compacted() > 0`**：
+    /// 那个计数只证明函数被调到，不证明体积真的减了。而"体积减半"
+    /// 正是这条规则的**全部意义**：一格碎屑改成一格沙，排水效应一点没少，
+    /// 水位该涨还是涨。所以判据必须落在"总量"上。
+    #[test]
+    fn buried_remains_compact_into_sand() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        // 40×4 的一堆碎屑：最上面一行露在空气里，下面三行被压着。
+        w.fill_rect(10, 56, 40, 4, MaterialKind::Remains);
+        let before = w.count_of(MaterialKind::Remains);
+        assert_eq!(before, 160);
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        sim.set_compact_remains(true);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        let after = w.count_of(MaterialKind::Remains);
+        // **判据必须落在"总体积"上，不能只看碎屑。**
+        //
+        // 只看 `Remains` 的话，"两格碎屑变两格沙"也会让它减少——而那正是
+        // 这条规则要排除的那种写法：固体一格没少，排水效应一点没变，
+        // 水位该涨还是涨，只是把名字换掉了。所以把沙一起数进去。
+        let solid_after = after + w.count_of(MaterialKind::Sand);
+        assert!(
+            solid_after * 4 < before * 3,
+            "压实必须减少**总体积**（不只是改名）：{before} → 碎屑 {after} + 沙 = {solid_after}"
+        );
+        assert!(
+            w.count_of(MaterialKind::Sand) > 0,
+            "压实应当产出沙，实际一格都没有"
+        );
+        assert!(sim.compacted() > 0, "压实计数应当被推到");
+    }
+
+    /// **露在表面的碎屑不压实**。
+    ///
+    /// 压实的前提是"上面压着东西"。少了这一条，一堆碎屑会从表面开始
+    /// 结晶——那不是沉积，那是凭空变出地形。
+    #[test]
+    fn surface_remains_do_not_compact() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        // 只有一层，上方全是空气。
+        w.fill_rect(10, 59, 40, 1, MaterialKind::Remains);
+        let before = w.count_of(MaterialKind::Remains);
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        sim.set_compact_remains(true);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        assert_eq!(
+            w.count_of(MaterialKind::Remains),
+            before,
+            "表面碎屑不该被压实"
+        );
+        assert_eq!(sim.compacted(), 0, "一格都不该压");
+    }
+
+    /// **默认关，而且关着时一格都不动**。
+    ///
+    /// 这条是"开关默认关 = 零行为变化"的守卫：它改的是地形，
+    /// 关着时旧世界的每一格碎屑都必须原样留着。
+    #[test]
+    fn compaction_is_off_by_default() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(10, 56, 40, 4, MaterialKind::Remains);
+        let before = w.count_of(MaterialKind::Remains);
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        assert!(!sim.compact_remains(), "默认必须是关的");
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        assert_eq!(w.count_of(MaterialKind::Remains), before, "关着时不该少");
+        assert_eq!(sim.compacted(), 0);
     }
 
     /// **露天的尸体不许在原地造水**（v0.50 的 ①）。

@@ -278,6 +278,10 @@ pub struct Snapshot {
     /// 原地、身体叠在它上面。所以它单独占一节，不混在"生态开关"里。
     pub share_water: bool,
 
+    /// 碎屑压实成地形（v0.57）。**改的是地形本身**——比水位更底层，
+    /// 所以和共格一样单独放在物理那一节。
+    pub compact_remains: bool,
+
     /// 材质层的并行工人数上限，以及上一次真正干活时用到了几个。
     pub threads: usize,
     pub workers: usize,
@@ -322,6 +326,7 @@ impl Default for Snapshot {
             water_cycle: false,
             land_reproduction: false,
             share_water: false,
+            compact_remains: false,
             threads: 1,
             workers: 1,
             hover: None,
@@ -550,6 +555,8 @@ pub enum Command {
     /// 水与生物共格（实验性物理内核）。**会改存档格式的语义**，见 core 的
     /// `World::share_water`。
     SetShareWater(bool),
+    /// 碎屑压实成地形（v0.57）。
+    SetCompactRemains(bool),
     /// 材质层并行工人数上限。
     SetThreads(usize),
 

@@ -268,13 +268,14 @@ impl Egui {
             Command::SaveWorld(_) => false,
             Command::LoadWorld(_) => false,
             Command::RefreshSaves => false,
-            // 「全局参数」的七条全要碰模拟：温度场、三个开关、物理模型、线程池。
+            // 「全局参数」的八条全要碰模拟：温度场、三个开关、物理模型、线程池。
             Command::SetAmbientTemp(_) => false,
             Command::ResetTemperature => false,
             Command::SetFoodGrowth(_) => false,
             Command::SetWaterCycle(_) => false,
             Command::SetLandReproduction(_) => false,
             Command::SetShareWater(_) => false,
+            Command::SetCompactRemains(_) => false,
             Command::SetThreads(_) => false,
             Command::Quit => false,
         }

@@ -269,6 +269,30 @@ fn physics_section(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
             .size(9.0)
             .color(theme::TEXT_FAINT),
     );
+
+    ui.add_space(6.0);
+
+    if widgets::toggle_row(
+        ui,
+        "碎屑压实成地形",
+        snap.compact_remains,
+        "被埋住的碎屑会慢慢压成沙：**两格碎屑挤成一格沙**，体积减半。\
+         关着时碎屑只进不出，堆在海里排开海水，水位会一路涨。",
+    )
+    .changed()
+    {
+        state.emit(Command::SetCompactRemains(!snap.compact_remains));
+    }
+
+    ui.label(
+        egui::RichText::new(if snap.compact_remains {
+            "开着：碎屑 → 沙，总量会停下来，水位不再涨。"
+        } else {
+            "关着：碎屑是吸收态，堆多少留多少（水位会跟着涨）。"
+        })
+        .size(9.0)
+        .color(theme::TEXT_FAINT),
+    );
 }
 
 /// 性能：并行工人数。

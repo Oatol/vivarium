@@ -295,6 +295,13 @@ fn run(seed: u64) -> String {
     // 陆地繁殖（`can_stand`）。默认关，`M7_LAND=1` 打开做对照。
     let land = std::env::var("M7_LAND").map(|v| v != "0").unwrap_or(false);
     sim.set_land_reproduction(land);
+    // 碎屑压实。默认关，`M7_COMPACT=1` 打开做对照。
+    //
+    // 这是 v0.56 判决指向的那条修法：水上那 2.7 万格水不是被搬上去的，
+    // 是碎屑堆在海里排开的。压实把两格碎屑挤成一格沙，**体积减半**，
+    // 排水才会停。
+    let compact = std::env::var("M7_COMPACT").map(|v| v != "0").unwrap_or(false);
+    sim.set_compact_remains(compact);
     // **双层模型**（水与生物共格）。默认关，`M7_SHARE=1` 打开。
     //
     // 必须在 `stock_surface` **之前**设：投放那一步就要走新规则
@@ -463,7 +470,7 @@ fn run(seed: u64) -> String {
         .join(" / ");
 
     format!(
-        "{map}\n{model} seed {seed:>5}  初始水 {water_start:6}  水上初 {water_above_start:5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  共格 {:5}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{} | 根 连海{} 落固{} 悬空{} 到底{} | 托物 屑{} 尸{} 地形{} 其它{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}\n        └ 水上来源：{src_line}",
+        "{map}\n{model} seed {seed:>5}  初始水 {water_start:6}  水上初 {water_above_start:5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  共格 {:5}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{} | 根 连海{} 落固{} 悬空{} 到底{} | 托物 屑{} 尸{} 地形{} 其它{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  压实 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}\n        └ 水上来源：{src_line}",
         st.organisms,
         st.plankton,
         st.species,
@@ -508,6 +515,7 @@ fn run(seed: u64) -> String {
         shape.orgs,
         sim.water_moved(),
         sim.water_vented(),
+        sim.compacted(),
         sim.water_vaporized(),
         sim.climate().evaporated(),
         sim.climate().rained(),

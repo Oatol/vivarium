@@ -1323,6 +1323,7 @@ impl Game {
             land_reproduction: self.life.land_reproduction(),
             // 共格模型住在 `World` 上（材质层也要读），所以从 `self.world` 取。
             share_water: self.world.shares_water(),
+            compact_remains: self.life.compact_remains(),
             threads: self.sim.threads(),
             workers: self.sim.workers(),
             hover: self.hover_info(),
@@ -1559,6 +1560,25 @@ impl Game {
                             "水与生物共格（身体不借水、不顶水）"
                         } else {
                             "旧模型（借水 + 顶水）"
+                        }
+                    ),
+                );
+            }
+            C::SetCompactRemains(on) => {
+                // **整个标脏**：压实改的是地形，静下来的块在新规则下
+                // 也得重新判一次——不然碎屑堆内部会一直是"刚堆好"的状态。
+                self.life.set_compact_remains(on);
+                self.world.mark_all_dirty();
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Warn,
+                    format!(
+                        "碎屑压实：{}",
+                        if on {
+                            "开（被埋的碎屑会压成沙，体积减半）"
+                        } else {
+                            "关（碎屑只进不出）"
                         }
                     ),
                 );
