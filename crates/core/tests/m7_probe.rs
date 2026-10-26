@@ -140,6 +140,32 @@ fn above_sea_shape(world: &World, sim: &LifeSim) -> AboveSea {
                 } else {
                     out.sky_on_solid += 1;
                 }
+                // 侧面：这根"柱子"是不是被身体围出来的。
+                let (l, r) = ((x - 1 + w) % w, (x + 1) % w);
+                let mut sides_open = 0;
+                for sx in [l, r] {
+                    if world.is_occupied(sx, y) {
+                        out.sky_side_body += 1;
+                    } else if matches!(
+                        world.get(sx, y),
+                        MaterialKind::Stone | MaterialKind::Sand | MaterialKind::Remains
+                    ) {
+                        // 固体也是墙，但那不是"身体的错"。
+                    } else {
+                        sides_open += 1;
+                    }
+                }
+                if sides_open >= 1 {
+                    out.sky_side_air += 1;
+                }
+                let band = match dy {
+                    0..=4 => 0,
+                    5..=16 => 1,
+                    17..=32 => 2,
+                    33..=64 => 3,
+                    _ => 4,
+                };
+                out.depth_bands[band] += 1;
             }
             out.deepest = out.deepest.max(dy);
         }
@@ -166,6 +192,28 @@ struct AboveSea {
     sky_on_nothing: u64,
     sky_on_solid: u64,
     sky_on_floor: u64,
+    /// 悬空水的**左右邻居里有几格是身体**（一个格子最多算 2）。
+    ///
+    /// 这是"双层模型能不能修好水柱"的判据。水柱的形状是"下面 85% 是水"，
+    /// 所以看下面看不出病因；但如果它的**侧面**被身体围住，那它就是一个
+    /// "身体当墙的尖峰"——身体不再当墙，它就塌。侧面也是水/空的话，
+    /// 那它靠的是别的东西（扫描顺序、横向流动规则），**双层救不了**。
+    sky_side_body: u64,
+    /// 悬空水里，**至少有一侧是空气**的格数。
+    ///
+    /// 这批水是"露在空气里"的：它旁边就是空的，只要规则允许就该摊出去。
+    /// 而内部格（两侧都是水）不算——那是水的内部，量它没有意义。
+    ///
+    /// 判据：**露在空气里的悬空水**有多少。如果它接近 `sky`，那这团水
+    /// 是一面暴露在空中的墙；如果它很小，那这团水其实是被地形围住的
+    /// "抬高的海面"，跟身体一点关系都没有。
+    sky_side_air: u64,
+    /// 悬空水按"离海平面多远"分桶：1–4 / 5–16 / 17–32 / 33–64 / 65+。
+    ///
+    /// **这是"平台还是尖刺"的判据。** 平顶的一大团水，每一层都接近满宽，
+    /// 分桶会前小后大（绝大部分在 33+）；细柱子则相反，越往上越少。
+    /// 两种形状的病因完全不同：前者是"海面被抬高了"，后者才是"被顶上去"。
+    depth_bands: [u64; 5],
     deepest: i32,
     orgs: usize,
 }
@@ -195,6 +243,23 @@ fn run(seed: u64) -> String {
         mat.step(&mut world);
         sim.step(&mut world);
         scavenged += sim.stats().scavenged as u64;
+    }
+
+    // **判决实验：这堆水是不想动，还是没被扫描？**
+    //
+    // 材质层只扫**脏块**（SPEC §2.4 的性能前提）。如果一团水在某个 tick
+    // 之后不再有任何格子移动，它所在的块就再也不进扫描队列——哪怕它的
+    // 形状在物理上根本站不住。`M7_STIR=1` 每 tick 把所有块标脏，
+    // 强制重新扫一遍：水掉下来 = 这是脏块追踪的问题，不是物理的问题。
+    let mut stirred = String::new();
+    if std::env::var("M7_STIR").map(|v| v != "0").unwrap_or(false) {
+        let before = sim.water_above(&world);
+        for _ in 0..200 {
+            world.mark_all_dirty();
+            mat.step(&mut world);
+        }
+        let after = sim.water_above(&world);
+        stirred = format!("  [强制扫描 200 tick：水上 {before} → {after}]");
     }
 
     let st = sim.stats();
@@ -245,8 +310,48 @@ fn run(seed: u64) -> String {
         }
     }
 
+    // 海平面以上那一片的**形状**：每 4×4 一格，`~` 有水、`#` 有身体、`.` 全空。
+    // 一个数（25171）可以是"平顶的一团"也可以是"一根柱子"，
+    // 而这两种形状的病因完全不同——**先看图，再谈因果**。
+    let sea = sim.moisture().sea_level();
+    let mut map = String::new();
+    let want_map = std::env::var("M7_MAP").map(|v| v != "0").unwrap_or(false);
+    let mut y = (sea - 116).max(0) as isize;
+    while y < sea as isize && want_map {
+        map.push_str("  ");
+        let mut x = 0;
+        while x < world.width() as isize {
+            let mut has_water = false;
+            let mut has_body = false;
+            for dy in 0..4isize {
+                for dx in 0..4isize {
+                    let (px, py) = (x + dx, y + dy);
+                    if !world.in_bounds(px, py) {
+                        continue;
+                    }
+                    if world.get(px, py) == MaterialKind::Water {
+                        has_water = true;
+                    }
+                    if world.is_occupied(px, py) {
+                        has_body = true;
+                    }
+                }
+            }
+            map.push(if has_body {
+                '#'
+            } else if has_water {
+                '~'
+            } else {
+                '.'
+            });
+            x += 4;
+        }
+        map.push('\n');
+        y += 4;
+    }
+
     format!(
-        "seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
+        "{map}\nseed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
         st.organisms,
         st.plankton,
         st.species,
@@ -272,6 +377,13 @@ fn run(seed: u64) -> String {
         shape.sky_on_water,
         shape.sky_on_nothing,
         shape.sky_on_solid,
+        shape.sky_side_body,
+        shape.sky_side_air,
+        shape.depth_bands[0],
+        shape.depth_bands[1],
+        shape.depth_bands[2],
+        shape.depth_bands[3],
+        shape.depth_bands[4],
         shape.orgs,
         sim.water_moved(),
         sim.water_vented(),
@@ -281,7 +393,7 @@ fn run(seed: u64) -> String {
         sim.climate().vapor(),
         land_surface_moisture(&world, &sim),
         land_remains,
-    )
+    ) + &stirred
 }
 
 #[test]
