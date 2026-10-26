@@ -509,7 +509,7 @@ impl Game {
 
   左键 落笔 · 右键/中键拖拽 平移 · 滚轮 缩放（以指针为中心）· 方向键 平移 · 0 回到全景
   B 画笔 · X 擦生物 · E 擦物质 · F 填充 · I 取样 · Q 检查 · P 光源
-  W 生物工坊 · G 世界（新建 / 保存 / 读取）· V 换滤镜",
+  W 生物工坊 · G 世界（新建 / 保存 / 读取）· K 全局参数 · V 换滤镜",
             info.name,
             info.backend,
             self.renderer.surface_format(),
@@ -596,6 +596,9 @@ impl Game {
                 // 而新建世界正好是这件事。
                 "w" | "W" => self.ui.state.workshop.open = !self.ui.state.workshop.open,
                 "g" | "G" => self.toggle_world_panel(),
+                // K = 全局参数（knobs）。放在 G 后面：两块都是"模态面板"，
+                // 而 K 是"世界的旋钮"——字母本身记得住。
+                "k" | "K" => self.ui.state.toggle_params(),
                 "r" | "R" => self.reseed(),
                 // V = 换滤镜。Tab 会被 egui 拿去走焦点，F1..F4 在很多
                 // 键盘上是媒体键，V 是这里唯一没被占的顺手的键。
@@ -968,6 +971,9 @@ impl Game {
     fn toggle_world_panel(&mut self) {
         self.ui.state.world.open = !self.ui.state.world.open;
         if self.ui.state.world.open {
+            // 两块模态互斥。`toggle_params` 里做了对称的那一半——
+            // 两处都要写，因为"开"可以从两个方向发生。
+            self.ui.state.params.open = false;
             self.ui.state.emit(vivarium_ui::Command::RefreshSaves);
         }
     }
@@ -1099,8 +1105,10 @@ impl Game {
                 self.world = world;
                 self.life = next_life;
                 // 存档里带着 `water_cycle`（不存的话读档之后雨会无声地停），
-                // 但**命令行开关是这一局的话事人**：用 `--no-rain` 启动的人
-                // 不该因为读了一份"有雨"的档就突然下起雨来。
+                // 但**这一局的设置是话事人**：用 `--no-rain` 启动、或者在
+                // 「全局参数」里关掉水循环的人，不该因为读了一份"有雨"的档
+                // 就突然下起雨来。`rain` 这个字段现在有两个写入口（命令行和
+                // 界面开关），它们写的是同一个地方，所以这条判据不用改。
                 self.life.set_water_cycle(self.rain);
                 self.sim = MaterialSim::new();
                 // 存档里没有"当初用的生成种子"，只能从材质反推地表形状。
@@ -1305,6 +1313,16 @@ impl Game {
             vapor: self.life.climate().vapor(),
             census: self.world.census(),
             field: self.life.field().stats(),
+            ambient_temp: self.life.field().ambient_temp(),
+            // 光合效率**在这里算**，不交给界面：`photosynthesis` 是模拟的一条
+            // 法则，界面抄一份公式就一定会漂移（而漂移的表现是"面板说 96%、
+            // 实际一片不产"）。这一行是"派生量该由谁算"的边界。
+            warmth: vivarium_core::field::photosynthesis(self.life.field().ambient_temp()),
+            food_growth: self.life.food_growth(),
+            water_cycle: self.life.water_cycle(),
+            land_reproduction: self.life.land_reproduction(),
+            threads: self.sim.threads(),
+            workers: self.sim.workers(),
             hover: self.hover_info(),
             history: self.history.clone(),
             selected: self.selected_view(),
@@ -1478,6 +1496,62 @@ impl Game {
             C::SaveWorld(name) => self.save_world(&name),
             C::LoadWorld(path) => self.load_world(&path),
             C::RefreshSaves => self.refresh_saves(),
+            // --- 全局参数 ---------------------------------------------------
+            C::SetAmbientTemp(t) => {
+                // 只改**目标**。现有温度场要自己慢慢走过去——顺手把它刷成
+                // 新温度会把"刚放的一团火"一起抹掉，而那正是玩家要看的。
+                self.life.field_mut().set_ambient_temp(t);
+            }
+            C::ResetTemperature => {
+                self.life.field_mut().reset_temp();
+                let tick = self.world.tick();
+                let t = self.life.field().ambient_temp();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("温度场已拉回 {t:.0} °C"),
+                );
+            }
+            C::SetFoodGrowth(on) => {
+                self.life.set_food_growth(on);
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("藻席生长：{}", if on { "开" } else { "关" }),
+                );
+            }
+            C::SetWaterCycle(on) => {
+                self.life.set_water_cycle(on);
+                // 和命令行参数保持一致：`rain` 这个字段是"这个世界要不要下雨"
+                // 的那份记录，`reseed` 会读它。两条路必须写同一个地方，
+                // 否则按 R 重铺地形之后雨会悄悄停掉。
+                self.rain = on;
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("水循环：{}", if on { "开" } else { "关" }),
+                );
+            }
+            C::SetLandReproduction(on) => {
+                self.life.set_land_reproduction(on);
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Warn,
+                    format!("陆地繁殖：{}", if on { "开" } else { "关" }),
+                );
+            }
+            C::SetThreads(n) => {
+                self.sim.set_threads(n);
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Info,
+                    format!("并行工人数：{}", self.sim.threads()),
+                );
+            }
             C::CenterView => {
                 let size = (self.world.width() as u32, self.world.height() as u32);
                 self.renderer.set_viewport(Viewport::centered_on(size));

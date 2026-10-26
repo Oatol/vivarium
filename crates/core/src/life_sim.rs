@@ -1015,6 +1015,10 @@ impl LifeSim {
         // 长度不符的温标会被 `restore` 整个拒掉，退回环境温度——
         // 一个坏档不值得让整个读档失败，但也不该装进去一半。
         field.restore(world, &save.sources, &save.temp);
+        // 环境温度是那张表的吸引子，得在装完表之后设——顺序其实无所谓
+        // （`set_ambient_temp` 只写一个标量），但写在后面读起来才是
+        // "先装状态，再装它的目标"。
+        field.set_ambient_temp(save.ambient);
 
         let mut sim = Self {
             organisms: Vec::new(),
@@ -5662,6 +5666,49 @@ mod tests {
         );
         assert_eq!(dampness(SUBMERGED_MIN), 1.0, "到 SUBMERGED_MIN 应当满产");
         assert_eq!(dampness(0.9), 1.0, "泡在水里不该有额外加成");
+    }
+
+    /// 世界温度真的会改变生态——这是「全局参数」里那个滑块的全部意义。
+    ///
+    /// 判据：同一份世界、同一具身体、只改环境温度，比几次 `step` 之后的光合
+    /// 注入量。`photosynthesis(20) = 0.96`、`photosynthesis(45) = 0.36`，
+    /// 所以后者应当**不到前者的一半**——只断言"更少"会被任何噪声满足。
+    ///
+    /// 注入量要**减去基线**：`spawn_injected` 会把这具身体的初始能量
+    /// 记成"注入"（那是真的注入了世界），5000 点基线会把 22 和 8 的差别
+    /// 整个吃掉——实测第一版就是这么写的，结论是"温度没影响"。
+    ///
+    /// 这条同时钉住了接线：`set_ambient_temp` → `reset_temp` → `temp_at`
+    /// → `photosynthesis` → `injected`。中间任何一环断了它都会红。
+    #[test]
+    fn a_hotter_world_photosynthesises_less() {
+        fn injected_at(ambient: f32) -> u64 {
+            let mut w = pool();
+            let mut sim = LifeSim::new(&mut w);
+            sim.set_food_growth(false);
+            sim.spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((20, 33), Genome::blank(), 5_000),
+            )
+            .unwrap();
+            sim.field_mut().set_ambient_temp(ambient);
+            // 直接铺到目标温度，省掉 2000 tick 的松弛——这条测的是"温度
+            // 有没有传到光合"，不是"温度怎么走过去"（那是 field 的测试）。
+            sim.field_mut().reset_temp();
+            let before = sim.ledger().injected;
+            for _ in 0..3 {
+                sim.step(&mut w);
+            }
+            sim.ledger().injected - before
+        }
+
+        let normal = injected_at(20.0);
+        let hot = injected_at(45.0);
+        assert!(normal > 0, "基线本身要有产出，否则这条测的是零");
+        assert!(
+            hot * 2 < normal,
+            "45 °C 的产出应当不到 20 °C 的一半：{hot} vs {normal}"
+        );
     }
 
     /// 水占比按**列**数，不按格数。

@@ -495,6 +495,25 @@ fn top_bar(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
                     state.emit(Command::Step);
                 }
 
+                // 参数：和速度档、单步挨在一起，因为这三件事都是"世界怎么跑"，
+                // 而右边的视图滤镜是"我怎么看"。**不给 tooltip**——顶栏的
+                // tooltip 只能往下弹，正好压在世界上面，而按参数按钮的人
+                // 下一步就要看世界怎么变。热键直接写进标签。
+                let params_on = state.params.open;
+                if widgets::flat_button(
+                    ui,
+                    "参数 K",
+                    if params_on {
+                        BtnState::Selected
+                    } else {
+                        BtnState::Normal
+                    },
+                )
+                .clicked()
+                {
+                    state.toggle_params();
+                }
+
                 ui.add_space(8.0);
                 sep(ui);
                 ui.add_space(4.0);

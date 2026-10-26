@@ -516,6 +516,77 @@ pub fn value_slider(
     resp
 }
 
+/// 一行开关：`标签 ········· [ 开 ]`。
+///
+/// ## 为什么整行可点
+///
+/// 这一行问的是"这一项现在开着吗"，而**点哪儿都该能翻它**。只让右边那个
+/// 小方块可点，等于把一个 18px 的目标塞在一条 400px 的行里——玩家会点标签，
+/// 然后以为界面坏了。
+///
+/// ## 为什么不用 `ui.checkbox`
+///
+/// egui 原生的勾选框带着它自己的一套配色和圆角，在这块纯黑 1px 线的皮肤上
+/// 像贴上去的。这里沿用 `flat_button` 的语言：`Selected` 就是"开"，
+/// 同一个词在两处长得一样，"开着"这件事就只需要学一次。
+///
+/// 返回值的 `changed()` 只在**这一次点击真的翻了状态**时为真。
+pub fn toggle_row(ui: &mut Ui, label: &str, on: bool, tip: &str) -> Response {
+    let h = 20.0;
+    let (rect, mut resp) =
+        ui.allocate_exact_size(Vec2::new(ui.available_width(), h), Sense::click());
+    let hovered = resp.hovered();
+    let pressed = resp.is_pointer_button_down_on();
+
+    let (fill, ink) = if pressed {
+        (theme::TEXT, theme::PANEL)
+    } else if hovered {
+        (theme::HOVER, Color32::WHITE)
+    } else {
+        (theme::PANEL, theme::TEXT_DIM)
+    };
+    let p = ui.painter();
+    p.rect_filled(rect, CornerRadius::ZERO, fill);
+    p.text(
+        egui::pos2(rect.left() + 2.0, rect.center().y),
+        Align2::LEFT_CENTER,
+        label,
+        FontId::new(theme::TEXT_SIZE, egui::FontFamily::Proportional),
+        ink,
+    );
+
+    // 右边的状态牌。**"开"和"关"是两个字，不是一个滑块的两端**：
+    // 滑块要靠位置去读，而这里一列开关扫一眼要能同时读出七八个状态。
+    let chip = Rect::from_center_size(
+        egui::pos2(rect.right() - 18.0, rect.center().y),
+        Vec2::new(36.0, 14.0),
+    );
+    let (cfill, cborder, cink) = if on {
+        (theme::ACCENT_DIM, theme::ACCENT, theme::ACCENT)
+    } else {
+        (theme::SUNKEN, theme::LINE, theme::TEXT_FAINT)
+    };
+    p.rect_filled(chip, CornerRadius::ZERO, cfill);
+    p.rect_stroke(
+        chip,
+        CornerRadius::ZERO,
+        Stroke::new(1.0, cborder),
+        StrokeKind::Inside,
+    );
+    p.text(
+        chip.center(),
+        Align2::CENTER_CENTER,
+        if on { "开" } else { "关" },
+        FontId::new(theme::TITLE_SIZE, egui::FontFamily::Proportional),
+        cink,
+    );
+
+    if resp.clicked() {
+        resp.mark_changed();
+    }
+    resp.on_hover_text(tip)
+}
+
 /// 一行 "标签 ······ 数值"。
 ///
 /// 标签左、数值右，中间不画引导线：TPT 不画，而在这个信息密度下
@@ -953,4 +1024,82 @@ fn lerp_color(a: Color32, b: Color32, t: f32) -> Color32 {
     let t = t.clamp(0.0, 1.0);
     let f = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
     Color32::from_rgb(f(a.r(), b.r()), f(a.g(), b.g()), f(a.b(), b.b()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **整行可点**——点在标签上也要能翻，而且一次点击只算一次。
+    ///
+    /// 这条测的是 `toggle_row` 唯一容易写错的地方：`allocate_exact_size` 拿到的
+    /// 整行矩形，和 `Sense::click()` 是不是真的覆盖了整行。早先的写法只有右边
+    /// 那个 36px 的状态牌可点，而人一定会去点标签——然后以为界面坏了。
+    ///
+    /// 用合成指针事件而不是"看一眼"：`clicked()` / `changed()` 的语义在
+    /// egui 里跟帧、跟按下位置都有关系，光读代码推不出来。
+    #[test]
+    fn toggle_row_is_clickable_across_the_whole_row() {
+        let ctx = egui::Context::default();
+        let size = egui::vec2(400.0, 100.0);
+        // 靠左 40px：那一段只有标签文字，离右边的状态牌（x≈380）很远。
+        let pos = egui::pos2(40.0, 10.0);
+        let mut changes = 0;
+        for frame in 0..3 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            if frame >= 1 {
+                input.events.push(egui::Event::PointerMoved(pos));
+            }
+            if frame == 2 {
+                for pressed in [true, false] {
+                    input.events.push(egui::Event::PointerButton {
+                        pos,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+            let mut out = ctx.run_ui(input, |ui| {
+                if toggle_row(ui, "藻席生长", false, "").changed() {
+                    changes += 1;
+                }
+            });
+            // `TexturesDelta` 带"必须被消费"的断言，测试里手动清掉。
+            out.textures_delta.clear();
+        }
+        assert_eq!(changes, 1, "整行应当可点，且一次点击只算一次");
+
+        // 反向判据：点在**行外**不该算。没有这一条，上面那个断言在
+        // "整块屏幕都能点"的实现下也会绿——而那种实现会让面板上
+        // 点哪儿都翻开关。
+        let miss = egui::pos2(40.0, 60.0);
+        for frame in 0..2 {
+            let mut input = egui::RawInput {
+                screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, size)),
+                ..Default::default()
+            };
+            input.events.push(egui::Event::PointerMoved(miss));
+            if frame == 1 {
+                for pressed in [true, false] {
+                    input.events.push(egui::Event::PointerButton {
+                        pos: miss,
+                        button: egui::PointerButton::Primary,
+                        pressed,
+                        modifiers: egui::Modifiers::default(),
+                    });
+                }
+            }
+            let mut out = ctx.run_ui(input, |ui| {
+                if toggle_row(ui, "藻席生长", false, "").changed() {
+                    changes += 1;
+                }
+            });
+            out.textures_delta.clear();
+        }
+        assert_eq!(changes, 1, "行外的点击不该翻开关");
+    }
 }

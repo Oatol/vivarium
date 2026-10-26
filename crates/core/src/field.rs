@@ -36,8 +36,25 @@ use crate::world::World;
 /// 滤镜子看不清哪儿是岸；再细一点，扫描成本翻倍而画面几乎没有区别。
 pub const AIR_CELL: usize = 4;
 
-/// 环境温度（°C）。世界的热平衡点。
+/// 环境温度（°C）的**默认值**。世界的热平衡点。
+///
+/// 它只是初值，不是法则：真正的环境温度是 [`AirField::ambient_temp`]，
+/// 玩家可以在「全局参数」里改。留这个常量是为了让"新世界的默认温度"
+/// 有一个唯一出处——**凡是"默认 20 度"的地方都读它**，改默认只改这一行。
 pub const AMBIENT_TEMP: f32 = 20.0;
+
+/// 环境温度的可调下限（°C）。
+///
+/// -20 已经足够冷：`photosynthesis` 在 0°C 以下是 0，整片海会停止产氧。
+/// 再往下调只是让同一个"全灭"来得更夸张，没有新现象。
+pub const AMBIENT_MIN: f32 = -20.0;
+
+/// 环境温度的可调上限（°C）。
+///
+/// 80 的理由和下限对称：`photosynthesis` 在 50°C 就归零了，
+/// 80 是"煮开的世界"。**不给到 900（`FIRE_TEMP`）**，因为那是火焰的
+/// 局部温度，而"整个世界都在着火"不是这个旋钮要表达的东西。
+pub const AMBIENT_MAX: f32 = 80.0;
 
 /// 火所在粗格的温度上限。
 pub const FIRE_TEMP: f32 = 900.0;
@@ -309,6 +326,18 @@ pub struct AirField {
     /// 这个数组就是那条规则的数据：`sun_march` 用它按覆盖度给下面的格打折。
     body: Vec<u8>,
 
+    /// 环境温度（°C）。**热平衡点**——冷却项向它回归。
+    ///
+    /// 做成字段而不是只留常量 `AMBIENT_TEMP`，因为"这个世界多冷"必须是
+    /// 玩家能调的（「全局参数」里的世界温度）。它是一个**目标**，不是一个
+    /// 赋值：改了它，现有的温度场要自己慢慢走过去（时间尺度
+    /// `1/COOLING ≈ 250` 次更新 = 2000 tick）。
+    ///
+    /// **不能靠 `refresh` 应用它。** `update_temp` 是松弛一步，不是重设；
+    /// 而 `restore` 之后调 `refresh` 会把存档里的温度积分状态抹掉——
+    /// 那正是读档路径最不能做的事。
+    ambient: f32,
+
     /// 每次 `update_light` / `update_temp` 自增。渲染器靠它判断"要不要重传纹理"。
     revision: u64,
 }
@@ -332,6 +361,7 @@ impl Default for AirField {
             fire: Vec::new(),
             water: Vec::new(),
             body: Vec::new(),
+            ambient: AMBIENT_TEMP,
             revision: 0,
         }
     }
@@ -356,8 +386,39 @@ impl AirField {
             fire: vec![0; n],
             water: vec![0; n],
             body: vec![0; n],
+            ambient: AMBIENT_TEMP,
             revision: 0,
         }
+    }
+
+    /// 当前的环境温度（°C）。
+    #[inline]
+    pub const fn ambient_temp(&self) -> f32 {
+        self.ambient
+    }
+
+    /// 改环境温度。夹到 `[AMBIENT_MIN, AMBIENT_MAX]`。
+    ///
+    /// **只改目标，不动现有的温度场。** 这是刻意的：
+    ///
+    /// - 若在这里把整张表刷成新温度，那么"放了一盏灯/一团火之后再调温度"
+    ///   会把火的效果一起抹掉，而那正是玩家想看的东西；
+    /// - 若什么都不做，暂停的世界里拖滑块看起来毫无反应——所以另给一个
+    ///   显式的 [`Self::reset_temp`]，让"立刻拉回环境温度"是一个**动作**，
+    ///   而不是拖滑块的副作用。
+    pub fn set_ambient_temp(&mut self, t: f32) {
+        self.ambient = t.clamp(AMBIENT_MIN, AMBIENT_MAX);
+    }
+
+    /// 把整张温度表**立刻**拉回环境温度。
+    ///
+    /// 用在两处：新世界（不需要，`new` 就是环境温度）和玩家按「重设温度场」。
+    /// 后者是唯一能把一团烧了几千 tick 的热量一次清掉的操作——没有它，
+    /// 玩家改完环境温度得盯着一个暂停的画面等 2000 tick。
+    pub fn reset_temp(&mut self) {
+        self.temp.fill(self.ambient);
+        self.next.fill(self.ambient);
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// 粗网格列数。
@@ -416,7 +477,7 @@ impl AirField {
         self.temp
             .get(self.coarse(x, y))
             .copied()
-            .unwrap_or(AMBIENT_TEMP)
+            .unwrap_or(self.ambient)
     }
 
     /// 某个粗格里水的占比（0..1）。
@@ -532,8 +593,9 @@ impl AirField {
 
         // 2) 冷却。向环境温度回归，**永远**有一条出路——
         //    这是"封闭世界不能有吸收态"（SPEC §2.2）在热场上的版本。
+        let ambient = self.ambient;
         for t in self.temp.iter_mut() {
-            *t += (AMBIENT_TEMP - *t) * COOLING;
+            *t += (ambient - *t) * COOLING;
         }
 
         // 3) 注入。火把这一格加热到「火焰温度 × 覆盖度」，**用 `max` 而不是累加**。
@@ -992,6 +1054,68 @@ mod tests {
         assert!(
             (after - AMBIENT_TEMP).abs() < 2.0,
             "火灭了 4000 次更新之后应当回到环境温度，实测 {after}"
+        );
+    }
+
+    /// 环境温度是**目标**，不是赋值。
+    ///
+    /// 判据分两段，缺一不可：
+    /// - 改完之后**当下**的温度场一格都不动（否则"放一团火再调温度"
+    ///   会把火的效果一起抹掉）；
+    /// - 之后的更新**朝着新目标**走（否则这个旋钮只是个装饰）。
+    ///
+    /// 第二段是这条测试真正的价值：把冷却项写回常量 `AMBIENT_TEMP`
+    /// 它就会红（那时 500 次更新之后仍是 20 度）。
+    #[test]
+    fn ambient_temperature_is_a_target_not_an_assignment() {
+        let world = pool(64, 64, 0);
+        let mut f = AirField::new(&world);
+        assert_eq!(f.ambient_temp(), AMBIENT_TEMP, "新世界的环境温度应当是默认值");
+
+        f.set_ambient_temp(60.0);
+        assert_eq!(f.ambient_temp(), 60.0);
+        assert!(
+            (f.temp_at(32.0, 32.0) - AMBIENT_TEMP).abs() < 0.01,
+            "改环境温度不该立刻改写温度场，实测 {}",
+            f.temp_at(32.0, 32.0)
+        );
+
+        for _ in 0..500 {
+            f.update_temp(&world);
+        }
+        let t = f.temp_at(32.0, 32.0);
+        assert!(t > 50.0, "500 次更新之后应当接近 60 度，实测 {t}");
+    }
+
+    /// 越界的温度要被夹住，而不是照单全收。
+    #[test]
+    fn ambient_temperature_is_clamped() {
+        let world = pool(8, 8, 0);
+        let mut f = AirField::new(&world);
+        f.set_ambient_temp(10_000.0);
+        assert_eq!(f.ambient_temp(), AMBIENT_MAX);
+        f.set_ambient_temp(-10_000.0);
+        assert_eq!(f.ambient_temp(), AMBIENT_MIN);
+    }
+
+    /// 「重设温度场」是唯一能把整张表一次拉回环境温度的操作。
+    #[test]
+    fn reset_temp_pulls_the_whole_field_back_to_ambient() {
+        let mut world = pool(64, 64, 0);
+        for y in 30..34 {
+            for x in 30..34 {
+                world.set(x, y, MaterialKind::Fire);
+            }
+        }
+        let mut f = AirField::new(&world);
+        f.update_temp(&world);
+        assert!(f.temp_at(31.0, 31.0) > 100.0, "先得真的热起来");
+
+        f.set_ambient_temp(35.0);
+        f.reset_temp();
+        assert!(
+            f.temp().iter().all(|t| (t - 35.0).abs() < 0.01),
+            "重设之后每一格都该是环境温度"
         );
     }
 

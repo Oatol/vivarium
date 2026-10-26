@@ -54,6 +54,7 @@
 //! 每个: i32 x, i32 y, f32 强度
 //! u32                温度格数（= ceil(w/4)*ceil(h/4)）
 //! 每格: f32
+//! f32                环境温度（v9）
 //! --- 账与时钟 ---
 //! u64 u64            注入 / 耗散
 //! u64 u64            rng state / inc
@@ -95,7 +96,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 8;
+pub const VERSION: u16 = 9;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -184,6 +185,12 @@ pub struct LifeSave {
     pub food_growth: bool,
     /// 粗粒度温度表。
     pub temp: Vec<f32>,
+    /// 环境温度（°C，v9）。**必须存**。
+    ///
+    /// 它是温度表的**吸引子**：存了温度表却不存它，读档之后一张 60 度的表
+    /// 会朝 20 度凉下去——玩家会说"我的世界温度没了"，而画面在头几秒
+    /// 完全正常。这属于"看着像缓存、其实是状态"那一类，判据同湿度场。
+    pub ambient: f32,
     /// 光源。
     pub sources: Vec<LightSource>,
     /// 土壤湿度场（**有状态**，见 [`crate::moisture`]）。
@@ -238,6 +245,7 @@ pub fn encode(world: &World, sim: &LifeSim) -> Vec<u8> {
         out.f32(s.intensity);
     }
     put_f32s(&mut out, field.temp());
+    out.f32(field.ambient_temp());
 
     let ledger = sim.ledger();
     out.u64(ledger.injected);
@@ -539,6 +547,14 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
     for _ in 0..temp_len {
         temp.push(r.f32()?);
     }
+    // v9 才有。v8 的档读到这里刚好是「账与时钟」的第一个 u64，
+    // 所以**不能无条件读**——那会吃掉注入账的前 4 个字节，然后把
+    // 后面整段解释成垃圾（症状是"账本莫名其妙少了一半"）。
+    let ambient = if header.version >= 9 {
+        r.f32()?
+    } else {
+        crate::field::AMBIENT_TEMP
+    };
 
 
     // 账与时钟
@@ -592,6 +608,7 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         founder,
         food_growth,
         temp,
+        ambient,
         sources,
         moisture,
         climate,
@@ -1021,7 +1038,22 @@ mod tests {
         assert_eq!(s2.food_growth(), sim.food_growth());
         assert_eq!(s2.field().sources().len(), sim.field().sources().len());
         assert_eq!(s2.field().temp(), sim.field().temp(), "温度场没原样回来");
+        assert_eq!(
+            s2.field().ambient_temp(),
+            sim.field().ambient_temp(),
+            "环境温度没原样回来——读档之后整张温度表会朝默认值凉下去"
+        );
         assert!(s2.founder().is_some(), "初代基因组丢了");
+    }
+
+    /// 环境温度进档之前是"读档悄悄变回 20 度"，这条钉住它。
+    #[test]
+    fn a_warm_world_comes_back_warm() {
+        let (world, mut sim) = sample();
+        sim.field_mut().set_ambient_temp(45.0);
+        let bytes = encode(&world, &sim);
+        let (_, s2) = decode(&bytes).expect("档读不回来");
+        assert_eq!(s2.field().ambient_temp(), 45.0);
     }
 
     #[test]

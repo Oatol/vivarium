@@ -257,6 +257,25 @@ pub struct Snapshot {
     /// 光场与温度场的统计。
     pub field: FieldStats,
 
+    /// 环境温度（°C）。世界温度的**目标值**，冷却项往它回归。
+    pub ambient_temp: f32,
+    /// 当前环境温度下的光合效率（0..1）。
+    ///
+    /// 由主循环算好递进来，而不是界面自己按温度套一个公式：那个公式
+    /// （`photosynthesis`）是模拟的一部分，界面抄一份就一定会漂移。
+    pub warmth: f32,
+
+    /// 藻席生长开不开。
+    pub food_growth: bool,
+    /// 水循环（蒸发 → 水汽 → 降水）开不开。
+    pub water_cycle: bool,
+    /// 陆地繁殖开不开（子代能不能站在实体上出生）。
+    pub land_reproduction: bool,
+
+    /// 材质层的并行工人数上限，以及上一次真正干活时用到了几个。
+    pub threads: usize,
+    pub workers: usize,
+
     /// 鼠标下面那一格的读数（分组的探针表）。指针不在世界上就是 `None`。
     ///
     /// 由主循环填：界面拿不到 `&World`，也不该拿。
@@ -291,6 +310,13 @@ impl Default for Snapshot {
             food: 0,
             census: [0; MaterialKind::COUNT],
             field: FieldStats::default(),
+            ambient_temp: 20.0,
+            warmth: 1.0,
+            food_growth: true,
+            water_cycle: false,
+            land_reproduction: false,
+            threads: 1,
+            workers: 1,
             hover: None,
             history: Vec::new(),
             selected: None,
@@ -497,6 +523,26 @@ pub enum Command {
     /// 打开"世界"窗口时发一次，存完档再发一次。刻意不做自动刷新：
     /// 每帧扫目录在 2000² 的档上是几十毫秒，而这个列表只在用户看的时候才有意义。
     RefreshSaves,
+
+    // --- 全局参数 ---------------------------------------------------------
+    /// 改环境温度（°C）。夹的范围由 core 决定，界面只负责递一个数。
+    ///
+    /// 拖滑块时**每帧都会发一条**：温度是"目标值"，连续变化正是想要的效果。
+    SetAmbientTemp(f32),
+    /// 把整张温度场立刻拉回环境温度。
+    ///
+    /// 单独一条命令而不是 `SetAmbientTemp` 的副作用：调温度不该顺手清掉
+    /// 一团还在烧的火，而"清掉"本身又是需要的（暂停时改温度才看得见）。
+    ResetTemperature,
+    /// 藻席生长开关。
+    SetFoodGrowth(bool),
+    /// 水循环开关。
+    SetWaterCycle(bool),
+    /// 陆地繁殖开关。
+    SetLandReproduction(bool),
+    /// 材质层并行工人数上限。
+    SetThreads(usize),
+
     /// 退出程序。
     ///
     /// 只由**退出确认框**发出。Esc 不发它——Esc 只负责把那个框打开，
@@ -862,10 +908,25 @@ impl WorldPanel {
     }
 }
 
+/// 「全局参数」窗口的状态。
+///
+/// ## 这里**故意**不存任何一份"当前值"
+///
+/// 温度、三个开关、工人数全部从 [`Snapshot`] 读，点击只发命令。理由不是
+/// 洁癖：界面自己留一份副本，就一定会和世界漂移——读档、新建世界、命令行
+/// 参数、甚至另一个面板都能改它们，而副本不会跟着变。漂移的症状是
+/// "面板上写着开、世界其实关着"，这种 bug 没有报错，只有玩家觉得怪。
+///
+/// 所以这个结构体里只有"窗口开没开"和"上一次操作说了什么"。
+#[derive(Debug, Clone, Default)]
+pub struct ParamsPanel {
+    /// 是否打开。打开时它是模态的。
+    pub open: bool,
+}
+
 // ---------------------------------------------------------------------------
 // 界面状态
 // ---------------------------------------------------------------------------
-
 /// 界面的全部可变状态。
 ///
 /// 这里只放**界面自己的**东西：选了哪个工具、笔刷多大、控制台滚到哪。
@@ -912,6 +973,8 @@ pub struct UiState {
     pub cells: Vec<CellEntry>,
     /// 「世界」窗口（新建 / 保存 / 读取）。
     pub world: WorldPanel,
+    /// 「全局参数」窗口（世界温度 / 生态开关 / 性能）。
+    pub params: ParamsPanel,
     /// 顶部那条"上一次操作"的提示，两秒后自己消失。
     ///
     /// 存在的理由：很多操作**没有可见反馈**（设速度、切工具），
@@ -937,6 +1000,7 @@ impl Default for UiState {
             library: Vec::new(),
             cells: Vec::new(),
             world: WorldPanel::default(),
+            params: ParamsPanel::default(),
             commands: Vec::new(),
             toast: None,
         }
@@ -951,7 +1015,7 @@ impl UiState {
         s.console.push(
             0,
             Level::Info,
-            "空格 暂停 · 1/2/3/4 速度 · W 工坊 · G 世界 · Esc 退出",
+            "空格 暂停 · 1/2/3/4 速度 · W 工坊 · G 世界 · K 参数 · Esc 退出",
         );
         s
     }
@@ -974,6 +1038,18 @@ impl UiState {
     /// 顶部提示。
     pub fn toast(&mut self, text: impl Into<String>, now: f64) {
         self.toast = Some((text.into(), now));
+    }
+
+    /// 打开/关闭「全局参数」。
+    ///
+    /// 收在这里而不是在按钮和快捷键里各写一遍：**模态互斥**是三条规则
+    /// （开它要关掉另外两个），写两遍就一定会有一遍忘记改。
+    pub fn toggle_params(&mut self) {
+        self.params.open = !self.params.open;
+        if self.params.open {
+            self.world.open = false;
+            self.workshop.open = false;
+        }
     }
 
     /// 取走这一帧攒下的命令。

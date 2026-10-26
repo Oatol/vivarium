@@ -31,6 +31,7 @@
 //! 是下一步。
 
 pub mod panels;
+pub mod params_window;
 pub mod quit_confirm;
 pub mod state;
 pub mod theme;
@@ -39,8 +40,8 @@ pub mod workshop;
 pub mod world_window;
 
 pub use state::{
-    CellEntry, Command, Console, Level, LibraryEntry, SaveEntry, Snapshot, Tool, UiState, Workshop,
-    WorldPanel,
+    CellEntry, Command, Console, Level, LibraryEntry, ParamsPanel, SaveEntry, Snapshot, Tool,
+    UiState, Workshop, WorldPanel,
 };
 pub use widgets::BtnState;
 
@@ -116,16 +117,22 @@ impl Ui {
         let mut modal = false;
         let full = self.ctx.run_ui(raw_input, |ui| {
             central = panels::draw(ui, state, snap);
-            // 工坊和「世界」都是**模态**：画在所有面板之上，并且吃掉这一帧的鼠标。
-            // 放在 `panels::draw` 之后是因为它们要盖住面板；用 `Area` 的
-            // `Foreground` 层，所以不受面板布局约束。
+            // 工坊、「世界」和「全局参数」都是**模态**：画在所有面板之上，
+            // 并且吃掉这一帧的鼠标。放在 `panels::draw` 之后是因为它们要盖住
+            // 面板；用 `Area` 的 `Foreground` 层，所以不受面板布局约束。
             //
-            // 两者**不会同时打开**：「世界」优先。两个模态叠在一起时，
-            // 下面那个的遮罩会把上面那个压暗，而"哪个按钮能点"就没有答案了。
+            // 三者**不会同时打开**：三个开关（W / G / K）各自打开时会把别的
+            // 关掉，这里是兜底。两个模态叠在一起时，下面那个的遮罩会把上面
+            // 那个压暗，而"哪个按钮能点"就没有答案了。
             if state.world.open {
                 state.workshop.open = false;
             }
+            if state.params.open {
+                state.world.open = false;
+                state.workshop.open = false;
+            }
             modal = workshop::draw(ui, state, snap);
+            modal |= params_window::draw(ui, state, snap);
             modal |= world_window::draw(ui, state, snap);
             // 退出确认**最后画**：它要盖住所有东西，包括别的模态。
             // 它一出现，别的窗口就不该再接收点击——`modal` 是"或"起来的，
@@ -318,6 +325,51 @@ mod tests {
         );
     }
 
+    /// 「全局参数」窗口：模态、画得出来、而且**只开一个模态**。
+    ///
+    /// 前两条和工坊同构（`modal` 漏了会让点击落到世界上，图元被裁没了
+    /// 等于没画）；第三条是这一屏特有的——它和「世界」是同级的两块面板，
+    /// 叠在一起时下面那块会被上面的遮罩压暗，而"哪个按钮能点"就没有答案了。
+    #[test]
+    fn the_params_window_is_modal_and_closes_the_other_modals() {
+        let mut ui = Ui::new();
+        let mut state = UiState::new();
+        let snap = Snapshot {
+            food_growth: true,
+            water_cycle: false,
+            ..Default::default()
+        };
+
+        let (_, mut full) = ui.show(&mut state, &snap, screen());
+        let before = full.shapes.len();
+        full.textures_delta.clear();
+
+        // 两条"别的模态都开着"的路径，各走一次。
+        state.world.open = true;
+        state.workshop.open = true;
+        state.toggle_params();
+        assert!(state.params.open);
+        assert!(!state.world.open, "「世界」必须被关掉：两块模态不能叠在一起");
+        assert!(!state.workshop.open, "工坊同理");
+
+        let (out, full) = show_twice(&mut ui, &mut state, &snap);
+        let after = full.len();
+        assert!(out.modal, "全局参数打开时必须报 modal，否则点击会漏到世界上");
+        assert!(
+            after > before + 40,
+            "面板应当画出滑块、开关和读数：{before} → {after}"
+        );
+        assert!(
+            full.iter().all(|s| s.clip_rect.width() >= 0.0),
+            "有图元的裁剪矩形宽度为负——说明它被布局挤出了屏幕"
+        );
+
+        // 再按一次关掉它，而且**不会顺手打开别的**。
+        state.toggle_params();
+        assert!(!state.params.open);
+        assert!(!state.world.open);
+    }
+
     /// **退出确认框：必须报 `modal`，而且它自己不会退出。**
     ///
     /// 这条守的是防误触的**两半**：
@@ -426,10 +478,17 @@ mod tests {
 
         state.workshop.open = true;
         state.world.open = true;
+        state.params.open = true;
         let (_, mut full) = ui.show(&mut state, &snap, screen());
         // `TexturesDelta` 带"必须被消费"的断言，测试里手动清掉。
         full.textures_delta.clear();
         assert!(!state.workshop.open, "「世界」打开时工坊必须让位");
+        // 三个模态同时被设成"开"是不可能的（每个开关都会关掉别的），
+        // 这里是兜底：真发生了也必须只剩一个，否则"哪个按钮能点"没有答案。
+        assert!(
+            !state.world.open || !state.params.open,
+            "「世界」和「全局参数」不能同时开着"
+        );
     }
 
     /// 「世界」窗口里的丢弃提醒**必须真的是红的**。

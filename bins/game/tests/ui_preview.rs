@@ -77,6 +77,14 @@ fn demo_snapshot() -> Snapshot {
             temp_range: (18.0, 620.0),
             avg_temp: 21.5,
         },
+        // 默认 20 °C，光合效率 96%——就是玩家打开游戏看到的那个数。
+        ambient_temp: 20.0,
+        warmth: 0.96,
+        food_growth: true,
+        water_cycle: true,
+        land_reproduction: false,
+        threads: 4,
+        workers: 4,
         // 悬停读数要能在预览图里看到，所以给一份"有生物"的探针表。
         //
         // 内容**手写**而不是调 `probe::cell_probes`：预览图要的是一份
@@ -232,6 +240,15 @@ fn quit_mode() -> bool {
     std::env::var("VIVARIUM_QUIT").is_ok()
 }
 
+/// 「全局参数」窗口模式：`VIVARIUM_PARAMS=1`。
+///
+/// 这张图要回答的问题：**一列开关的标签、状态牌、滑块有没有对齐**，
+/// 以及"三行开关挨在一起会不会看不出哪行是哪行"。全是看一眼就知道、
+/// 写断言却说不清的东西。
+fn params_mode() -> bool {
+    std::env::var("VIVARIUM_PARAMS").is_ok()
+}
+
 /// 指针放哪儿：`VIVARIUM_HOVER=375,12`。
 ///
 /// 有了它就能把"悬停某个按钮时会不会有东西挡住界面"变成一张图，
@@ -282,6 +299,9 @@ fn demo_state() -> UiState {
     }
     if quit_mode() {
         state.confirm_quit = true;
+    }
+    if params_mode() {
+        state.params.open = true;
     }
     if world_mode() {
         state.world.open = true;
@@ -561,6 +581,8 @@ fn ui_preview_png() {
             "workshop-preview.png"
         } else if world_mode() {
             "world-preview.png"
+        } else if params_mode() {
+            "params-preview.png"
         } else if quit_mode() {
             "quit-preview.png"
         } else {
@@ -595,7 +617,7 @@ fn ui_preview_png() {
     //
     // 「世界」窗口同理，而且是同一个判据：模态面板盖住了整张图，
     // 下面那些"哪块面板在哪儿"的断言全都失去意义。
-    if workshop_mode() || world_mode() || quit_mode() {
+    if workshop_mode() || world_mode() || params_mode() || quit_mode() {
         let lit = pixels
             .chunks_exact(4)
             .filter(|p| p[0] > 24 || p[1] > 24 || p[2] > 24)
@@ -676,7 +698,6 @@ fn ui_preview_png() {
     //    而**真正的错**（多做一次 gamma 转换）会让 0x0b 变成 0x2a 那种
     //    量级的差——容差 1 照样抓得住。
     for (name, x, y, want) in [
-        ("顶栏", 700, top / 2, panel),
         ("左栏", 8, 400, panel),
         ("右栏", W - 20, 400, panel),
         ("调色板", 500, H - con - pal / 2, panel),
@@ -691,6 +712,33 @@ fn ui_preview_png() {
             hex(want)
         );
     }
+
+    // 1a. 顶栏单独扫一条线，**不取单点**。
+    //
+    //     顶栏的内容是会长的一条：v0.54 加了「参数 K」按钮，它正好落在
+    //     原来那个取样点 (700,15) 上，于是这条断言红了——而底色一点没错。
+    //     单点像素探针撞上合法控件，是这类测试最常见的误报，所以判据要能
+    //     容忍内容增长：要求**四分之一以上**的像素是面板色。
+    //
+    //     实测这一行（y=15，横跨 1100 px，每 3 px 取一个）有 42% 是纯面板色
+    //     ——剩下的被按钮底（`RAISED`）、字和分隔线占掉。四分之一留了一倍余量，
+    //     够再加十几个按钮。
+    //
+    //     这仍然是 gamma 判据：多做一次 sRGB 转换会把 0x0b 变成 0x2a，
+    //     那时一个像素都匹配不上，下面这条照样红。
+    let mut panel_like = 0usize;
+    let mut total = 0usize;
+    for x in (0..W).step_by(3) {
+        let got = px(x, top / 2);
+        total += 1;
+        if (0..3).all(|i| got[i].abs_diff(panel[i]) <= 1) {
+            panel_like += 1;
+        }
+    }
+    assert!(
+        panel_like * 4 >= total,
+        "顶栏四分之一以上应当是面板色，实测 {panel_like}/{total}"
+    );
 
     // 1b. 左栏的**边界**要落在 `TOOL_STRIP_W` 那一列上。
     //
