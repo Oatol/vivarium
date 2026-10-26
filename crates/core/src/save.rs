@@ -64,6 +64,11 @@
 //! --- 有机体 ---
 //! u32                个数
 //! 每个: 见 `put_organism`
+//! --- 湿度 / 气候（v7）---
+//! u8                 有/没有湿度场，有则跟一段游程编码
+//! u64 u64 u64        水汽 / 累计蒸发 / 累计降水
+//! u8                 water_cycle
+//! u8                 land_reproduction（v8）
 //! "ENDVIVAR"  8B     尾标记
 //! ```
 //!
@@ -90,7 +95,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 7;
+pub const VERSION: u16 = 8;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -191,6 +196,9 @@ pub struct LifeSave {
     pub climate: crate::climate::Climate,
     /// 水循环开不开。存进档里，否则读档之后雨会停。
     pub water_cycle: bool,
+    /// 陆地繁殖开不开（v8）。**必须存**，理由和 `water_cycle` 一模一样：
+    /// 它改的是"子代能生在哪儿"，读档之后悄悄关掉就等于换了一个世界。
+    pub land_reproduction: bool,
 }
 
 /// 一条存档列表项。界面"读取"那一栏直接吃它。
@@ -261,6 +269,7 @@ pub fn encode(world: &World, sim: &LifeSim) -> Vec<u8> {
     out.u64(climate.evaporated());
     out.u64(climate.rained());
     out.u8(u8::from(sim.water_cycle()));
+    out.u8(u8::from(sim.land_reproduction()));
 
     out.0.extend_from_slice(&TRAILER);
     out.0
@@ -557,12 +566,16 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
 
     // v7：湿度场与水汽。更早的档没有这一节——那时候湿度是世界的纯函数，
     // `LifeSim::restore` 会重新播种一遍（和当时的行为一致）。
-    let (moisture, climate, water_cycle) = if header.version >= 7 {
+    let (moisture, climate, water_cycle, land_reproduction) = if header.version >= 7 {
         let moisture = read_moisture(&mut r, header.width, header.height)?;
         let climate = crate::climate::Climate::from_parts(r.u64()?, r.u64()?, r.u64()?);
-        (moisture, climate, r.u8()? != 0)
+        let water_cycle = r.u8()? != 0;
+        // v8 才有的字段。v7 的档读到这里刚好是尾标记之前，
+        // 所以**不能无条件读**——会吃进尾标记的前 8 个字节然后报坏档。
+        let land = if header.version >= 8 { r.u8()? != 0 } else { false };
+        (moisture, climate, water_cycle, land)
     } else {
-        (None, crate::climate::Climate::new(), false)
+        (None, crate::climate::Climate::new(), false, false)
     };
 
     // 尾标记
@@ -583,6 +596,7 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         moisture,
         climate,
         water_cycle,
+        land_reproduction,
     };
     let sim = LifeSim::restore(&mut world, save);
     Ok((world, sim))
@@ -1091,7 +1105,8 @@ mod tests {
     /// 读档时**不能再算一遍**——算出来的是初值，不是当前值。所以它必须
     /// 进存档，而"存了"这件事只能靠"存之前和读回来之后逐格相同"来证明。
     ///
-    /// 顺带钉住 `water_cycle`：不存它的话，读档之后雨会无声地停掉。
+    /// 顺带钉住 `water_cycle` 与 `land_reproduction`：不存它们的话，
+    /// 读档之后雨会无声地停掉、陆生繁殖会无声地关掉。
     #[test]
     fn moisture_and_vapor_survive_a_roundtrip() {
         let mut world = World::new(160, 120).unwrap();
@@ -1100,6 +1115,7 @@ mod tests {
         let mut sim = LifeSim::new(&mut world);
         sim.set_food_growth(false);
         sim.set_water_cycle(true);
+        sim.set_land_reproduction(true);
 
         let mut mat = MaterialSim::new();
         mat.set_threads(1);
@@ -1125,6 +1141,10 @@ mod tests {
         assert_eq!(s2.climate().evaporated(), sim.climate().evaporated());
         assert_eq!(s2.climate().rained(), sim.climate().rained());
         assert!(s2.water_cycle(), "读档之后水循环被关掉了，雨会无声地停");
+        assert!(
+            s2.land_reproduction(),
+            "读档之后陆地繁殖被关掉了：子代能生在哪儿变了，等于换了个世界"
+        );
     }
 
     #[test]

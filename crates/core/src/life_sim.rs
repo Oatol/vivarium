@@ -692,6 +692,16 @@ pub struct LifeSim {
     /// 水汽与蒸发/降水计数。**和 `water_cycle` 分开存**：关掉循环之后
     /// 天上那点水还在（读数不该归零），只是不再流动。
     climate: Climate,
+    /// 陆地繁殖：子代能不能"站在实体上"出生（见 [`Self::can_stand`]）。
+    ///
+    /// **默认关**，和 `water_cycle` 同一个理由：它改水位。门一开，一批在
+    /// 水里出生的身体会死在岸上，那些借来的水就再也回不到海里
+    /// （v0.50 实测 `water_vented` = 34217 格、海平面以下的水掉 45%）。
+    ///
+    /// 这个开关存在的意义是**能测**。`fits` 上那段注释里五次失败、
+    /// 六次尝试全是"改完跑一遍"，而没有开关就只能改源码再改回来——
+    /// 那种流程里"我到底测的是哪个版本"永远说不清。
+    land_reproduction: bool,
     /// 四个方向的累计移动次数 `[左, 右, 上, 下]`。
     ///
     /// 和 `stats.moved` 的区别是**它不清零**：`stats` 每 tick 重建，
@@ -710,14 +720,29 @@ pub struct LifeSim {
     water_moved: u64,
     /// 累计有多少格"欠着的水"**再也没还回来**——也就是被销毁的水。
     ///
-    /// 只在一个地方 +1：海平面以上的尸体烂成碎屑（[`Self::tick_organics`]）。
-    /// 那张欠条是出生时打的（那格水被从世界里删掉了），烂成碎屑就意味着
-    /// 那格水不会再出现。
+    /// 只在一个地方 +1：海平面以上的尸体烂成碎屑，**而且水循环关着**
+    /// （[`Self::tick_organics`]）。那张欠条是出生时打的（那格水被从世界里
+    /// 删掉了），烂成碎屑就意味着那格水不会再出现。
+    ///
+    /// **水循环开着时这条不记**，那笔水改记在 [`Self::water_vaporized`] 上
+    /// ——它上了天，还能下回来。v0.53 实测门开着时 30023 格水全走这条路。
     ///
     /// **它是账，不是 bug 计数器**：水不是守恒量（现实里也不守恒，会蒸发、
     /// 会渗进地下），但"少了多少"必须看得见。能量那边有 `dissipated`，
     /// 水这边就是这个。
     water_vented: u64,
+    /// 累计有多少格"欠着的水"被**送进了大气**（v0.53）。
+    ///
+    /// 和 [`Self::water_vented`] 是同一个事件的两条出路：海平面以上的尸体
+    /// 烂成碎屑时，那格水要么**销毁**（水循环关着，没有回程），要么
+    /// **变成水汽**（水循环开着，能下回来）。
+    ///
+    /// 分开记是因为它们量的是两件事：`vented` 是"这片海真的浅了"，
+    /// `vaporized` 是"这些水在等一场雨"。合在一起就分不清
+    /// "雨太小"和"水没了"。
+    ///
+    /// 不进存档——和 `water_vented` 一样是本次会话的诊断计数。
+    water_vaporized: u64,
     /// 累计下落次数。
     fell_total: u64,
     /// 当前所有藻的 id，**升序**。
@@ -773,9 +798,11 @@ impl Default for LifeSim {
             food_growth: true,
             water_cycle: false,
             climate: Climate::new(),
+            land_reproduction: false,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
+            water_vaporized: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -825,9 +852,11 @@ impl LifeSim {
             food_growth: true,
             water_cycle: false,
             climate: Climate::new(),
+            land_reproduction: false,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
+            water_vaporized: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -916,6 +945,21 @@ impl LifeSim {
         self.water_cycle
     }
 
+    /// 打开/关闭陆地繁殖（子代能不能站在实体上出生），见 [`Self::can_stand`]。
+    ///
+    /// **默认关**，理由写在 `land_reproduction` 字段上：它改水位。
+    /// 目前只有 `tests/m7_probe.rs` 打开它做测量——这个开关还没有对应的
+    /// 命令行参数，因为门后面前提（水被销毁、陆地碎屑没有出口）还没修完。
+    pub fn set_land_reproduction(&mut self, on: bool) {
+        self.land_reproduction = on;
+    }
+
+    /// 陆地繁殖是否开着。
+    #[inline]
+    pub fn land_reproduction(&self) -> bool {
+        self.land_reproduction
+    }
+
     /// 水汽与蒸发/降水计数（只读）。
     #[inline]
     pub fn climate(&self) -> &Climate {
@@ -982,9 +1026,11 @@ impl LifeSim {
             food_growth: save.food_growth,
             water_cycle: save.water_cycle,
             climate: save.climate,
+            land_reproduction: save.land_reproduction,
             moved_total: [0; 4],
             water_moved: 0,
             water_vented: 0,
+            water_vaporized: 0,
             fell_total: 0,
             plankton_ids: Vec::new(),
             eaten_plankton: Vec::new(),
@@ -1484,10 +1530,10 @@ impl LifeSim {
                 let (x, y) = (x as isize, y as isize);
                 world.vacate(x, y);
                 // "水面以上的湿细胞死亡" = 水被搬到岸上了。记一笔，见 `water_moved`。
-            if cell.wet && (y as i32) < self.moisture.sea_level() {
-                self.water_moved += 1;
-            }
-            if cell.wet {
+                if cell.wet && (y as i32) < self.moisture.sea_level() {
+                    self.water_moved += 1;
+                }
+                if cell.wet {
                     world.set(x, y, MaterialKind::Water);
                 }
             }
@@ -1920,11 +1966,26 @@ impl LifeSim {
                 world.set(xs, ys, product);
                 if product == MaterialKind::Water {
                     world.set_flags(xs, ys, crate::material::water_src::ROT);
+                } else if self.water_cycle {
+                    // **水循环开着 → 那格水上天，不是销毁**（v0.53）。
+                    //
+                    // 这是 v0.50 那个"代价"的正解：出生时借走的水，尸体烂在
+                    // 岸上时不还回原地（还了就是"空气里凭空积水"），但也
+                    // **不能就这么算了**——它变成水汽，等一场雨落回海里。
+                    //
+                    // 实测（种子 11 · 8000 tick · 门开着）：原来是
+                    // `water_vented` = 30023、海平面以下的水从 85791 掉到
+                    // 50074（少 42%）。改成上天之后那笔水会以雨的形式回来，
+                    // 缺的只剩"现在停在天上的那几千格"。
+                    //
+                    // 为什么不进 `evaporated`：蒸发是"从水面跑掉"，
+                    // 这是"从尸体里升上去"，两条路不同，混在一起就再也
+                    // 分不清"雨太小"和"尸体太多"。见 `Climate::add_vapor`。
+                    self.climate.add_vapor(1);
+                    self.water_vaporized += 1;
                 } else {
-                    // 这张欠条再也兑不出来了。**必须记账**，否则"海为什么
-                    // 越来越浅"会变成一个查不出来的谜：`water_volume`
-                    // 那条不变量是 `水 + 借出的湿细胞 + 尸体`，而碎屑不在
-                    // 其中任何一项里。
+                    // 水循环关着 = 没有回程。那格水是真的没了，必须记账，
+                    // 否则"海为什么越来越浅"会是个查不出来的谜。
                     self.water_vented += 1;
                 }
                 // **不管烂成什么，能量都记进耗散。**
@@ -2264,6 +2325,14 @@ impl LifeSim {
     /// 累计有多少格湿细胞在**水面之上**死亡（= 水被从海里搬到岸上）。
     ///
     /// 和 [`Self::water_above`] 一起看：前者是流量，后者是存量。
+    ///
+    /// ## 它只量"被擦掉的"，不量"死掉的"
+    ///
+    /// 唯一的 +1 在 [`Self::remove_organisms`]（玩家/编辑器擦除那条路）。
+    /// 自然死亡走 [`Self::bury`]，那里不记——所以这个数在生态测量里
+    /// **恒为 0**，而 `water_vented` 能到三万。别拿它当"水被搬上岸多少"
+    /// 的判据，那正是"一个计数器问错了问题、而你照着它修错地方"的老坑。
+    /// 真正该看的流量是 `water_vented + water_vaporized`。
     #[inline]
     pub fn water_moved(&self) -> u64 {
         self.water_moved
@@ -2276,6 +2345,16 @@ impl LifeSim {
     #[inline]
     pub fn water_vented(&self) -> u64 {
         self.water_vented
+    }
+
+    /// 累计有多少格"欠着的水"被**送进了大气**（见字段上的说明）。
+    ///
+    /// 判据看这两个数：`vented == 0 && vaporized > 0` 才说明"水循环
+    /// 真的把尸体那笔水接住了"；两个都是 0 说明这条规则没被触发
+    /// （门关着时它本来就不该触发）。
+    #[inline]
+    pub fn water_vaporized(&self) -> u64 {
+        self.water_vaporized
     }
 
     /// **海平面以上的水，来源分布**（见 [`crate::material::water_src`]）。
@@ -3277,16 +3356,18 @@ impl LifeSim {
             }
             cells.push((x, y));
         }
-        Self::touches_water(world, org.width, &cells)
+        if self.land_reproduction {
+            Self::can_stand(world, org.width, &cells)
+        } else {
+            Self::touches_water(world, org.width, &cells)
+        }
     }
 
     /// 「整具泡在水里 **或** 脚下踩着实体」——v0.44~v0.50 试了六次的放宽版。
     ///
-    /// **目前没有调用方**：留着是因为下一次要试的时候，第一步一定是把它接回
-    /// [`Self::fits`]，而失败的五种变体（`is_in_stable_water`、`water_push_dir`、
-    /// 压身体、挤身体 …）都已经删干净了，只剩这一个"最干净"的版本。
-    /// 接回去之前请先读 `fits` 上的那段：**光放宽门是不够的，水会漏。**
-    #[allow(dead_code)]
+    /// **由 [`Self::land_reproduction`] 开关控制**（v0.53 起）：默认关，
+    /// 只有测量与实验会打开它。接回 [`Self::fits`] 之前请先读那段：
+    /// **光放宽门是不够的，水会漏。**
     fn can_stand(world: &World, width: i32, cells: &[(i32, i32)]) -> bool {
         if cells.is_empty() {
             return false;
@@ -5078,6 +5159,64 @@ mod tests {
         );
         assert_eq!(sim.water_vented(), 1, "那一格水应当记成蒸发");
         assert_eq!(water_volume(&w, &sim), before, "蒸发也是账，总量不能变");
+    }
+
+    /// **水循环开着时，那格水不是被销毁，是上了天**（v0.53）。
+    ///
+    /// 和上一条是同一个场景的两半，判据正好互补：
+    ///
+    /// | | `water_vented` | `water_vaporized` | `vapor` |
+    /// |---|---|---|---|
+    /// | 水循环关 | 1 | 0 | 不变 |
+    /// | 水循环开 | **0** | **1** | +1 |
+    ///
+    /// 为什么这条重要：v0.50 的 ① 把"空气里凭空积水"修掉了，代价是那格水
+    /// **永久消失**——门一开 8000 tick 抽掉三万格（海平面以下的水掉 42%）。
+    /// 现在它变成水汽，能下回来。`water_volume` 那条不变量在这里必须仍然
+    /// 成立（它已经把 `vapor` 算进去了），否则这条只是"把漏损换了个人记账"。
+    #[test]
+    fn a_corpse_rotting_in_the_open_air_sends_its_water_to_the_sky() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 30, 64, 30, MaterialKind::Water);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        sim.set_water_cycle(true);
+
+        w.set(10, 20, MaterialKind::Corpse);
+        w.set_flags(10, 20, 7);
+        let before = water_volume(&w, &sim);
+        let water_before = w.count_of(MaterialKind::Water);
+
+        let mut rotted_at = None;
+        for tick in 0..6000 {
+            sim.step(&mut w);
+            w.advance_tick();
+            if w.get(10, 20) != MaterialKind::Corpse {
+                rotted_at = Some(tick);
+                break;
+            }
+        }
+        let tick = rotted_at.expect("露天的尸体必须会烂");
+        assert_eq!(w.get(10, 20), MaterialKind::Remains, "第 {tick} tick");
+        assert_eq!(sim.water_vented(), 0, "水循环开着，那格水不该被销毁");
+        assert_eq!(sim.water_vaporized(), 1, "那格水应当记成上了天");
+        // **水汽的账必须平**：`vapor == evaporated − rained + vaporized`。
+        // 只断言"vapor 涨了"是不够的——同一个 tick 里蒸发也在让它涨，
+        // 那条件恒真。这条恒等式能同时抓住"漏记"和"记两遍"。
+        let c = sim.climate();
+        assert_eq!(
+            c.vapor(),
+            c.evaporated() - c.rained() + sim.water_vaporized(),
+            "水汽账不平：蒸发 {} − 雨 {} + 汽化 {} ≠ {}",
+            c.evaporated(),
+            c.rained(),
+            sim.water_vaporized(),
+            c.vapor()
+        );
+        // 世界里的水可以少（它上天了），但**账必须平**。
+        assert!(w.count_of(MaterialKind::Water) <= water_before);
+        assert_eq!(water_volume(&w, &sim), before, "上天也是账，总量不能变");
     }
 
     /// **繁殖也不能让水位漂移。**

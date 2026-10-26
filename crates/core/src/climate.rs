@@ -73,8 +73,28 @@ pub const EVAP_PERCENT: u32 = 4;
 /// 调大它 = 天上存更多水 = 干旱期更长、雨更集中。
 pub const RAIN_UNITS_PER_PERCENT: u64 = 3;
 
-/// 降水概率上限（%）。100 = 每 tick 最多落一格。
+/// 降水概率上限（%）。100 = 每 tick 至少落一格。
 pub const RAIN_MAX_PERCENT: u32 = 100;
+
+/// 每多这么多格水汽，每 tick 就多落一格雨。
+///
+/// ## 为什么雨量要跟着存量走
+///
+/// 概率已经正比于 `vapor` 了，但**每 tick 最多落一格**——那个上限在正常
+/// 天气里是对的（稳态 `vapor` 只有 53~69，概率早就饱和了），一旦有大批水
+/// 上了天就变成瓶颈：v0.53 实测繁殖门开着时，岸上死掉的湿细胞把 **30023 格**
+/// 水留在了账上（`water_vented`），而雨最多还 1 格/tick，8000 tick 只还 8000。
+///
+/// 让它跟着存量走，负反馈就从"概率"扩展到"流量"：天上水多 → 下得又密又急
+/// → 存量掉得飞快。而且**正常态一个字都没变**：`vapor < 2000` 时
+/// `vapor / 2000 = 0`，预算恒为 1，和原来完全一样。
+pub const RAIN_BULK_UNITS: u64 = 2000;
+
+/// 单 tick 降水预算的上限。
+///
+/// 没有它，`vapor` 上百万时一 tick 要落几百滴，而每一滴都要扫一列找落点。
+/// 64 已经能在 500 tick 内还掉三万格水，够快，也不会让一帧卡住。
+pub const RAIN_MAX_DROPS: u64 = 64;
 
 const SALT_EVAP_COLUMN: u32 = 0x00C1_1A7E;
 const SALT_EVAPORATE: u32 = 0x00C1_1A7F;
@@ -128,6 +148,25 @@ impl Climate {
         self.rained
     }
 
+    /// 把**生命层**的水放进大气（不经过蒸发）。
+    ///
+    /// 唯一的调用方是"海平面以上的尸体烂成碎屑"那条路（见
+    /// [`crate::life_sim`] 的 `tick_organics`）。那里本来是一格水被
+    /// **永久销毁**——出生时借走、死后不还、账上记 `water_vented`。
+    ///
+    /// 现在改成上天：**水没消失，只是换了个地方待着**，而且还能下回来。
+    /// 这一条让"封闭世界里水不守恒"变成"水在三个池子之间流动"
+    /// （海 / 借出的活细胞 / 大气）。
+    ///
+    /// 它**不计进 `evaporated`**：蒸发是"从水面跑掉"，这是"从尸体里
+    /// 升上去"，两条路不同。所以 `vapor == evaporated - rained + vaporized`
+    /// 才是那个恒等式，而 `vaporized` 记在 `LifeSim` 上（和 `water_vented`
+    /// 作伴，是生命层的账，不进存档）。
+    #[inline]
+    pub fn add_vapor(&mut self, n: u64) {
+        self.vapor += n;
+    }
+
     /// 推进一个 tick。
     pub fn step(&mut self, world: &mut World) {
         let tick = world.tick();
@@ -160,10 +199,14 @@ impl Climate {
         }
     }
 
-    /// 落一格雨。
+    /// 落雨。
     ///
-    /// 概率正比于 `vapor`——这就是那个自动稳压的负反馈：
-    /// 蒸发快 → 天上水多 → 雨大 → 天上水少。
+    /// 两步：**先抽一次签决定"这一 tick 下不下"**（概率正比于 `vapor`，
+    /// 这就是那个自动稳压的负反馈：蒸发快 → 天上水多 → 雨大 → 天上水少），
+    /// **再按存量算这一 tick 能落几滴**（[`RAIN_BULK_UNITS`]）。
+    ///
+    /// 顺序不能反：先算预算再抽签的话，`vapor` 大时每滴都必然落，
+    /// 于是"概率"这条负反馈就失效了——而那正是稳态的来源。
     fn rain(&mut self, world: &mut World, tick: u64) {
         if self.vapor == 0 {
             return;
@@ -176,16 +219,22 @@ impl Climate {
         if w == 0 {
             return;
         }
-        let x = Rng::at_below(1, 0, tick, SALT_RAIN_COLUMN, w as u32) as usize;
-        // 找不到落点（整列塞满）就**放弃这一次**，`vapor` 不减——
-        // 否则水会无声地从账上消失，而那正是 v0.50 刚花力气记清楚的那类事。
-        let Some(y) = Self::landing_spot(world, x) else {
-            return;
-        };
-        world.set(x as isize, y as isize, MaterialKind::Water);
-        world.set_flags(x as isize, y as isize, water_src::RAIN);
-        self.vapor -= 1;
-        self.rained += 1;
+        let budget = (self.vapor / RAIN_BULK_UNITS + 1).min(RAIN_MAX_DROPS);
+        for k in 0..budget {
+            if self.vapor == 0 {
+                return;
+            }
+            let x = Rng::at_below(1, k as usize, tick, SALT_RAIN_COLUMN, w as u32) as usize;
+            // 找不到落点（整列塞满）就**放弃这一滴**，`vapor` 不减——
+            // 否则水会无声地从账上消失，而那正是 v0.50 刚花力气记清楚的那类事。
+            let Some(y) = Self::landing_spot(world, x) else {
+                continue;
+            };
+            world.set(x as isize, y as isize, MaterialKind::Water);
+            world.set_flags(x as isize, y as isize, water_src::RAIN);
+            self.vapor -= 1;
+            self.rained += 1;
+        }
     }
 
     /// 这一列**暴露在空气里**的水面在哪一行。
@@ -388,6 +437,57 @@ mod tests {
         }
         assert!(landed > 20, "200 tick 只落了 {landed} 格雨，降水没在跑");
         assert!(first.is_some(), "200 tick 一滴雨都没落，降水没在跑");
+    }
+
+    /// **天上一旦积了大量水，雨要下得又密又急。**
+    ///
+    /// 判据不能是"雨变多了"（太弱，随便改个常数都能满足），要钉的是
+    /// **一 tick 能落不止一滴**：那个"每 tick 最多一格"的上限在正常天气里
+    /// 是对的（稳态只有 53~69 格），但尸体那笔水（v0.53 实测三万格）
+    /// 靠它要还四万 tick，等于没还。
+    #[test]
+    fn a_loaded_sky_rains_harder_than_one_drop_per_tick() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 40, 64, 24, MaterialKind::Stone);
+        let mut c = Climate::new();
+        c.vapor = 20_000;
+        let mut most = 0usize;
+        for _ in 0..30 {
+            let before = w.count_of(MaterialKind::Water);
+            c.step(&mut w);
+            w.advance_tick();
+            // 蒸发会同时把水抽走，所以差值可能为负——`saturating_sub` 而不是 `-`。
+            most = most.max(w.count_of(MaterialKind::Water).saturating_sub(before));
+        }
+        assert!(
+            most > 5,
+            "天上两万格水，一 tick 最多只落了 {most} 滴——雨量的上限还是 1"
+        );
+    }
+
+    /// **正常天气的雨量一个字都没变**：`vapor < RAIN_BULK_UNITS` 时预算恒为 1。
+    ///
+    /// 这条是"改雨量没动基线"的唯一证据。没有它，`RAIN_BULK_UNITS` 调错一个
+    /// 数量级会让整个生态的降水翻倍，而所有"雨"相关的测试仍然绿——
+    /// 因为它们只数"下没下"，不数"下了多少"。
+    #[test]
+    fn a_normal_sky_still_rains_one_drop_at_a_time() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 40, 64, 24, MaterialKind::Stone);
+        let mut c = Climate::new();
+        c.vapor = 60;
+        let mut most = 0usize;
+        let mut drops = 0usize;
+        for _ in 0..4000 {
+            let before = w.count_of(MaterialKind::Water);
+            c.step(&mut w);
+            w.advance_tick();
+            let got = w.count_of(MaterialKind::Water).saturating_sub(before);
+            most = most.max(got);
+            drops += got;
+        }
+        assert_eq!(most, 1, "正常天气里一 tick 落了 {most} 滴，预算不该超过 1");
+        assert!(drops > 100, "4000 tick 只落了 {drops} 滴，降水没在跑");
     }
 
     /// 水汽为 0 时不下雨。

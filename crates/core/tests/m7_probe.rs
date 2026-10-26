@@ -76,6 +76,100 @@ fn land_surface_moisture(world: &World, sim: &LifeSim) -> f64 {
     }
 }
 
+/// 海平面以上那批水**离海平面有多远**，以及"水上个体"有多少。
+///
+/// `water_above` 只回答"有多少格"，不回答"在哪儿"。这两个问题差别很大：
+///
+/// - **贴着海平面几行** = 身体把水面顶起来一点，那是浮力，物理上正确；
+/// - **在陆地列上方** = 雨落在山上 / 岸上的水洼，那是**地形**，不是泵；
+/// - **在水面列的高处** = 水被搬到半空里悬着，那才是"水泵"。
+///
+/// 同一个数字（11910 格）可以是三件完全不同的事。`水上 深 67` 这个读数
+/// 第一眼像"水被顶到 67 格高的天上"，但它也可能是"山有 67 格高、山上在下雨"。
+/// **判据必须能把这两件事分开**，否则修的是不存在的东西。
+fn above_sea_shape(world: &World, sim: &LifeSim) -> AboveSea {
+    let sea = sim.moisture().sea_level();
+    let w = world.width() as isize;
+    // 每一列的地形顶：最高的 Stone / Sand 那一行。**不看 `Remains`**——
+    // 碎屑是粉末、会被水冲走，把它算进地形会让"岸"随尸体漂移。
+    let mut terrain = vec![i32::MAX; w as usize];
+    for x in 0..w {
+        for y in 0..world.height() as isize {
+            if matches!(
+                world.get(x, y),
+                MaterialKind::Stone | MaterialKind::Sand
+            ) {
+                terrain[x as usize] = y as i32;
+                break;
+            }
+        }
+    }
+    let mut out = AboveSea::default();
+    for y in 0..sea.max(0) as isize {
+        let dy = sea - y as i32;
+        for x in 0..w {
+            if world.get(x, y) != MaterialKind::Water {
+                continue;
+            }
+            let over_land = terrain[x as usize] < sea;
+            if over_land {
+                out.on_land += 1;
+            } else if dy <= 4 {
+                out.film += 1;
+            } else {
+                out.sky += 1;
+                // **悬空水靠什么撑着？** 看它下面那一格是谁。
+                //
+                // 三个候选，对应三种完全不同的病因：
+                // - `身体`：身体对水是墙（`yields_to` 把占位当墙），于是
+                //   "水托身体、身体托水"可以互相撑住——一座空中的塔；
+                // - `水`：下面是水，说明它是**一整根水柱**的一部分，
+                //   那要问"水柱底下是什么"；
+                // - `空位`：下面是空的，那它就是**该掉而没掉**——
+                //   材质层的问题，不是生命层的。
+                let below = y + 1;
+                let bs = below;
+                if !world.in_bounds(x, bs) {
+                    out.sky_on_floor += 1;
+                } else if world.is_occupied(x, bs) {
+                    out.sky_on_body += 1;
+                } else if world.get(x, bs) == MaterialKind::Water {
+                    out.sky_on_water += 1;
+                } else if world.get(x, bs) == MaterialKind::Empty {
+                    out.sky_on_nothing += 1;
+                } else {
+                    out.sky_on_solid += 1;
+                }
+            }
+            out.deepest = out.deepest.max(dy);
+        }
+    }
+    out.orgs = sim
+        .organisms()
+        .iter()
+        .filter(|o| o.footprint().all(|(_, y)| y < sea))
+        .count();
+    out
+}
+
+#[derive(Default)]
+struct AboveSea {
+    /// 贴着海平面（≤4 行）的水。
+    film: u64,
+    /// 落在"地形高出海平面"的那些列上方的水 = 山上的雨/水洼。
+    on_land: u64,
+    /// 剩下的：水面列的高处，也就是真的悬在半空。
+    sky: u64,
+    /// 悬空水的**下面一格是谁**（四类，加起来等于 `sky`）。
+    sky_on_body: u64,
+    sky_on_water: u64,
+    sky_on_nothing: u64,
+    sky_on_solid: u64,
+    sky_on_floor: u64,
+    deepest: i32,
+    orgs: usize,
+}
+
 fn run(seed: u64) -> String {
     let mut world = World::new(512, 512).unwrap();
     let mut rng = Rng::new(seed);
@@ -85,6 +179,9 @@ fn run(seed: u64) -> String {
     // `M7_RAIN=0` 做对照。
     let rain = std::env::var("M7_RAIN").map(|v| v != "0").unwrap_or(true);
     sim.set_water_cycle(rain);
+    // 陆地繁殖（`can_stand`）。默认关，`M7_LAND=1` 打开做对照。
+    let land = std::env::var("M7_LAND").map(|v| v != "0").unwrap_or(false);
+    sim.set_land_reproduction(land);
     let mut mat = MaterialSim::new();
     mat.set_threads(1);
     stock_surface(&mut world, &mut sim, 16, 300, false);
@@ -135,9 +232,21 @@ fn run(seed: u64) -> String {
     } else {
         corpse_energy as f64 / corpses as f64
     };
+    let shape = above_sea_shape(&world, &sim);
+    // 陆地碎屑：`Remains` 在海平面以上有多少格。这是"① 的产物有没有出口"
+    // 的唯一直接读数——它在涨就说明陆地会一直变高。
+    let sea = sim.moisture().sea_level();
+    let mut land_remains = 0u64;
+    for y in 0..sea.max(0) as isize {
+        for x in 0..world.width() as isize {
+            if world.get(x, y) == MaterialKind::Remains {
+                land_remains += 1;
+            }
+        }
+    }
 
     format!(
-        "seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:4}  搬水 {:6}  销毁 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}",
+        "seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
         st.organisms,
         st.plankton,
         st.species,
@@ -155,12 +264,23 @@ fn run(seed: u64) -> String {
         st.corpses_rotted,
         world.count_of(MaterialKind::Water),
         sim.water_above(&world),
+        shape.film,
+        shape.on_land,
+        shape.sky,
+        shape.deepest,
+        shape.sky_on_body,
+        shape.sky_on_water,
+        shape.sky_on_nothing,
+        shape.sky_on_solid,
+        shape.orgs,
         sim.water_moved(),
         sim.water_vented(),
+        sim.water_vaporized(),
         sim.climate().evaporated(),
         sim.climate().rained(),
         sim.climate().vapor(),
         land_surface_moisture(&world, &sim),
+        land_remains,
     )
 }
 
