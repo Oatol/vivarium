@@ -1321,6 +1321,8 @@ impl Game {
             food_growth: self.life.food_growth(),
             water_cycle: self.life.water_cycle(),
             land_reproduction: self.life.land_reproduction(),
+            // 共格模型住在 `World` 上（材质层也要读），所以从 `self.world` 取。
+            share_water: self.world.shares_water(),
             threads: self.sim.threads(),
             workers: self.sim.workers(),
             hover: self.hover_info(),
@@ -1541,6 +1543,24 @@ impl Game {
                     tick,
                     vivarium_ui::Level::Warn,
                     format!("陆地繁殖：{}", if on { "开" } else { "关" }),
+                );
+            }
+            C::SetShareWater(on) => {
+                // **整个世界标脏**（见 `World::set_share_water`）：换的是物理
+                // 规则，原本已经稳定下来的块在新规则下未必还稳定。
+                self.world.set_share_water(on);
+                let tick = self.world.tick();
+                self.ui.log(
+                    tick,
+                    vivarium_ui::Level::Warn,
+                    format!(
+                        "物理模型：{}",
+                        if on {
+                            "水与生物共格（身体不借水、不顶水）"
+                        } else {
+                            "旧模型（借水 + 顶水）"
+                        }
+                    ),
                 );
             }
             C::SetThreads(n) => {

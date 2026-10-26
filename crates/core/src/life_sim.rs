@@ -1019,6 +1019,10 @@ impl LifeSim {
         // （`set_ambient_temp` 只写一个标量），但写在后面读起来才是
         // "先装状态，再装它的目标"。
         field.set_ambient_temp(save.ambient);
+        // 共格模型是**世界**的属性（材质层也要读），所以装在 world 上。
+        // 必须在装有机体之前设好：`restore` 之后的身体格该怎么解释
+        // （"这格水是被托着的" vs "这格水该流走"）由它决定。
+        world.set_share_water(save.share_water);
 
         let mut sim = Self {
             organisms: Vec::new(),
@@ -1137,13 +1141,25 @@ impl LifeSim {
         // 尸体腐烂或被吃掉时还回来。**债务在出生这一刻定死**，
         // 不能到死的时候按"当时泡不泡在水里"倒推——那样一条在空气里出生的鱼
         // 沉下去死了，会还出一格它从没借过的水。实测 32000 tick 多了一万八千格。
+        //
+        // ## 共格模型（`World::shares_water`）下这一段整个不成立
+        //
+        // 水留在原地、身体叠在它上面，于是**一格都没借**，`wet` 全为 false，
+        // 也就没有"还不还"的问题。`bury` 那时改用"这一格现在是不是水"
+        // 来判尸体还是碎屑——那才是当时当地的事实，而 `wet` 是一张
+        // 出生时签下、可能早就跟现实脱节的欠条。
         // 落点先算好再动 cells：`cell_at` 要借 `org`，而下面要 `&mut org.cells`。
         let spots: Vec<(i32, i32)> = org.cells.iter().map(|c| org.cell_at(c)).collect();
+        // 共格模型下**没有债务**：水留在原地，身体只是叠在它上面。
+        // 所以 `wet` 一律 false，`water_volume` 那个不变量也就少一项
+        // （它数的正是"被借走的水"，而这里一格都没借）。
+        let share = world.shares_water();
         for (cell, &(x, y)) in org.cells.iter_mut().zip(&spots) {
             let kind = world.get(x as isize, y as isize);
             // 只有水才算"借"。气体、火被挤掉不算债务——它们本来就不是水。
-            cell.wet = matches!(kind, MaterialKind::Water);
-            if kind.is_fluid() {
+            cell.wet = !share && matches!(kind, MaterialKind::Water);
+            // 共格模型里**不清材质**：清掉就等于"借走"，而那正是要拆掉的东西。
+            if kind.is_fluid() && !share {
                 world.set(x as isize, y as isize, MaterialKind::Empty);
             }
         }
@@ -1563,11 +1579,24 @@ impl LifeSim {
             per_cell.min(u8::MAX as u32)
         };
         let mut placed = 0u32;
+        let share = world.shares_water();
         for cell in &org.cells {
             let (x, y) = org.cell_at(cell);
             let (x, y) = (x as isize, y as isize);
+            // 共格模型下 `wet` 永远是 false（没借过），所以判据换成
+            // **这一格现在是不是水**——身体格里的水一直留在原地，
+            // 死亡那一刻看一眼就知道该留尸体（水会回来）还是碎屑。
+            //
+            // 这里必须用 `world.get` 而不是 `wet`：一条从水里游到岸上的鱼，
+            // 它最后一格的材质是 `Empty`，该死成碎屑；`wet` 会记着它
+            // 出生时那格水，于是"岸上凭空多出一格水"的老毛病原样复活。
+            let wet = if share {
+                world.get(x, y) == MaterialKind::Water
+            } else {
+                cell.wet
+            };
             world.vacate(x, y);
-            if cell.wet {
+            if wet {
                 // 借过水的那几格：留**尸体**。尸体腐烂时把那一格水还回来，
                 // 所以"1 格尸体 = 1 格借来的水"是这条规则的地基。
                 world.set(x, y, remains_of(cell.kind));
@@ -2988,42 +3017,55 @@ impl LifeSim {
         // 而材质层要等整个生命层跑完才轮到，没有人会看到这个中间态。
         org.release(world);
 
-        // 身体腾出来的格子——只有这些位置才接得住被挤开的流体。
+        // ## 共格模型：**不顶开任何东西**
         //
-        // 这里有一个很容易写错的陷阱：不能拿 `old[k]` 当第 k 个细胞的落点。
-        // 身体内部会重叠——右移一格时，0 号细胞的新位置正是 1 号细胞的旧位置。
-        // 照着下标配对的写法会把水换进**新身体内部**（那格随即被 claim 成细胞），
-        // 于是鱼肚子里藏了一格水；等它死掉、那格被写成残骸，水就凭空没了。
-        // 实测 512² 跑 8000 tick 少了 371 格水，根因就在这里。
-        let vacated: Vec<(i32, i32)> = old
-            .iter()
-            .copied()
-            .filter(|p| !targets.contains(p))
-            .collect();
-        let mut next_vacated = 0usize;
-        for &(x, y) in &targets {
-            if old.contains(&(x, y)) {
-                // 身体内部的格子：它本来就是 Empty，没什么可挤的。
-                continue;
-            }
-            // 水和藻都会被身体挤开（藻是悬浮物，不是障碍）。
-            // 只认 `is_fluid` 的话，藻会留在被 claim 的格子里——
-            // 材质和细胞同时占着一格，违反"非材质即细胞"这条地基。
-            if !Self::body_displaces(world.get(x as isize, y as isize)) {
-                continue;
-            }
-            if next_vacated >= vacated.len() {
-                break;
-            }
-            let (ox, oy) = vacated[next_vacated];
-            next_vacated += 1;
-            // 小生物顶开水：水被挤到身体刚让出来的那一格。
-            // 用 `swap` 而不是"复制 + 清空"，水才不会凭空消失。
-            let was_water = world.get(x as isize, y as isize) == MaterialKind::Water;
-            world.swap(ox as isize, oy as isize, x as isize, y as isize);
-            // **仪器**：这一格水是被身体顶过来的，记下来（见 `material::water_src`）。
-            if was_water {
-                world.set_flags(ox as isize, oy as isize, crate::material::water_src::SWAP);
+        // 旧模型里下面这一整段是台水泵：身体往下/往旁边挪一格，就把那一格
+        // 的流体 `swap` 到自己刚让出来的位置。海里的表层生命密度很高，
+        // 每一次这样的交换都在把水往**上**搬一格——实测门一开，海平面以上
+        // 从 8 格涨到 8420 格（见 `plugs_water` 的注释）。
+        //
+        // 双层模型里水不参与身体的位置变化：身体离开，那格水留在原地；
+        // 身体进来，那格水也留在原地（材质层跳过被占住的格子，见
+        // `sim::Ctx::visit`）。于是"顶水"这件事在物理上不存在了，
+        // 也就不需要这段补偿逻辑。
+        if !world.shares_water() {
+            // 身体腾出来的格子——只有这些位置才接得住被挤开的流体。
+            //
+            // 这里有一个很容易写错的陷阱：不能拿 `old[k]` 当第 k 个细胞的落点。
+            // 身体内部会重叠——右移一格时，0 号细胞的新位置正是 1 号细胞的旧位置。
+            // 照着下标配对的写法会把水换进**新身体内部**（那格随即被 claim 成细胞），
+            // 于是鱼肚子里藏了一格水；等它死掉、那格被写成残骸，水就凭空没了。
+            // 实测 512² 跑 8000 tick 少了 371 格水，根因就在这里。
+            let vacated: Vec<(i32, i32)> = old
+                .iter()
+                .copied()
+                .filter(|p| !targets.contains(p))
+                .collect();
+            let mut next_vacated = 0usize;
+            for &(x, y) in &targets {
+                if old.contains(&(x, y)) {
+                    // 身体内部的格子：它本来就是 Empty，没什么可挤的。
+                    continue;
+                }
+                // 水和藻都会被身体挤开（藻是悬浮物，不是障碍）。
+                // 只认 `is_fluid` 的话，藻会留在被 claim 的格子里——
+                // 材质和细胞同时占着一格，违反"非材质即细胞"这条地基。
+                if !Self::body_displaces(world.get(x as isize, y as isize)) {
+                    continue;
+                }
+                if next_vacated >= vacated.len() {
+                    break;
+                }
+                let (ox, oy) = vacated[next_vacated];
+                next_vacated += 1;
+                // 小生物顶开水：水被挤到身体刚让出来的那一格。
+                // 用 `swap` 而不是"复制 + 清空"，水才不会凭空消失。
+                let was_water = world.get(x as isize, y as isize) == MaterialKind::Water;
+                world.swap(ox as isize, oy as isize, x as isize, y as isize);
+                // **仪器**：这一格水是被身体顶过来的，记下来（见 `material::water_src`）。
+                if was_water {
+                    world.set_flags(ox as isize, oy as isize, crate::material::water_src::SWAP);
+                }
             }
         }
 
@@ -3355,7 +3397,15 @@ impl LifeSim {
         let mut cells = Vec::with_capacity(org.cells.len());
         for c in &org.cells {
             let (x, y) = org.cell_at(c);
-            if !Self::can_place(world, x, y) || !Self::water_has_air_above(world, x, y) {
+            if !Self::can_place(world, x, y) {
+                return false;
+            }
+            // 「这一格水要有地方可去」只在**旧模型**里成立：那里出生会把
+            // 那格水删掉，删之前得确认它不是"最后一块"。
+            // 共格模型里水根本不挪，这条判据失去前提——留着它反而会
+            // 让贴水面出生的子代被无缘无故拒掉（水面那一列上方就是空气，
+            // 但再往上一整列可能都是水）。
+            if !world.shares_water() && !Self::water_has_air_above(world, x, y) {
                 return false;
             }
             cells.push((x, y));
@@ -6902,5 +6952,177 @@ mod tests {
 
         assert!(sim.organism(id).is_none(), "深水里应该饿死");
         assert!(sim.audit(&w).is_balanced());
+    }
+
+    // -----------------------------------------------------------------------
+    // 共格模型（`World::share_water`）—— 第 0 步：最小物理内核
+    // -----------------------------------------------------------------------
+    //
+    // 这三条测的是"双层模型的三条规则真的接上了"，不是它的生态效果。
+    // 生态效果要跑 `tests/m7_probe.rs`（三种子 × 8000 tick），单元测试
+    // 在这里只回答"规则有没有生效"——因为**一条没生效的规则和一条
+    // 生效了但没用的规则，在生态数字上长得一模一样**。
+
+    /// 半个池子：只有左边 8 列有水，右边是敞开的空气。
+    ///
+    /// 为什么要这样造：`try_spread` 撞到另一格水就停（水不能让位给水），
+    /// 所以池子**内部**的水永远摊不出去，测不出"身体格里的水会不会被
+    /// 材质层抽走"。把水放在敞开的边缘上，那一格水才真的"想动"。
+    fn half_full_pool() -> World {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.fill_rect(0, 30, 8, 30, MaterialKind::Water);
+        w
+    }
+
+    /// 共格模型里出生**不借水**：那格水留在原地，身体叠在它上面。
+    ///
+    /// 这一条是整套改动的地基。旧模型里 `spawn` 会把水删掉、记成 `wet`，
+    /// 于是"水少了一格"；共格模型里水量一格都不变，`wet` 也全是 false。
+    #[test]
+    fn sharing_water_does_not_borrow_the_cell() {
+        let mut w = pool();
+        w.set_share_water(true);
+        let before = w.count_of(MaterialKind::Water);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 40), Genome::blank(), 100),
+            )
+            .unwrap();
+
+        assert_eq!(
+            w.count_of(MaterialKind::Water),
+            before,
+            "共格模型不该把身体占住的那几格水借走"
+        );
+        let org = sim.organism(id).unwrap();
+        assert!(
+            org.cells.iter().all(|c| !c.wet),
+            "一格水都没借，就不该有欠条"
+        );
+        for (x, y) in org.footprint() {
+            assert_eq!(
+                w.get(x as isize, y as isize),
+                MaterialKind::Water,
+                "身体格 ({x},{y}) 里的水必须留在原地"
+            );
+            assert!(w.is_occupied(x as isize, y as isize), "那一格仍然被占着");
+        }
+    }
+
+    /// 材质层**不许动**被身体占住的那一格水。
+    ///
+    /// ## 没有这条规则会怎样
+    ///
+    /// 那格水会被材质层当成普通的水：它顺着"横向找平"摊到旁边的空气里，
+    /// 身体格随之变成 `Empty`。水量并不因此减少（水只是挪了个地方），
+    /// 所以**任何只看总量的判据都发现不了**——但"身体托着水"这件事
+    /// 从此不存在了，而整套模型的意义就在这件事上。
+    ///
+    /// 判据因此必须是**位置**：那几格现在还是水吗。
+    ///
+    /// 每 tick 强制全扫（`mark_all_dirty`）是必要的：不这么做，水在几十个
+    /// tick 之后就静下来、分块变干净、那一格再也不会被 `visit` 到——
+    /// 删掉规则测试照样是绿的。
+    #[test]
+    fn the_material_layer_does_not_drain_water_out_of_a_body() {
+        let mut w = half_full_pool();
+        w.set_share_water(true);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 身体横跨水的右边界：最右那格 (7,31) 旁边就是空气，最想摊出去。
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((6, 31), Genome::blank(), 100),
+            )
+            .unwrap();
+        let held: Vec<(i32, i32)> = sim.organism(id).unwrap().footprint().collect();
+        for &(x, y) in &held {
+            assert_eq!(w.get(x as isize, y as isize), MaterialKind::Water);
+        }
+
+        let mut mat = crate::sim::MaterialSim::new();
+        mat.set_threads(1);
+        for _ in 0..40 {
+            w.mark_all_dirty();
+            mat.step(&mut w);
+        }
+
+        for &(x, y) in &held {
+            assert_eq!(
+                w.get(x as isize, y as isize),
+                MaterialKind::Water,
+                "({x},{y}) 的水被材质层抽走了——身体不再托着它"
+            );
+        }
+    }
+
+    /// 死在水里的身体留**尸体**，而不是碎屑；而且水量账上不多不少。
+    ///
+    /// 旧模型判"尸体还是碎屑"用的是出生时签下的欠条（`Cell::wet`）。
+    /// 共格模型没有欠条，判据换成**这一格现在是不是水**——一条从水里
+    /// 游到岸上的鱼，最后一格是空气，它就该烂成碎屑，不该在岸上
+    /// 凭空还出一格水。
+    #[test]
+    fn a_body_that_dies_in_water_becomes_a_corpse_in_place() {
+        let mut w = pool();
+        w.set_share_water(true);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 40), Genome::blank(), 100),
+            )
+            .unwrap();
+        let org = sim.organism(id).unwrap().clone();
+        let before = w.count_of(MaterialKind::Water);
+
+        sim.bury(&mut w, &org);
+
+        // 三格身体都泡在水里 → 三格尸体。水少三格、尸体多三格，
+        // **总量不变**：那一格水只是换成了"等它烂掉就会变回水"的东西。
+        assert_eq!(w.count_of(MaterialKind::Corpse), 3, "泡在水里的身体该留尸体");
+        assert_eq!(
+            w.count_of(MaterialKind::Water),
+            before - 3,
+            "三格水变成了尸体"
+        );
+        assert_eq!(
+            w.count_of(MaterialKind::Water) + w.count_of(MaterialKind::Corpse),
+            before,
+            "水 + 尸体是守恒量（共格模型下没有'借出'那一项）"
+        );
+        assert_eq!(w.count_of(MaterialKind::Remains), 0, "不该有碎屑");
+    }
+
+    /// 反面：死在**空气**里的身体留碎屑，一格水都不碰。
+    ///
+    /// 和上一条合起来才说明判据是"当时当地是不是水"，而不是"出生时借没借过"。
+    #[test]
+    fn a_body_that_dies_in_air_leaves_remains_not_water() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        w.set_share_water(true);
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        // 悬在空气里（重力会在 step 里把它拉下去，但这里不跑 step）。
+        let id = sim
+            .spawn_injected(
+                &mut w,
+                LifeSim::simple_fish((10, 20), Genome::blank(), 100),
+            )
+            .unwrap();
+        let org = sim.organism(id).unwrap().clone();
+
+        sim.bury(&mut w, &org);
+
+        assert_eq!(w.count_of(MaterialKind::Remains), 3, "空气里死的是碎屑");
+        assert_eq!(w.count_of(MaterialKind::Water), 0, "不该凭空造水");
+        assert_eq!(w.count_of(MaterialKind::Corpse), 0);
     }
 }

@@ -70,6 +70,7 @@
 //! u64 u64 u64        水汽 / 累计蒸发 / 累计降水
 //! u8                 water_cycle
 //! u8                 land_reproduction（v8）
+//! u8                 share_water（v10）
 //! "ENDVIVAR"  8B     尾标记
 //! ```
 //!
@@ -96,7 +97,7 @@ pub const MAGIC: [u8; 8] = *b"VIVARIUM";
 /// 尾标记。见模块文档最后一节。
 pub const TRAILER: [u8; 8] = *b"ENDVIVAR";
 /// 当前格式版本。
-pub const VERSION: u16 = 9;
+pub const VERSION: u16 = 10;
 /// 存档扩展名（不带点）。
 pub const EXTENSION: &str = "vivarium";
 
@@ -206,6 +207,15 @@ pub struct LifeSave {
     /// 陆地繁殖开不开（v8）。**必须存**，理由和 `water_cycle` 一模一样：
     /// 它改的是"子代能生在哪儿"，读档之后悄悄关掉就等于换了一个世界。
     pub land_reproduction: bool,
+    /// 水与生物共格（v10）。**必须存**，而且比前两个更硬：
+    ///
+    /// 它换的是**一套物理规则**。旧模型的世界里，身体格是 `Empty`（水被借走了）；
+    /// 拿这种世界去跑共格模型，那些格子会永远空着——鱼泡在自己的空气泡里，
+    /// 而周围的水灌不进来。反过来更糟：共格世界的身体格里是水，
+    /// 拿旧模型跑，那些水会被材质层当成自由的水流走。
+    ///
+    /// 两种错法都不会报错，只会让读档后的世界"跟存的时候不太一样"。
+    pub share_water: bool,
 }
 
 /// 一条存档列表项。界面"读取"那一栏直接吃它。
@@ -278,6 +288,7 @@ pub fn encode(world: &World, sim: &LifeSim) -> Vec<u8> {
     out.u64(climate.rained());
     out.u8(u8::from(sim.water_cycle()));
     out.u8(u8::from(sim.land_reproduction()));
+    out.u8(u8::from(world.shares_water()));
 
     out.0.extend_from_slice(&TRAILER);
     out.0
@@ -582,16 +593,21 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
 
     // v7：湿度场与水汽。更早的档没有这一节——那时候湿度是世界的纯函数，
     // `LifeSim::restore` 会重新播种一遍（和当时的行为一致）。
-    let (moisture, climate, water_cycle, land_reproduction) = if header.version >= 7 {
+    let (moisture, climate, water_cycle, land_reproduction, share_water) = if header.version >= 7 {
         let moisture = read_moisture(&mut r, header.width, header.height)?;
         let climate = crate::climate::Climate::from_parts(r.u64()?, r.u64()?, r.u64()?);
         let water_cycle = r.u8()? != 0;
         // v8 才有的字段。v7 的档读到这里刚好是尾标记之前，
         // 所以**不能无条件读**——会吃进尾标记的前 8 个字节然后报坏档。
         let land = if header.version >= 8 { r.u8()? != 0 } else { false };
-        (moisture, climate, water_cycle, land)
+        let share = if header.version >= 10 {
+            r.u8()? != 0
+        } else {
+            false
+        };
+        (moisture, climate, water_cycle, land, share)
     } else {
-        (None, crate::climate::Climate::new(), false, false)
+        (None, crate::climate::Climate::new(), false, false, false)
     };
 
     // 尾标记
@@ -614,6 +630,7 @@ pub fn decode(bytes: &[u8]) -> Result<(World, LifeSim), SaveError> {
         climate,
         water_cycle,
         land_reproduction,
+        share_water,
     };
     let sim = LifeSim::restore(&mut world, save);
     Ok((world, sim))
@@ -1177,6 +1194,33 @@ mod tests {
             s2.land_reproduction(),
             "读档之后陆地繁殖被关掉了：子代能生在哪儿变了，等于换了个世界"
         );
+    }
+
+    /// **共格模型开关必须原样穿过存档**（v10）。
+    ///
+    /// 它换的是**一套物理规则**，不是数值。读档之后悄悄退回旧模型的话，
+    /// 那些被身体托着的水会在下一 tick 全被材质层抽走——而能量账、
+    /// 生物数、水位统计在那之后一切正常，只有画面不对。
+    #[test]
+    fn a_shared_water_world_comes_back_shared() {
+        let mut world = World::new(64, 64).unwrap();
+        world.set_share_water(true);
+        let sim = LifeSim::new(&mut world);
+        let bytes = encode(&world, &sim);
+        let (w2, _) = decode(&bytes).unwrap();
+        assert!(w2.shares_water(), "读档之后共格模型被关掉了");
+    }
+
+    /// 反面：默认关着的世界读回来也是关着的。
+    ///
+    /// 少了这一条，"读回来永远是 `true`"也能过上面那条。
+    #[test]
+    fn an_ordinary_world_comes_back_without_sharing() {
+        let mut world = World::new(64, 64).unwrap();
+        let sim = LifeSim::new(&mut world);
+        let bytes = encode(&world, &sim);
+        let (w2, _) = decode(&bytes).unwrap();
+        assert!(!w2.shares_water(), "旧模型的世界不该被读成共格模型");
     }
 
     #[test]

@@ -83,6 +83,7 @@ fn demo_snapshot() -> Snapshot {
         food_growth: true,
         water_cycle: true,
         land_reproduction: false,
+        share_water: false,
         threads: 4,
         workers: 4,
         // 悬停读数要能在预览图里看到，所以给一份"有生物"的探针表。

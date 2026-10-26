@@ -271,6 +271,12 @@ pub struct Snapshot {
     pub water_cycle: bool,
     /// 陆地繁殖开不开（子代能不能站在实体上出生）。
     pub land_reproduction: bool,
+    /// 水与生物共格（实验性物理内核）。
+    ///
+    /// 和上面三个开关不同，它换的不是"某条规则开不开"，而是**身体与水的
+    /// 关系**：关着时身体占住的那格水被借走、移动时把水顶开；开着时水留在
+    /// 原地、身体叠在它上面。所以它单独占一节，不混在"生态开关"里。
+    pub share_water: bool,
 
     /// 材质层的并行工人数上限，以及上一次真正干活时用到了几个。
     pub threads: usize,
@@ -315,6 +321,7 @@ impl Default for Snapshot {
             food_growth: true,
             water_cycle: false,
             land_reproduction: false,
+            share_water: false,
             threads: 1,
             workers: 1,
             hover: None,
@@ -540,6 +547,9 @@ pub enum Command {
     SetWaterCycle(bool),
     /// 陆地繁殖开关。
     SetLandReproduction(bool),
+    /// 水与生物共格（实验性物理内核）。**会改存档格式的语义**，见 core 的
+    /// `World::share_water`。
+    SetShareWater(bool),
     /// 材质层并行工人数上限。
     SetThreads(usize),
 

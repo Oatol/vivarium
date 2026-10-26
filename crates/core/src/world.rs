@@ -162,6 +162,21 @@ pub struct World {
     dirty: Vec<bool>,
     dirty_count: usize,
     tick: u64,
+    /// **水与有机体共格**（实验性物理内核，默认关）。
+    ///
+    /// 关着 = v0.54 及以前的模型：身体占住的那一格水被**删掉**（记成
+    /// `Cell::wet` 的欠条），移动时靠 `swap` 把水顶到刚让出来的格子里。
+    /// 两条路都会**搬运水**：删除让水少一格、swap 让水多一格，而它们在
+    /// 世界里发生的**位置不同**——净效果就是一台持续运转的水泵
+    /// （实测海平面以上悬着 27137 格水）。
+    ///
+    /// 开着 = 双层模型：水**留在原地**，身体叠在它上面；材质层跳过被占住的
+    /// 格子，于是那格水既流不走、也灌不进。没有借、没有还、没有顶。
+    ///
+    /// 为什么这个开关住在 `World` 而不是 `LifeSim`：**材质层也要读它**
+    /// （见 `sim::Ctx::visit`）。放在生命层会需要第二份副本，而两份副本
+    /// 迟早会漂开——症状是"水在身体里流走了，但账上还说它被托着"。
+    share_water: bool,
 }
 
 impl World {
@@ -205,6 +220,7 @@ impl World {
             dirty: vec![true; chunk_count],
             dirty_count: chunk_count,
             tick: 0,
+            share_water: false,
         })
     }
 
@@ -361,6 +377,28 @@ impl World {
     /// 世界里被占用的格子总数。
     pub fn occupied_count(&self) -> usize {
         self.owner.iter().filter(|o| o.is_some()).count()
+    }
+
+    /// 水与有机体是否共格（见 [`World::share_water`] 字段的注释）。
+    #[inline]
+    pub const fn shares_water(&self) -> bool {
+        self.share_water
+    }
+
+    /// 切换共格模型。
+    ///
+    /// **切换时整个世界标脏**：换掉的是一套物理规则，原本"已经稳定下来"
+    /// 的块在新规则下未必还稳定（关掉时那些被身体托着的水突然自由了，
+    /// 该塌的得让它塌）。只标一次，代价是"切换后的一两个 tick 全扫"，
+    /// 比"切换后水永远悬在那儿"便宜得多。
+    ///
+    /// 值没变时不动任何东西——这个函数会被界面每帧调用。
+    pub fn set_share_water(&mut self, on: bool) {
+        if self.share_water == on {
+            return;
+        }
+        self.share_water = on;
+        self.mark_all_dirty();
     }
 
     /// 读取格子的标记位。越界返回 0。    #[inline]

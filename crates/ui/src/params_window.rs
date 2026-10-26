@@ -1,4 +1,4 @@
-//! 「全局参数」窗口：世界温度 + 生态开关 + 性能。
+//! 「全局参数」窗口：世界温度 + 生态开关 + 物理模型 + 性能。
 //!
 //! ## 它解决的问题
 //!
@@ -92,6 +92,8 @@ pub fn draw(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) -> bool {
             ui.add_space(8.0);
             ecology_section(ui, state, snap);
             ui.add_space(8.0);
+            physics_section(ui, state, snap);
+            ui.add_space(8.0);
             perf_section(ui, state, snap);
             ui.add_space(6.0);
             footer(ui);
@@ -114,7 +116,7 @@ fn header(ui: &mut Ui) -> bool {
         );
         ui.add_space(8.0);
         ui.label(
-            egui::RichText::new("温度 · 生态 · 性能")
+            egui::RichText::new("温度 · 生态 · 物理 · 性能")
                 .size(9.5)
                 .color(theme::TEXT_FAINT),
         );
@@ -236,6 +238,34 @@ fn ecology_section(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
     ui.add_space(3.0);
     ui.label(
         egui::RichText::new("开关会立刻生效，但不会重算已经跑过的世界。")
+            .size(9.0)
+            .color(theme::TEXT_FAINT),
+    );
+}
+
+/// 物理：换掉"身体和水的关系"的那一个开关。
+///
+/// 单独一节，而不是塞进「生态开关」：那三个开关各自开关一条规则，
+/// 这一个换的是**规则之间的关系**——身体还借不借水、移动还顶不顶水。
+/// 把它们排成一列会让人以为它们是同一层级的东西。
+fn physics_section(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
+    widgets::section(ui, "物理");
+    ui.add_space(2.0);
+
+    if widgets::toggle_row(
+        ui,
+        "水与生物共格",
+        snap.share_water,
+        "水留在原地，身体叠在它上面。关着时身体会把那格水借走、移动时把它顶开。\
+         **改的是物理规则本身**，已经跑过的世界不会被重算。",
+    )
+    .changed()
+    {
+        state.emit(Command::SetShareWater(!snap.share_water));
+    }
+
+    ui.label(
+        egui::RichText::new("开着时身体不借水、也不顶水；关着时两者都发生（旧模型）。")
             .size(9.0)
             .color(theme::TEXT_FAINT),
     );

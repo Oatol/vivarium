@@ -853,6 +853,19 @@ impl MaterialSim {
 impl Ctx<'_> {
     /// 处理单格。
     fn visit(&mut self, x: usize, y: usize, tick: u64) {
+        // **共格模型：被有机体占住的格子里的材质是"被身体托着的"，不许动。**
+        //
+        // 没有这一条，双层模型立刻漏成一个无底洞：身体格里的那格水会被
+        // 材质层当成普通水往下流 / 往旁边摊，流走之后那格变成 `Empty`，
+        // 而水**并没有回到海里**——它只是从身体里被放了出来，然后身体
+        // 再也没法"还"它。净效果是每个身体格吃水一格。
+        //
+        // 关着的时候这一行是**空操作**：那种世界里身体格本来就是 `Empty`
+        // （`spawn` 把水借走了），下面第二行就会返回。所以它不影响旧行为，
+        // 只在共格世界里起作用。
+        if self.world.shares_water() && self.world.is_occupied(x as isize, y as isize) {
+            return;
+        }
         let idx = self.world.index_of(x, y);
         if self.already_moved(x, y, idx, tick) {
             return;

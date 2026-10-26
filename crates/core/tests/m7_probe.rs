@@ -230,11 +230,19 @@ fn run(seed: u64) -> String {
     // 陆地繁殖（`can_stand`）。默认关，`M7_LAND=1` 打开做对照。
     let land = std::env::var("M7_LAND").map(|v| v != "0").unwrap_or(false);
     sim.set_land_reproduction(land);
+    // **双层模型**（水与生物共格）。默认关，`M7_SHARE=1` 打开。
+    //
+    // 必须在 `stock_surface` **之前**设：投放那一步就要走新规则
+    // （不借水、不清材质），设晚了第一批 300 条鱼还是旧模型的。
+    let share = std::env::var("M7_SHARE").map(|v| v != "0").unwrap_or(false);
+    world.set_share_water(share);
     let mut mat = MaterialSim::new();
     mat.set_threads(1);
     stock_surface(&mut world, &mut sim, 16, 300, false);
     // 水的基线。**必须在 `stock_surface` 之后取**：投放时每个细胞都要借走
     // 它占住的那一格水，提前取会把"借"算成"漏"。
+    // （共格模型下投放不借水，早取晚取是同一个数——但基线位置保持一致，
+    // 两列才能直接比。）
     let water_start = world.count_of(MaterialKind::Water);
     // 累计"吃掉尸体"的格数。这是食腐生态位的**唯一直接证据**：
     // 尸体存量会同时受死亡率、腐烂、材质模拟影响，掉了分不清是谁干的。
@@ -310,6 +318,20 @@ fn run(seed: u64) -> String {
         }
     }
 
+    // **共格水**：材质是 `Water`、同时被有机体占着的格子。
+    //
+    // 这是"双层模型真的在跑"的唯一直接读数。它必须 > 0，否则
+    // `M7_SHARE=1` 什么也没打开——而那种失败**看起来完全像一次
+    // 成功的实验**（水上水掉到 0，因为水根本没被托着，而是压根没生效）。
+    let mut shared_water = 0u64;
+    for y in 0..world.height() as isize {
+        for x in 0..world.width() as isize {
+            if world.get(x, y) == MaterialKind::Water && world.is_occupied(x, y) {
+                shared_water += 1;
+            }
+        }
+    }
+
     // 海平面以上那一片的**形状**：每 4×4 一格，`~` 有水、`#` 有身体、`.` 全空。
     // 一个数（25171）可以是"平顶的一团"也可以是"一根柱子"，
     // 而这两种形状的病因完全不同——**先看图，再谈因果**。
@@ -350,8 +372,13 @@ fn run(seed: u64) -> String {
         y += 4;
     }
 
+    // 每一行自报"这是哪个模型"：三次测量的输出会混在一屏里，
+    // 而两列数字的差别全靠这一行区分。忘了它会得到一张
+    // "同种子两次测量差了三万格"的图，然后去查一个不存在的 bug。
+    let model = if share { "[共格]" } else { "[旧模型]" };
+
     format!(
-        "{map}\nseed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
+        "{map}\n{model} seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  共格 {:5}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
         st.organisms,
         st.plankton,
         st.species,
@@ -368,6 +395,7 @@ fn run(seed: u64) -> String {
         scavenged,
         st.corpses_rotted,
         world.count_of(MaterialKind::Water),
+        shared_water,
         sim.water_above(&world),
         shape.film,
         shape.on_land,
