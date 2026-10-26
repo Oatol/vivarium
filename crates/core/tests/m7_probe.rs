@@ -175,6 +175,45 @@ fn above_sea_shape(world: &World, sim: &LifeSim) -> AboveSea {
         .iter()
         .filter(|o| o.footprint().all(|(_, y)| y < sea))
         .count();
+
+    // 追到底。**只看"下面一格是谁"是不够的**：水柱内部每一格下面都是水，
+    // 于是 `sky_on_water` 会吃掉 85% 的样本，而真正的地基只有最底下那一层。
+    // 一路追下去才知道这团水的根扎在哪儿。
+    let h = world.height() as isize;
+    for y in 0..sea.max(0) as isize {
+        for x in 0..w {
+            if world.get(x, y) != MaterialKind::Water {
+                continue;
+            }
+            let mut by = y + 1;
+            loop {
+                if by >= h {
+                    out.to_floor += 1;
+                    break;
+                }
+                let k = world.get(x, by);
+                if k == MaterialKind::Water {
+                    by += 1;
+                    continue;
+                }
+                if by >= sea as isize {
+                    // 根扎在海平面以下 = 这是海的一部分，海面被抬起来了。
+                    out.to_sea += 1;
+                } else if k == MaterialKind::Empty {
+                    out.to_air += 1;
+                } else {
+                    out.to_solid += 1;
+                    match k {
+                        MaterialKind::Remains => out.to_remains += 1,
+                        MaterialKind::Corpse => out.to_corpse += 1,
+                        MaterialKind::Stone | MaterialKind::Sand => out.to_terrain += 1,
+                        _ => out.to_other += 1,
+                    }
+                }
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -216,6 +255,32 @@ struct AboveSea {
     depth_bands: [u64; 5],
     deepest: i32,
     orgs: usize,
+    /// 海平面以上的水，**往下追到第一个非水格**之后，那一格在哪儿。
+    ///
+    /// 这是"水位上涨"和"悬空水柱"的**唯一干净判据**：
+    /// - `to_sea`：追到海平面以下 ⇒ 这格水**连着海**，海面整体抬升了；
+    /// - `to_solid`：追到固体（仍在海平面以上）⇒ 岸上的水洼 / 山上的水；
+    /// - `to_air`：追到空气 ⇒ **真悬空**，该掉而没掉；
+    /// - `to_floor`：一路都是水到世界底 ⇒ 从海底长上来的水柱。
+    ///
+    /// 同一个 `水上 27137`，这四类的修法互不相容：
+    /// 第一类是**收支不平衡**（雨比蒸发多），第二三类是**搬运**，
+    /// 第四类是**水柱**。不分开就只能在四种解释里挑一个顺眼的。
+    to_sea: u64,
+    to_solid: u64,
+    to_air: u64,
+    to_floor: u64,
+    /// `to_solid` 再按**追到的是什么**细分。
+    ///
+    /// 这一步是"水被谁托着"的最终判据。`to_solid` 说"下面是固体"，
+    /// 但固体可能是山（`Stone`/`Sand`，地形，水本来就该在那儿）
+    /// 也可能是**碎屑**（`Remains`，生物尸体烂出来的粉末，会堆积）。
+    /// 前者是地形，后者是**生命活动的产物**——修法完全相反：
+    /// 一个是"世界生成"，一个是"别让碎屑堆在水面上"。
+    to_remains: u64,
+    to_corpse: u64,
+    to_terrain: u64,
+    to_other: u64,
 }
 
 fn run(seed: u64) -> String {
@@ -244,6 +309,11 @@ fn run(seed: u64) -> String {
     // （共格模型下投放不借水，早取晚取是同一个数——但基线位置保持一致，
     // 两列才能直接比。）
     let water_start = world.count_of(MaterialKind::Water);
+    // **基线也要记"水上"那一份**。总水 85791 只说明世界里有这么多水，
+    // 不说明它在海平面以上还是以下——而"水柱"这个问题问的正是后者。
+    // 少了这个数，27137 里有多少是建场就有的、有多少是 8000 tick 搬上来的，
+    // 完全分不清。（这是"先减基线再比"那条坑的镜像：先量基线。）
+    let water_above_start = sim.water_above(&world);
     // 累计"吃掉尸体"的格数。这是食腐生态位的**唯一直接证据**：
     // 尸体存量会同时受死亡率、腐烂、材质模拟影响，掉了分不清是谁干的。
     let mut scavenged = 0u64;
@@ -377,8 +447,23 @@ fn run(seed: u64) -> String {
     // "同种子两次测量差了三万格"的图，然后去查一个不存在的 bug。
     let model = if share { "[共格]" } else { "[旧模型]" };
 
+    // **海平面以上的水按来源拆分**。
+    //
+    // `water_above` 只给一个总数（27137）。同样是 27137，可能是"下的雨"、
+    // "尸体还的"、"被身体顶上去的"——**三种病因，三种修法**。
+    // 这个读数把总数换成向量，是"谁在往上搬水"的直接答案。
+    let src = sim.water_above_sources(&world);
+    let src_names = vivarium_core::material::water_src::NAMES;
+    let src_line = src_names
+        .iter()
+        .zip(src.iter())
+        .filter(|(_, &n)| n > 0)
+        .map(|(name, n)| format!("{name} {n}"))
+        .collect::<Vec<_>>()
+        .join(" / ");
+
     format!(
-        "{map}\n{model} seed {seed:>5}  初始水 {water_start:6}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  共格 {:5}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}",
+        "{map}\n{model} seed {seed:>5}  初始水 {water_start:6}  水上初 {water_above_start:5}  动物 {:4}  藻 {:3}  物种 {:3}  能量 {:7}  体长 {:2}–{:2} 众数 {:2}  形状 {:2} 种  扁平 {:.2}  脱水 {:2}  最高 y {:3}  尸体 {:5} 格 均 {:3.0}  食腐 {:6}  腐烂 {:6}  总水 {:6}  共格 {:5}  水上 {:5} [膜 {} 陆 {} 空 {} 深 {:2}：托体 {} 托水 {} 托空 {} 托固 {} | 侧挡体 {} 露空气 {} | 分桶 {}/{}/{}/{}/{} | 根 连海{} 落固{} 悬空{} 到底{} | 托物 屑{} 尸{} 地形{} 其它{}] 水上个体 {:3}  搬水 {:6}  销毁 {:6}  汽化 {:6}  蒸发 {:6}  雨 {:6}  水汽 {:5}  陆湿 {:5.1}  陆屑 {:5}\n        └ 水上来源：{src_line}",
         st.organisms,
         st.plankton,
         st.species,
@@ -412,6 +497,14 @@ fn run(seed: u64) -> String {
         shape.depth_bands[2],
         shape.depth_bands[3],
         shape.depth_bands[4],
+        shape.to_sea,
+        shape.to_solid,
+        shape.to_air,
+        shape.to_floor,
+        shape.to_remains,
+        shape.to_corpse,
+        shape.to_terrain,
+        shape.to_other,
         shape.orgs,
         sim.water_moved(),
         sim.water_vented(),
