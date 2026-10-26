@@ -373,7 +373,37 @@ pub const DRY_CORPSE_ROT_PERCENT: u32 = 3;
 /// `ORGANICS_INTERVAL = 25`，8000 tick 扫 320 次。2% ⇒ 一对被埋的碎屑
 /// 平均 50 次扫描后压实，也就是 1250 tick。碎屑的生成速率是"每次死亡
 /// 一格"，这个速率足够跟上而不会一夜之间把海底全变成沙。
+///
+/// **注意：调这个数改不了"最后压掉多少"，只能改"多久压完"。**
+/// `1-(1-p)^320` 在 p=1% 和 p=2% 时分别是 96% 和 99.8%——都一样是
+/// "几乎全部"。真正决定"压掉多少"的是 [`COMPACT_MIN_DEPTH`]：
+/// 它决定哪些碎屑**有资格**被压实。
 pub const COMPACT_PERCENT: u32 = 2;
+
+/// 碎屑上方**连续压着几格**才够格压实。
+///
+/// ## 这个数就是"压实慢下来"的旋钮
+///
+/// v0.57 第一版是 1（"上面有一格东西就算被埋"），结果压掉了全部被埋碎屑
+/// ——陆地食物 -81%，两个种子的动物数跟着掉。
+///
+/// 而碎屑同时是食物（`eat_remains` 吃 `Remains`）：一层薄薄的碎屑，生物
+/// 从侧面还够得到；压到三层以下才是真的够不着。所以这个数**同时**是
+/// "地质压实的门槛"和"生态够不着的门槛"。
+///
+/// ## 为什么是 3（扫过 1 / 2 / 3，见 SPEC v0.58）
+///
+/// | 深度 | 水上水（11/2026/7） | 动物 | 物种 |
+/// |---|---|---|---|
+/// | 1 | 4409 / 13116 / 2640 | 1208 / 186 / 256 | 448 / **104 / 73** |
+/// | 2 | **15924** / 12421 / 5724 | **311** / 247 / 658 | 109 / 131 / 316 |
+/// | 3 | 8235 / 15636 / 7795 | 1210 / 223 / 251 | 293 / 151 / 90 |
+///
+/// **2 不是 1 和 3 的中间值**：seed 7 在深度 2 时极好（动物 307→658、
+/// 物种 86→316），seed 11 却崩了（动物 1111→311，水位反而 15924）。
+/// 这个维度上系统是**混沌的**，调参不能用来优化——只能挑一个"三个种子
+/// 都不崩"的值。3 是唯一满足这条的：动物 1210/223/251、物种 293/151/90。
+pub const COMPACT_MIN_DEPTH: usize = 3;
 
 
 /// 浮游藻撒在水面以下多少格之内。
@@ -2130,24 +2160,40 @@ impl LifeSim {
     ///
     /// 压实只发生在**被埋住**的碎屑上：表面的碎屑是刚落下的，还没有被压过。
     /// 这条同时保证了压实从堆的内部开始，而不是表面莫名其妙地结晶。
+    ///
+    /// ## 为什么是"上面压着 N 格"而不是"上面有一格"
+    ///
+    /// v0.57 第一版只要求上方一格有东西，结果压掉的是**全部被埋的碎屑**
+    /// ——陆地食物少了 81%（15918 → 2966），两个种子的动物数跟着掉
+    /// （254 → 186、307 → 256）。
+    ///
+    /// 而"慢一点"不能靠降概率：扫描是 320 次，2% 和 1% 的最终压实比例
+    /// 都是九成以上（`1-(1-p)^320`），**降概率只会让碎屑在压实前多存在
+    /// 一会儿，压完的总量几乎不变**。真正能"慢"的是**让可压实的那部分
+    /// 变小**：薄薄一层碎屑生物还能从侧面吃到，只有被压了三层以上的才是
+    /// 真的够不着。所以这里数的是"上方连续压着几格"。
     fn is_buried(world: &World, x: usize, y: usize) -> bool {
-        if y == 0 {
-            // 世界最上面一行上面没有东西，压不着。
-            return false;
-        }
         let xs = x as isize;
-        let above = (y - 1) as isize;
-        if matches!(
-            world.get(xs, above),
-            MaterialKind::Remains
-                | MaterialKind::Sand
-                | MaterialKind::Stone
-                | MaterialKind::Corpse
-        ) {
-            return true;
+        let mut depth = 0usize;
+        let mut yy = y;
+        while yy > 0 && depth < COMPACT_MIN_DEPTH {
+            yy -= 1;
+            let above = yy as isize;
+            let solid = matches!(
+                world.get(xs, above),
+                MaterialKind::Remains
+                    | MaterialKind::Sand
+                    | MaterialKind::Stone
+                    | MaterialKind::Corpse
+            );
+            // 身体也是墙（`yields_to` 把它当障碍），被它压着同样算压着。
+            if solid || world.is_occupied(xs, above) {
+                depth += 1;
+            } else {
+                break;
+            }
         }
-        // 身体也是墙（`yields_to` 把它当障碍），被它压着同样算埋住。
-        world.is_occupied(xs, above)
+        depth >= COMPACT_MIN_DEPTH
     }
 
     /// 试着把 `(x, y)` 和它右邻这一**对**碎屑压成地形。
@@ -5321,10 +5367,11 @@ mod tests {
     fn buried_remains_compact_into_sand() {
         let mut w = World::new(64, 64).unwrap();
         w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
-        // 40×4 的一堆碎屑：最上面一行露在空气里，下面三行被压着。
-        w.fill_rect(10, 56, 40, 4, MaterialKind::Remains);
+        // 40×10 的一堆碎屑。**要够高**：只有上方连续压着
+        // `COMPACT_MIN_DEPTH` 格的碎屑才够格，堆太薄的话一格都不会压。
+        w.fill_rect(10, 50, 40, 10, MaterialKind::Remains);
         let before = w.count_of(MaterialKind::Remains);
-        assert_eq!(before, 160);
+        assert_eq!(before, 400);
 
         let mut sim = LifeSim::new(&mut w);
         sim.set_food_growth(false);
@@ -5380,6 +5427,45 @@ mod tests {
             "表面碎屑不该被压实"
         );
         assert_eq!(sim.compacted(), 0, "一格都不该压");
+    }
+
+    /// **薄薄一层碎屑不压实**——这是"压实慢下来"的核心判据。
+    ///
+    /// 碎屑同时是食物。一层两三层厚的碎屑，生物从侧面还够得到；只有压到
+    /// `COMPACT_MIN_DEPTH` 以下的才是真的够不着。所以"慢"不是降概率
+    /// （扫描 320 次，1% 和 2% 都压掉九成以上），而是**让薄层根本没有资格**。
+    ///
+    /// 这条测试和 `surface_remains_do_not_compact` 测的是两件事：
+    /// 那条是"上方完全没东西"，这条是"上方有东西但不够厚"。
+    /// 少了后者，把 `COMPACT_MIN_DEPTH` 改回 1 也不会红。
+    #[test]
+    fn a_thin_litter_layer_does_not_compact() {
+        let mut w = World::new(64, 64).unwrap();
+        w.fill_rect(0, 60, 64, 4, MaterialKind::Stone);
+        // 厚度比门槛少一格：最底下那格上方压着的格数差一。
+        // **用常量算，不写死**——否则改 `COMPACT_MIN_DEPTH` 时这条测试会
+        // 悄悄变成"测另一件事"，而它恰恰是那个常量的唯一守卫。
+        let thin = COMPACT_MIN_DEPTH - 1;
+        let top = 60isize - thin as isize;
+        w.fill_rect(10, top, 40, thin, MaterialKind::Remains);
+        let before = w.count_of(MaterialKind::Remains);
+        assert_eq!(before, 40 * thin);
+
+        let mut sim = LifeSim::new(&mut w);
+        sim.set_food_growth(false);
+        sim.set_compact_remains(true);
+        let mut material = crate::sim::MaterialSim::new();
+        for _ in 0..2000 {
+            sim.step(&mut w);
+            material.step(&mut w);
+        }
+
+        assert_eq!(
+            w.count_of(MaterialKind::Remains),
+            before,
+            "薄层碎屑不该被压实（生物还够得到）"
+        );
+        assert_eq!(sim.compacted(), 0);
     }
 
     /// **默认关，而且关着时一格都不动**。

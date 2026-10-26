@@ -276,7 +276,8 @@ fn physics_section(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
         ui,
         "碎屑压实成地形",
         snap.compact_remains,
-        "被埋住的碎屑会慢慢压成沙：**两格碎屑挤成一格沙**，体积减半。\
+        "被**埋住三层以上**的碎屑会慢慢压成沙：两格碎屑挤成一格沙，体积减半。\
+         表面几层留给生态吃，只有够不着的才变成地形。\
          关着时碎屑只进不出，堆在海里排开海水，水位会一路涨。",
     )
     .changed()
@@ -286,7 +287,7 @@ fn physics_section(ui: &mut Ui, state: &mut UiState, snap: &Snapshot) {
 
     ui.label(
         egui::RichText::new(if snap.compact_remains {
-            "开着：碎屑 → 沙，总量会停下来，水位不再涨。"
+            "开着：够不着的碎屑 → 沙，总量会停下来，水位不再涨。"
         } else {
             "关着：碎屑是吸收态，堆多少留多少（水位会跟着涨）。"
         })
